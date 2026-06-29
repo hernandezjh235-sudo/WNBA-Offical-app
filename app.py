@@ -1477,23 +1477,37 @@ def fetch_underdog_board():
         return infer_market(txt)
 
     def parse_line(*objs):
-        safe_keys = ["stat_value", "line_score", "over_under_line", "target_value", "value"]
+        # Critical: only trust the official Underdog over_under_line value.
+        # Do NOT pull numbers from option text like "26+", payout multipliers,
+        # decimal prices, or ids. That was causing fake lines such as 1.0, 4.0, 7.0.
+        safe_keys = ["stat_value", "line_score", "target_value"]
         for o in objs:
+            if not isinstance(o, dict):
+                continue
+            typ = get_type(o)
+            path = str(o.get("_path", "")).lower()
+            # Ignore Higher/Lower option objects under over_under_lines.options.
+            if "options" in path or "option" in typ:
+                continue
             a = attr(o)
             for k in safe_keys:
                 v = safe_float(a.get(k), np.nan)
                 if pd.notna(v) and 0.5 <= v <= 80:
                     return float(v)
-        txt = candidate_text(*objs)
-        # Try patterns close to market names first.
-        m = re.search(r"(?:line|stat_value|line_score|target_value)[^0-9]{0,20}(\d{1,2}(?:\.5)?)", txt, flags=re.I)
-        if m:
-            v = safe_float(m.group(1), np.nan)
-            if pd.notna(v) and 0.5 <= v <= 80:
-                return float(v)
-        nums = [safe_float(x, np.nan) for x in re.findall(r"(?<!\d)(\d{1,2}(?:\.5)?)(?!\d)", txt)]
-        nums = [v for v in nums if pd.notna(v) and 0.5 <= v <= 80]
-        return float(nums[0]) if nums else np.nan
+        return np.nan
+
+    def is_true_underdog_line_obj(o):
+        if not isinstance(o, dict):
+            return False
+        typ = get_type(o)
+        path = str(o.get("_path", "")).lower()
+        a = attr(o)
+        if "options" in path or "option" in typ:
+            return False
+        if any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "target_value"]):
+            return True
+        # Accept the actual top-level over_under_line object, not nested option records.
+        return ("over_under_line" in typ or re.search(r"over_under_lines\[\d+\]$", path) is not None)
 
     def is_wnba_text(txt):
         low = str(txt or "").lower()
@@ -1578,14 +1592,11 @@ def fetch_underdog_board():
 
         line_objs = []
         for o in objects:
-            typ = get_type(o)
-            a = attr(o)
-            if "over_under_line" in typ or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value"]):
+            if is_true_underdog_line_obj(o):
                 line_objs.append(o)
 
-        # If no specific line objects were found, still scan leaf objects containing a market and a line.
-        if not line_objs:
-            line_objs = [o for o in objects if parse_market(object_text(o)) and pd.notna(parse_line(o))]
+        # Do not scan arbitrary leaf/options objects for lines. If Underdog changes schema,
+        # Decode Mode will show "no line found" rather than creating bad 1.0/4.0/7.0 lines.
 
         for lo in line_objs:
             rels = relation_ids(lo)
@@ -1627,26 +1638,8 @@ def fetch_underdog_board():
             append_row(resolved["Player"], resolved.get("Team", ""), market, line, raw, "relationship")
             add_decode(raw_name, market, line, resolved, True, resolved.get("Reason", "accepted"), "relationship", raw)
 
-        # Fallback scan with full objects when relation path missed player info.
-        for o in objects:
-            raw = object_text(o, 1400)
-            if not raw or not is_wnba_text(raw):
-                continue
-            market = parse_market(raw)
-            line = parse_line(o)
-            if market not in MARKETS or pd.isna(line):
-                continue
-            candidates = extract_name_candidates(o)
-            raw_name = candidates[0] if candidates else ""
-            resolved = resolve_player(candidates, raw, team_from_text(raw))
-            if not resolved.get("Player"):
-                add_decode(raw_name, market, line, resolved, False, resolved.get("Reason", "unmatched fallback"), "recursive", raw)
-                continue
-            if ACTIVE_TEAMS and resolved.get("Team") and resolved.get("Team") not in ACTIVE_TEAMS:
-                add_decode(raw_name, market, line, resolved, False, "matched player not on active schedule team", "recursive", raw)
-                continue
-            append_row(resolved["Player"], resolved.get("Team", ""), market, line, raw, "recursive")
-            add_decode(raw_name, market, line, resolved, True, resolved.get("Reason", "accepted"), "recursive", raw)
+        # No recursive option fallback. It was useful for debugging but created bad lines
+        # from Higher/Lower alt-option text. Relationship parser above is the only active parser.
 
         if rows:
             break
@@ -1660,8 +1653,14 @@ def fetch_underdog_board():
 
     if rows:
         df = pd.DataFrame(rows)
-        df = df.sort_values(["NameKey", "Market", "Line"]).drop_duplicates(subset=["NameKey", "Market", "Line"], keep="first")
-        debug.append({"source":"Underdog", "url":"parser", "status":"ok", "rows":len(df), "message":f"accepted {len(df)} rows; decode rows {len(decode_df)}"})
+        df = df[pd.to_numeric(df["Line"], errors="coerce").between(0.5, 80)].copy()
+        # One main line per Player+Market. Prefer half-point standard prop lines, then larger
+        # market-looking values over small option/threshold values if any slipped through.
+        df["_half"] = pd.to_numeric(df["Line"], errors="coerce").map(lambda x: 1 if abs((x * 2) - round(x * 2)) < 1e-9 and abs(x - round(x)) > 1e-9 else 0)
+        df["_line_priority"] = df["_half"] * 100 + pd.to_numeric(df["Line"], errors="coerce").clip(0, 80)
+        df = df.sort_values(["NameKey", "Market", "_line_priority"], ascending=[True, True, False])
+        df = df.drop_duplicates(subset=["NameKey", "Market"], keep="first").drop(columns=["_half", "_line_priority"], errors="ignore")
+        debug.append({"source":"Underdog", "url":"parser", "status":"ok", "rows":len(df), "message":f"accepted {len(df)} real main-line rows; decode rows {len(decode_df)}"})
         return df.reset_index(drop=True), pd.DataFrame(debug)
 
     debug.append({"source":"Underdog", "url":"parser", "status":"no accepted rows", "rows":0, "message":f"decode rows {len(decode_df)}; active teams {sorted(ACTIVE_TEAMS) if ACTIVE_TEAMS else 'not detected'}"})
