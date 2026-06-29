@@ -1590,16 +1590,43 @@ def reset_logs():
 def inject_css():
     st.markdown("""
     <style>
-    .stApp { background: #090d12; color: #eef3f7; }
-    section[data-testid="stSidebar"] { background:#0b1118; }
-    div[data-testid="stMetric"] { background:#111822; border:1px solid #202c3b; border-radius:16px; padding:12px; }
-    .card { background:linear-gradient(145deg,#101722,#111b29); border:1px solid #263649; border-radius:18px; padding:16px; margin:10px 0; box-shadow: 0 0 16px rgba(0,0,0,.25); }
-    .badge { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid #33465c; margin-right:6px; font-size:.82rem; }
-    .hot { color:#70ffbd; font-weight:800; }
-    .warn { color:#ffd166; font-weight:800; }
-    .pass { color:#9aa7b2; font-weight:700; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;800;900&display=swap');
+    html, body, [class*="css"] {font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif;}
+    .stApp { background: radial-gradient(circle at top,#240607 0,#090101 42%,#050505 100%); color:#f7f7f7; }
+    section[data-testid="stSidebar"] { background:#09090d; border-right:1px solid rgba(255,65,65,.22); }
+    .block-container { padding-top: 1.2rem; max-width: 1200px; }
+    div[data-testid="stMetric"] { background:linear-gradient(145deg,rgba(45,3,3,.94),rgba(16,16,20,.95)); border:1px solid rgba(255,64,64,.45); border-radius:22px; padding:18px; box-shadow:0 0 18px rgba(255,0,0,.10); }
+    div[data-testid="stMetric"] label { color:#c9c9c9!important; text-transform:uppercase; font-weight:900; letter-spacing:.08em; }
+    div[data-testid="stMetricValue"] { color:#ffffff!important; font-size:2.3rem!important; }
+    .stButton>button, .stDownloadButton>button { background:#111820; border:1px solid #334155; color:#f8fafc; border-radius:13px; padding:.75rem 1rem; font-weight:800; }
+    .stButton>button:hover, .stDownloadButton>button:hover { border-color:#ff3b3b; color:#ffffff; box-shadow:0 0 14px rgba(255,59,59,.22); }
+    .stTabs [data-baseweb="tab-list"] { gap:16px; border-bottom:1px solid rgba(255,255,255,.08); }
+    .stTabs [data-baseweb="tab"] { color:#bfc5cf; font-weight:900; letter-spacing:.04em; text-transform:uppercase; padding-left:0; padding-right:0; }
+    .stTabs [aria-selected="true"] { color:#39ff87!important; border-bottom:5px solid #39ff87!important; }
+    .owp-hero {background:linear-gradient(145deg,#1a0506 0%,#09090b 58%,#120202 100%); border:1px solid rgba(255,56,56,.55); border-radius:28px; padding:28px; margin: 8px 0 22px 0; box-shadow: inset 0 0 28px rgba(255,0,0,.08), 0 0 35px rgba(255,0,0,.12);}
+    .owp-title {font-size:2.25rem; font-weight:1000; line-height:1.18; letter-spacing:.02em; color:#fff; text-transform:uppercase;}
+    .owp-subtitle {font-size:1.08rem; color:#d7d7dc; margin-top:10px;}
+    .owp-blue-note {background:#08243d; border-radius:16px; border:1px solid rgba(65,164,255,.35); color:#50adff; padding:16px; margin:16px 0 22px 0; line-height:1.55; font-weight:700;}
+    .owp-kpi-grid {display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; margin:18px 0;}
+    .owp-kpi-card {background:linear-gradient(145deg,rgba(39,3,4,.98),rgba(12,12,15,.98)); border:1px solid rgba(255,55,55,.40); border-radius:24px; padding:20px; min-height:125px;}
+    .owp-kpi-label {color:#b9b9c2; text-transform:uppercase; font-weight:1000; letter-spacing:.08em; font-size:.9rem;}
+    .owp-kpi-value {font-size:2.7rem; font-weight:900; color:#fff; margin-top:16px;}
+    .owp-kpi-sub {color:#c7c7cc; margin-top:8px; font-size:.92rem;}
+    .section-title {font-size:2rem; font-weight:1000; border-left:7px solid #ff3838; padding-left:16px; margin:26px 0 8px 0;}
+    .card { background:linear-gradient(145deg,#170304,#0b0d12); border:1px solid rgba(255,59,59,.45); border-radius:24px; padding:18px; margin:14px 0; box-shadow: 0 0 20px rgba(255,0,0,.09); }
+    .badge { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid #3b4657; margin-right:6px; font-size:.82rem; }
+    .hot { color:#70ffbd; font-weight:900; }
+    .warn { color:#ffd166; font-weight:900; }
+    .pass { color:#aeb6c2; font-weight:800; }
     .small-note { color:#9fb2c3; font-size:.86rem; }
-    .owp-header { font-size:2.25rem; font-weight:900; letter-spacing:.2px; }
+    .owp-header { display:none; }
+    @media (max-width: 760px) {
+      .owp-title {font-size:1.8rem;}
+      .owp-kpi-grid {grid-template-columns:1fr 1fr; gap:12px;}
+      .owp-kpi-card {min-height:110px; padding:16px;}
+      .owp-kpi-value {font-size:2.2rem;}
+      .block-container {padding-left:1rem; padding-right:1rem;}
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1634,6 +1661,57 @@ def dataset_status_table():
             rows.append({"Dataset": k, "Status": "❌ missing", "File": str(path), "Columns": 0, "Updated": ""})
     return pd.DataFrame(rows)
 
+
+
+def kpi_card(label: str, value: Any, sub: str = ""):
+    st.markdown(f"""
+    <div class='owp-kpi-card'>
+      <div class='owp-kpi-label'>{label}</div>
+      <div class='owp-kpi-value'>{value}</div>
+      <div class='owp-kpi-sub'>{sub}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, strong: int = 0):
+    st.markdown("""
+    <div class='owp-hero'>
+      <div class='owp-title'>🔥 WNBA PROP ENGINE v1.4<br/>SAFETY GATES + MARKET TABS</div>
+      <div class='owp-subtitle'>Strict WNBA-only prop line lock → Refresh → Save → Grade</div>
+    </div>
+    """, unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🔄 REFRESH LIVE BOARD — Do Not Save Yet", use_container_width=True, key="hero_refresh_live_board"):
+            clear_line_pull_caches()
+            pull_board_lines(use_ud, use_sleeper)
+            st.rerun()
+    with c2:
+        if st.button("💾 SAVE OFFICIAL BEFORE-GAME SNAPSHOT", use_container_width=True, key="hero_save_official_before"):
+            board_path = CACHE_FILES.get("projection_board")
+            if board_path and board_path.exists():
+                try:
+                    board_cache = pd.read_csv(board_path)
+                    n = save_officials(board_cache)
+                    st.success(f"Saved {n} official plays from the current board.")
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
+            else:
+                st.warning("Build or refresh a board first, then save official plays.")
+    st.markdown(
+        f"""
+        <div class='owp-blue-note'>
+        ONE WAY PICKZ WNBA v1.4 VERIFIED LEARNING BUILD + SPORTSDATAVERSE DATA MANAGER + MARKET TABS | SAVED OFFICIAL SNAPSHOTS | Last refresh: {st.session_state.get('wnba_last_refresh', 'Not refreshed this session')}
+        </div>
+        <div class='owp-kpi-grid'>
+          <div class='owp-kpi-card'><div class='owp-kpi-label'>Board Rows</div><div class='owp-kpi-value'>{board_rows}</div><div class='owp-kpi-sub'>Current screen</div></div>
+          <div class='owp-kpi-card'><div class='owp-kpi-label'>Real Lines</div><div class='owp-kpi-value'>{real_lines}</div><div class='owp-kpi-sub'>Underdog/Sleeper/Manual</div></div>
+          <div class='owp-kpi-card'><div class='owp-kpi-label'>No Line</div><div class='owp-kpi-value'>{no_line}</div><div class='owp-kpi-sub'>Tracked only</div></div>
+          <div class='owp-kpi-card'><div class='owp-kpi-label'>Strong Signals</div><div class='owp-kpi-value'>{strong}</div><div class='owp-kpi-sub'>Official gate passed</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 # ============================================================
 # Streamlit app
 # ============================================================
@@ -1715,16 +1793,18 @@ def get_lines_from_state_or_pull(use_ud_flag: bool, use_sleeper_flag: bool) -> T
     )
 
 
-def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame):
-    st.markdown(f"### {mode} Board")
+def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame, force_market: Optional[str] = None):
+    market_label = f" — {force_market}" if force_market else ""
+    st.markdown(f"<div class='section-title'>{mode}{market_label} Board</div>", unsafe_allow_html=True)
+    market_key = force_market or "ALL"
     top_cols = st.columns([1.1, 1.1, 1.2, 1.2, 2.0])
     with top_cols[0]:
-        if st.button(f"🔄 Refresh {mode} Lines", key=f"refresh_{mode}"):
+        if st.button(f"🔄 Refresh {mode} Lines", key=f"refresh_{mode}_{market_key}"):
             clear_line_pull_caches()
             pull_board_lines(use_ud_flag, use_sleeper_flag)
             st.rerun()
     with top_cols[1]:
-        if st.button(f"🧱 Rebuild {mode} Board", key=f"rebuild_{mode}"):
+        if st.button(f"🧱 Rebuild {mode} Board", key=f"rebuild_{mode}_{market_key}"):
             try:
                 master, team_ranks = build_master_features()
                 st.session_state["wnba_rebuilt_at"] = now_iso()
@@ -1767,8 +1847,12 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
             st.dataframe(nl, use_container_width=True)
         return pd.DataFrame()
 
-    market_filter = st.multiselect("Market", MARKETS, default=MARKETS, key=f"market_{mode}")
-    search = st.text_input("Search player", key=f"search_{mode}")
+    if force_market:
+        market_filter = [force_market]
+        st.caption(f"Market locked to {force_market}; lines from Underdog/Sleeper/Manual route directly here.")
+    else:
+        market_filter = st.multiselect("Market", MARKETS, default=MARKETS, key=f"market_{mode}_{market_key}")
+    search = st.text_input("Search player", key=f"search_{mode}_{market_key}")
     proj_df = make_projection_board(lines[lines["Market"].isin(market_filter)], logs_global, master_global)
     if search and not proj_df.empty:
         proj_df = proj_df[proj_df["Player"].str.contains(search, case=False, na=False)]
@@ -1790,19 +1874,19 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
 
     action_cols = st.columns([1.2, 1.2, 1.2, 2.0])
     with action_cols[0]:
-        if st.button(f"✅ Save {mode} Official Before", key=f"save_before_{mode}"):
+        if st.button(f"✅ Save {mode} Official Before", key=f"save_before_{mode}_{market_key}"):
             n = save_officials(proj_df)
             st.success(f"Saved {n} official plays for {mode}.")
     with action_cols[1]:
-        if st.button(f"📊 Grade After Results", key=f"grade_after_{mode}"):
+        if st.button(f"📊 Grade After Results", key=f"grade_after_{mode}_{market_key}"):
             n = grade_pending(logs_global)
             st.success(f"Graded {n} pending plays.")
     with action_cols[2]:
-        st.download_button(f"Download {mode} Board CSV", proj_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ', '_')}_projection_board.csv", "text/csv", key=f"dl_{mode}")
+        st.download_button(f"Download {mode} Board CSV", proj_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ', '_')}_projection_board.csv", "text/csv", key=f"dl_{mode}_{market_key}")
     with action_cols[3]:
         st.caption("Save before does not change projections. Grade after uses the latest imported stat logs and updates learning history.")
 
-    display_mode = st.radio("View", ["Player cards", "Table"], horizontal=True, key=f"view_{mode}")
+    display_mode = st.radio("View", ["Player cards", "Table"], horizontal=True, key=f"view_{mode}_{market_key}")
     if display_mode == "Player cards":
         for _, r in proj_df.head(100).iterrows():
             render_card(r)
@@ -1842,20 +1926,41 @@ if master_global.empty and not logs_global.empty:
     except Exception:
         master_global = pd.DataFrame()
 
-tabs = st.tabs(["Board", "Manual Lines", "Data Manager", "Research Hub", "Team Ranks", "Official + Grade", "Log Tools", "Debug"])
+# Pull state once for hero summary without forcing rerun behavior.
+try:
+    hero_lines = st.session_state.get("wnba_lines_all", pd.DataFrame())
+    hero_board = load_dataset("projection_board")
+    hero_board_rows = 0 if hero_board.empty else len(hero_board)
+    hero_real_lines = 0 if hero_lines is None or hero_lines.empty else len(hero_lines)
+    hero_strong = 0 if hero_board.empty or "Official" not in hero_board.columns else int(hero_board["Official"].astype(str).str.contains("OVER|UNDER", na=False).sum())
+    hero_no_line = max(0, (0 if master_global is None or master_global.empty else len(master_global)) - hero_real_lines)
+except Exception:
+    hero_board_rows = hero_real_lines = hero_no_line = hero_strong = 0
+hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
 
-with tabs[0]:
-    st.subheader("Projection Board")
-    st.caption("MLB-style flow: Today/Tomorrow tabs, refresh board lines, save official before games, then grade after results.")
-    slate_tabs = st.tabs(["Today", "Tomorrow", "All Lines"])
-    with slate_tabs[0]:
-        render_mlb_style_board("Today", use_ud, use_sleeper, logs_global, master_global)
-    with slate_tabs[1]:
-        render_mlb_style_board("Tomorrow", use_ud, use_sleeper, logs_global, master_global)
-    with slate_tabs[2]:
-        render_mlb_style_board("All Lines", use_ud, use_sleeper, logs_global, master_global)
+tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Manual Lines", "Data Manager", "Research Hub", "Team Ranks", "Official + Grade", "Log Tools", "Debug"])
 
-with tabs[2]:
+MARKET_TAB_META = {
+    "PTS": ("POINTS", "Points board: scoring projection, shot profile, pace, usage, matchup, line edge."),
+    "REB": ("REBOUNDS", "Rebounds board: minutes, role, team rebounding, opponent context, recent form."),
+    "AST": ("ASSISTS", "Assists board: minutes, usage proxy, lineup continuity, team shot environment."),
+    "PRA": ("PRA", "Combo board: points + rebounds + assists with full Monte Carlo distribution."),
+}
+
+for idx, market in enumerate(MARKETS):
+    with tabs[idx]:
+        title, caption = MARKET_TAB_META[market]
+        st.markdown(f"<div class='section-title'>{title} / Pure Edge Model</div>", unsafe_allow_html=True)
+        st.caption(caption + " Main flow: Refresh → inspect → save before games → grade after results.")
+        slate_tabs = st.tabs(["Today", "Tomorrow", "All Lines"])
+        with slate_tabs[0]:
+            render_mlb_style_board("Today", use_ud, use_sleeper, logs_global, master_global, force_market=market)
+        with slate_tabs[1]:
+            render_mlb_style_board("Tomorrow", use_ud, use_sleeper, logs_global, master_global, force_market=market)
+        with slate_tabs[2]:
+            render_mlb_style_board("All Lines", use_ud, use_sleeper, logs_global, master_global, force_market=market)
+
+with tabs[5]:
     st.subheader("SportsDataverse Import Wizard")
     st.caption("Upload the SportsDataverse CSV index files and/or actual CSV/Parquet files. Parquet is preferred. RDS is not supported in Python.")
     st.info("Saving flow: importing files saves the stat database automatically under wnba_engine/data. The 'Save official plays before games' button only saves your betting slate. The 'Grade pending' button later grades those saved plays and updates the learning log.")
@@ -1978,9 +2083,9 @@ with tabs[2]:
             data = path.read_bytes()
             st.download_button(f"Download {k}.csv", data, file_name=path.name, mime="text/csv")
 
-with tabs[1]:
+with tabs[4]:
     st.subheader("Manual fallback lines")
-    st.caption("Use this when Underdog/Sleeper miss players. These lines are included with Source=Manual.")
+    st.caption("Use this when Underdog/Sleeper miss players. These lines are included with Source=Manual and route into the correct PTS/REB/AST/PRA tab.")
     existing = load_manual_lines()
     edited = st.data_editor(existing, num_rows="dynamic", use_container_width=True, column_config={"Market": st.column_config.SelectboxColumn(options=MARKETS)})
     if st.button("Save manual lines"):
@@ -1989,7 +2094,7 @@ with tabs[1]:
             del st.session_state["wnba_lines_all"]
         st.success("Manual lines saved. Refresh board lines to include them.")
 
-with tabs[3]:
+with tabs[6]:
     st.subheader("Research Hub")
     if master_global.empty:
         st.warning("Build master features in Data Manager first.")
@@ -2014,7 +2119,7 @@ with tabs[3]:
             st.markdown("### Feature row")
             st.dataframe(pd.DataFrame([p.to_dict()]), use_container_width=True)
 
-with tabs[4]:
+with tabs[7]:
     st.subheader("Team Ranks")
     team_ranks = load_dataset("team_ranks")
     if team_ranks.empty:
@@ -2023,7 +2128,7 @@ with tabs[4]:
         st.dataframe(team_ranks, use_container_width=True)
         st.download_button("Download team ranks CSV", team_ranks.to_csv(index=False), "wnba_team_ranks.csv", "text/csv")
 
-with tabs[5]:
+with tabs[8]:
     st.subheader("Official picks + grading")
     board_path = CACHE_FILES["projection_board"]
     if board_path.exists() and not logs_global.empty and not master_global.empty:
@@ -2053,7 +2158,7 @@ with tabs[5]:
             st.info("Learning log exists, but no graded Result column yet.")
         st.dataframe(learning.tail(200), use_container_width=True)
 
-with tabs[6]:
+with tabs[9]:
     st.subheader("Log tools + injury bump table")
     st.caption("Import prior learning logs, backup all CSVs/logs, or reset logs. Injury bumps are manual for now and do not change code.")
     up = st.file_uploader("Import previous learning/offical log CSV", type=["csv"], key="learning_import")
@@ -2076,7 +2181,7 @@ with tabs[6]:
         save_json(INJURY_BUMPS_FILE, edited_bumps.to_dict("records"))
         st.success("Injury bump table saved.")
 
-with tabs[7]:
+with tabs[10]:
     st.subheader("Debug")
     st.markdown("### Data status")
     st.dataframe(dataset_status_table(), use_container_width=True)
