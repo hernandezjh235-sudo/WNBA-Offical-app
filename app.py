@@ -692,39 +692,136 @@ def standardize_lineups(df: pd.DataFrame) -> pd.DataFrame:
     out = coerce_numeric(out, ["Season", "PlayerCount"])
     return out
 
+def _best_text_col_by_values(df: pd.DataFrame, preferred_tokens: List[str]) -> Optional[str]:
+    """Find a name-like text column when SportsDataverse schema changes."""
+    if df is None or df.empty:
+        return None
+    obj_cols = [c for c in df.columns if df[c].dtype == object or str(df[c].dtype).startswith('string')]
+    scored = []
+    for c in obj_cols[:80]:
+        cn = col_norm(c)
+        vals = df[c].dropna().astype(str).head(80)
+        if vals.empty:
+            continue
+        # Name-like = two alpha tokens often enough.
+        name_like = vals.map(lambda x: bool(re.search(r"[A-Za-z]{2,}\s+[A-Za-z]{2,}", x))).mean()
+        token_bonus = sum(1 for t in preferred_tokens if t in cn) * 0.35
+        unique_bonus = min(0.15, vals.nunique() / max(len(vals), 1))
+        scored.append((name_like + token_bonus + unique_bonus, c))
+    scored.sort(reverse=True)
+    return scored[0][1] if scored and scored[0][0] >= 0.35 else None
+
+
 def standardize_shots(df: pd.DataFrame) -> pd.DataFrame:
+    """Robust SportsDataverse shot parser.
+
+    The shots parquet schema can vary. This parser intentionally accepts many column names
+    and will save a useful shot-feature cache instead of returning empty whenever possible.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     d = df.copy()
-    player_col = find_col(d, ["PLAYER_NAME", "player_name", "athlete_display_name", "shooter", "player", "athlete"])
-    team_col = find_col(d, ["team", "team_abbreviation", "team_name"])
-    date_col = find_col(d, ["game_date", "date", "start_date"])
-    season_col = find_col(d, ["season", "year"])
-    made_col = find_col(d, ["made", "shot_made", "shot_result", "result"])
-    value_col = find_col(d, ["shot_value", "points", "point_value"])
-    type_col = find_col(d, ["shot_type", "type", "action_type", "play_type"])
-    dist_col = find_col(d, ["shot_distance", "distance"])
-    out = pd.DataFrame()
-    out["Player"] = d[player_col] if player_col else np.nan
-    out["Team"] = d[team_col] if team_col else ""
+    # Prefer real name columns, then infer by values. Team is optional; player is required for matching.
+    player_col = find_col(d, [
+        "PLAYER_NAME", "player_name", "athlete_display_name", "athlete_name", "shooter",
+        "shooter_name", "player", "athlete", "name", "display_name", "full_name",
+        "text", "description"
+    ])
+    if not player_col:
+        player_col = _best_text_col_by_values(d, ["athlete", "player", "shooter", "name"])
+    team_col = find_col(d, [
+        "team", "team_abbreviation", "team_name", "team_short_display_name", "team_display_name",
+        "shooting_team", "offense_team", "home_away", "team_id"
+    ], contains_any=["team"])
+    date_col = find_col(d, ["game_date", "date", "start_date", "game_date_time", "created_at"])
+    season_col = find_col(d, ["season", "year", "game_season"])
+    game_id_col = find_col(d, ["game_id", "event_id", "competition_id", "id"])
+    made_col = find_col(d, [
+        "made", "shot_made", "shot_result", "result", "scoring_play", "is_made",
+        "shot_outcome", "make_miss", "outcome"
+    ])
+    value_col = find_col(d, ["shot_value", "points", "point_value", "score_value", "attempt_points"])
+    type_col = find_col(d, ["shot_type", "type", "action_type", "play_type", "sub_type", "shot_zone_basic", "shot_zone_area"])
+    dist_col = find_col(d, ["shot_distance", "distance", "shot_dist", "distance_ft"])
+    x_col = find_col(d, ["x", "loc_x", "coordinate_x", "x_coordinate"])
+    y_col = find_col(d, ["y", "loc_y", "coordinate_y", "y_coordinate"])
+
+    out = pd.DataFrame(index=d.index)
+    if player_col:
+        out["Player"] = d[player_col].astype(str)
+    else:
+        # Last fallback: sometimes shot rows include a long text description with a player name.
+        desc_col = find_col(d, ["description", "text", "play_text", "play_description"])
+        if desc_col:
+            out["Player"] = d[desc_col].astype(str).str.extract(r"^([A-Z][a-zA-Z'\-.]+\s+[A-Z][a-zA-Z'\-.]+)", expand=False)
+        else:
+            return pd.DataFrame()
+    out["Team"] = d[team_col].astype(str) if team_col else ""
     out["GameDate"] = parse_date_series(d[date_col]) if date_col else pd.NaT
-    out["Season"] = d[season_col] if season_col else out["GameDate"].dt.year
-    out["ShotValue"] = d[value_col] if value_col else np.nan
-    out["ShotType"] = d[type_col] if type_col else ""
+    if season_col:
+        out["Season"] = d[season_col]
+    else:
+        out["Season"] = out["GameDate"].dt.year if out["GameDate"].notna().any() else np.nan
+    out["GameID"] = d[game_id_col] if game_id_col else ""
+    out["ShotType"] = d[type_col].astype(str) if type_col else ""
     out["ShotDistance"] = d[dist_col] if dist_col else np.nan
+    out["X"] = d[x_col] if x_col else np.nan
+    out["Y"] = d[y_col] if y_col else np.nan
+
+    if value_col:
+        out["ShotValue"] = d[value_col]
+    else:
+        type_text = out["ShotType"].astype(str).str.lower()
+        out["ShotValue"] = np.where(type_text.str.contains("3|three", na=False), 3, 2)
+
     if made_col:
         m = d[made_col]
         if m.dtype == object:
-            out["Made"] = m.astype(str).str.lower().isin(["made", "true", "1", "yes", "make"])
+            mt = m.astype(str).str.lower()
+            out["Made"] = mt.str.contains("made|make|true|yes|score|good|1", regex=True, na=False) & ~mt.str.contains("miss|blocked|false|no", regex=True, na=False)
         else:
             out["Made"] = pd.to_numeric(m, errors="coerce").fillna(0) > 0
     else:
+        # If no make/miss field, leave unknown; attempts are still useful.
         out["Made"] = np.nan
-    out = coerce_numeric(out, ["Season", "ShotValue", "ShotDistance"])
-    if out["ShotValue"].isna().all():
-        out["ShotValue"] = np.where(out["ShotType"].astype(str).str.contains("3|three", case=False, na=False), 3, 2)
+
+    out = coerce_numeric(out, ["Season", "ShotValue", "ShotDistance", "X", "Y"])
+    # Zone tags: conservative and schema-independent.
+    type_text = out["ShotType"].astype(str).str.lower()
+    out["Is3"] = (out["ShotValue"].fillna(0) >= 3) | type_text.str.contains("3|three", na=False)
+    out["AtRim"] = (out["ShotDistance"].fillna(999) <= 5) | type_text.str.contains("layup|rim|dunk", na=False)
+    out["MidRange"] = (~out["Is3"].fillna(False)) & (~out["AtRim"].fillna(False))
     out["NameKey"] = out["Player"].map(normalize_name)
-    return out.dropna(subset=["Player"])
+    out = out[out["NameKey"].str.len() > 0].copy()
+    return out
+
+
+def build_shot_features(shots: pd.DataFrame) -> pd.DataFrame:
+    sh = standardize_shots(shots) if shots is not None and not shots.empty else pd.DataFrame()
+    if sh.empty:
+        return pd.DataFrame()
+    sh["Attempt"] = 1
+    sh["MadeNum"] = sh["Made"].fillna(False).astype(bool).astype(int)
+    sh["PtsOnShot"] = sh["MadeNum"] * pd.to_numeric(sh["ShotValue"], errors="coerce").fillna(2)
+    agg = sh.groupby("NameKey").agg(
+        ShotAttempts=("Attempt", "sum"),
+        ShotMakes=("MadeNum", "sum"),
+        ShotPoints=("PtsOnShot", "sum"),
+        ThreePA=("Is3", "sum"),
+        RimAttempts=("AtRim", "sum"),
+        MidRangeAttempts=("MidRange", "sum"),
+        AvgShotDistance=("ShotDistance", "mean"),
+    ).reset_index()
+    agg["ThreePARate"] = agg["ThreePA"] / agg["ShotAttempts"].replace(0, np.nan)
+    agg["RimRate"] = agg["RimAttempts"] / agg["ShotAttempts"].replace(0, np.nan)
+    agg["MidRangeRate"] = agg["MidRangeAttempts"] / agg["ShotAttempts"].replace(0, np.nan)
+    agg["ShotMakeRate"] = agg["ShotMakes"] / agg["ShotAttempts"].replace(0, np.nan)
+    agg["PointsPerShot"] = agg["ShotPoints"] / agg["ShotAttempts"].replace(0, np.nan)
+    agg["ShotProfileScore"] = np.clip(
+        50 + agg["ThreePARate"].fillna(0)*14 + agg["RimRate"].fillna(0)*18 + (agg["ShotMakeRate"].fillna(0.42)-0.42)*60,
+        0, 100
+    ).round(1)
+    return agg
 
 
 def position_group(pos) -> str:
@@ -898,23 +995,32 @@ def compute_player_baselines(logs: pd.DataFrame, season_stats: pd.DataFrame = pd
         base["Position"] = ""
         base["PositionGroup"] = "Unknown"
 
-    # Shot profile for points.
-    sh = standardize_shots(shots) if shots is not None and not shots.empty else pd.DataFrame()
-    if not sh.empty:
-        sh["Is3"] = sh["ShotValue"].fillna(2) >= 3
-        sh_agg = sh.groupby("NameKey").agg(
-            ShotAttempts=("ShotValue", "count"), ShotMakes=("Made", lambda x: pd.Series(x).fillna(False).astype(bool).sum()),
-            ThreePA=("Is3", "sum"), AvgShotDistance=("ShotDistance", "mean")
-        ).reset_index()
-        sh_agg["ThreePARate"] = sh_agg["ThreePA"] / sh_agg["ShotAttempts"].replace(0, np.nan)
-        sh_agg["ShotMakeRate"] = sh_agg["ShotMakes"] / sh_agg["ShotAttempts"].replace(0, np.nan)
+    # Shot profile for points. Flexible parser supports SportsDataverse parquet schemas.
+    sh_agg = build_shot_features(shots)
+    if not sh_agg.empty:
         base = base.merge(sh_agg, on="NameKey", how="left")
     else:
-        for c in ["ShotAttempts", "ThreePA", "ThreePARate", "ShotMakeRate", "AvgShotDistance"]:
+        for c in ["ShotAttempts", "ShotMakes", "ShotPoints", "ThreePA", "RimAttempts", "MidRangeAttempts", "ThreePARate", "RimRate", "MidRangeRate", "ShotMakeRate", "PointsPerShot", "ShotProfileScore", "AvgShotDistance"]:
             base[c] = np.nan
 
+    # Home/away and consistency features from logs.
+    if "HomeAway" in d.columns:
+        ha = d.copy()
+        ha["HA"] = ha["HomeAway"].astype(str).str.upper().str[:1]
+        for m in MARKETS:
+            piv = ha.pivot_table(index="NameKey", columns="HA", values=m, aggfunc="mean")
+            if "H" in piv.columns:
+                base = base.merge(piv[["H"]].rename(columns={"H": f"{m}_HomeAvg"}).reset_index(), on="NameKey", how="left")
+            if "A" in piv.columns:
+                base = base.merge(piv[["A"]].rename(columns={"A": f"{m}_AwayAvg"}).reset_index(), on="NameKey", how="left")
     for m in MARKETS:
+        base[f"{m}_Std20"] = g[m].agg(lambda x: x.tail(20).std(ddof=0)).values
         base[f"{m}_per_min"] = base[f"{m}_avg"] / base["MIN_avg"].replace(0, np.nan)
+
+    base["VolatilityScore"] = np.clip(
+        30 + base[[f"{m}_Std20" for m in MARKETS if f"{m}_Std20" in base.columns]].fillna(0).mean(axis=1) * 8,
+        0, 100
+    ).round(1)
     return base
 
 
@@ -952,28 +1058,52 @@ def build_master_features() -> Tuple[pd.DataFrame, pd.DataFrame]:
         base["StarterGames"] = np.nan
         base["StarterRate"] = np.nan
 
-    # Lineups: count mentions for continuity signal.
+    # Lineups: count mentions for continuity/role signal. This uses normalized lineup text so it works
+    # even when SportsDataverse gives lineup-player columns instead of one clean player field.
     lns = standardize_lineups(lineups) if not lineups.empty else pd.DataFrame()
     if not lns.empty:
+        lns_text = lns["LineupText"].astype(str).map(normalize_name)
+        total_lineups = max(len(lns_text), 1)
         mentions = []
         for _, b in base[["NameKey", "Player"]].drop_duplicates().iterrows():
             nk = b["NameKey"]
-            # Cheap but workable for uploaded parquet: lineup text contains names.
-            cnt = lns["LineupText"].astype(str).map(normalize_name).str.contains(nk, regex=False, na=False).sum()
-            mentions.append({"NameKey": nk, "LineupMentions": cnt})
+            cnt = int(lns_text.str.contains(nk, regex=False, na=False).sum()) if nk else 0
+            mentions.append({
+                "NameKey": nk,
+                "LineupMentions": cnt,
+                "LineupShare": cnt / total_lineups,
+                "LineupContinuityScore": round(min(100, 35 + 65 * (cnt / total_lineups) * 8), 1),
+            })
         base = base.merge(pd.DataFrame(mentions), on="NameKey", how="left")
     else:
         base["LineupMentions"] = np.nan
+        base["LineupShare"] = np.nan
+        base["LineupContinuityScore"] = np.nan
 
     base["RoleConfidence"] = np.clip(
-        45 + base["Games"].fillna(0).clip(0, 20)*1.4 + base["MIN_l10"].fillna(base["MIN_avg"]).clip(0, 36)*0.7 + base["StarterRate"].fillna(0)*18,
+        43
+        + base["Games"].fillna(0).clip(0, 20)*1.3
+        + base["MIN_l10"].fillna(base["MIN_avg"]).clip(0, 36)*0.7
+        + base["StarterRate"].fillna(0)*18
+        + base["LineupContinuityScore"].fillna(50)*0.08,
         0, 100
     ).round(1)
     base["MinutesSafetyGrade"] = np.select(
         [base["MIN_l10"] >= 30, base["MIN_l10"] >= 24, base["MIN_l10"] >= 18],
         ["A", "B", "C"], default="D"
     )
-    base["DataScore"] = np.clip(30 + base["Games"].fillna(0).clip(0, 25)*2 + base["MIN_avg"].fillna(0).clip(0, 36)*0.8 + base["RoleConfidence"].fillna(0)*0.25, 0, 100).round(1)
+    base["TeamMatchupStrengthScore"] = np.clip(50 + base.get("Team_NetRtg", pd.Series(0, index=base.index)).fillna(0)*2.0, 0, 100).round(1)
+    base["MinutesProjectionBase"] = (0.35*base["MIN_avg"].fillna(0) + 0.30*base["MIN_l10"].fillna(0) + 0.20*base["MIN_l5"].fillna(0) + 0.15*base["MIN_l3"].fillna(0)).round(2)
+    base["BayesianPriorStrength"] = np.clip((base["Games"].fillna(0) / 20) * 100, 0, 100).round(1)
+    base["DataScore"] = np.clip(
+        28
+        + base["Games"].fillna(0).clip(0, 25)*1.9
+        + base["MIN_avg"].fillna(0).clip(0, 36)*0.75
+        + base["RoleConfidence"].fillna(0)*0.24
+        + base.get("ShotProfileScore", pd.Series(0, index=base.index)).fillna(0)*0.06
+        + base["LineupContinuityScore"].fillna(50)*0.06,
+        0, 100
+    ).round(1)
     save_dataset("master_features", base)
     return base, team_ranks
 
@@ -1331,6 +1461,12 @@ def project_row(row, base, logs):
         "Team ORtg": round(safe_float(b.get("Team_ORtg"), np.nan), 2) if pd.notna(safe_float(b.get("Team_ORtg"), np.nan)) else np.nan,
         "Team DRtg": round(safe_float(b.get("Team_DRtg"), np.nan), 2) if pd.notna(safe_float(b.get("Team_DRtg"), np.nan)) else np.nan,
         "Team Net": round(team_net, 2) if pd.notna(team_net) else np.nan,
+        "Team Matchup Strength": round(safe_float(b.get("TeamMatchupStrengthScore"), np.nan), 1) if pd.notna(safe_float(b.get("TeamMatchupStrengthScore"), np.nan)) else np.nan,
+        "Lineup Continuity": round(safe_float(b.get("LineupContinuityScore"), np.nan), 1) if pd.notna(safe_float(b.get("LineupContinuityScore"), np.nan)) else np.nan,
+        "Shot Profile": round(safe_float(b.get("ShotProfileScore"), np.nan), 1) if pd.notna(safe_float(b.get("ShotProfileScore"), np.nan)) else np.nan,
+        "Rim Rate": round(safe_float(b.get("RimRate"), np.nan), 3) if pd.notna(safe_float(b.get("RimRate"), np.nan)) else np.nan,
+        "3PA Rate": round(safe_float(b.get("ThreePARate"), np.nan), 3) if pd.notna(safe_float(b.get("ThreePARate"), np.nan)) else np.nan,
+        "Shot Make Rate": round(safe_float(b.get("ShotMakeRate"), np.nan), 3) if pd.notna(safe_float(b.get("ShotMakeRate"), np.nan)) else np.nan,
         "Position": b.get("Position", ""), "PositionGroup": b.get("PositionGroup", "Unknown"),
         "Projection Note": f"{learn_note}; {ml_note}",
     }
@@ -1529,6 +1665,7 @@ tabs = st.tabs(["Board", "Manual Lines", "Data Manager", "Research Hub", "Team R
 with tabs[2]:
     st.subheader("SportsDataverse Import Wizard")
     st.caption("Upload the SportsDataverse CSV index files and/or actual CSV/Parquet files. Parquet is preferred. RDS is not supported in Python.")
+    st.info("Saving flow: importing files saves the stat database automatically under wnba_engine/data. The 'Save official plays before games' button only saves your betting slate. The 'Grade pending' button later grades those saved plays and updates the learning log.")
 
     cA, cB, cC = st.columns(3)
     with cA:
@@ -1689,7 +1826,7 @@ with tabs[0]:
             for _, r in proj_df.head(80).iterrows():
                 render_card(r)
             with st.expander("Table view"):
-                show_cols = ["Player", "Market", "Line", "Source", "Projection", "Edge", "Lean", "Official", "Official Play Score", "PASS Reason", "Underdog Line", "Sleeper Line", "Best Over Line", "Best Under Line", "Over %", "Under %", "L5 Hit%", "L10 Hit%", "L20 Hit%", "MIN Proj", "Role Confidence", "Minutes Safety", "Data Score", "Bayesian Confidence", "Team Pace", "Team ORtg", "Team DRtg", "Team Net"]
+                show_cols = ["Player", "Market", "Line", "Source", "Projection", "Edge", "Lean", "Official", "Official Play Score", "PASS Reason", "Underdog Line", "Sleeper Line", "Best Over Line", "Best Under Line", "Over %", "Under %", "L5 Hit%", "L10 Hit%", "L20 Hit%", "MIN Proj", "Role Confidence", "Minutes Safety", "Data Score", "Bayesian Confidence", "Team Pace", "Team ORtg", "Team DRtg", "Team Net", "Team Matchup Strength", "Lineup Continuity", "Shot Profile", "Rim Rate", "3PA Rate", "Shot Make Rate"]
                 st.dataframe(proj_df[[c for c in show_cols if c in proj_df.columns]], use_container_width=True)
                 st.download_button("Download projection board CSV", proj_df.to_csv(index=False), "wnba_projection_board.csv", "text/csv")
         else:
