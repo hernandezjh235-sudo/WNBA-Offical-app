@@ -1399,10 +1399,15 @@ def fetch_odds_api_board(api_key: str, regions: str = "us", bookmakers: str = DE
                         continue
                     side = "Over" if name.lower() == "over" else "Under" if name.lower() == "under" else ""
                     key = (normalize_name(player), player, internal_market, float(line), str(book_key), ev.get("commence_time"))
+                    event_raw = f"{ev.get('away_team','')} @ {ev.get('home_team','')}"
+                    event_away = _team_key_for_matchup(ev.get('away_team')) if '_team_key_for_matchup' in globals() else str(ev.get('away_team',''))
+                    event_home = _team_key_for_matchup(ev.get('home_team')) if '_team_key_for_matchup' in globals() else str(ev.get('home_team',''))
                     rec = paired.setdefault(key, {
                         "Player": player, "Team": "", "Market": internal_market, "Line": float(line),
                         "Source": f"OddsAPI:{book_key}", "Start": ev.get("commence_time") or "",
-                        "Raw": f"{ev.get('away_team','')} @ {ev.get('home_team','')}", "OverOdds": np.nan, "UnderOdds": np.nan
+                        "Raw": event_raw, "EventAway": event_away, "EventHome": event_home,
+                        "Matchup": f"{event_away} @ {event_home}" if event_away and event_home else event_raw,
+                        "OverOdds": np.nan, "UnderOdds": np.nan
                     })
                     price = safe_float(out.get("price"), np.nan)
                     if side == "Over":
@@ -3091,50 +3096,186 @@ def make_baseline_player_cards(master_global: pd.DataFrame, market: str, limit: 
         })
     return pd.DataFrame(rows)
 
+
+# ============================================================
+# Robust matchup/opponent resolver
+# ============================================================
+WNBA_TEAM_KEY_MAP = {
+    # Current WNBA teams and common abbreviations
+    "ATL": "ATL", "ATLANTA": "ATL", "ATLANTA DREAM": "ATL",
+    "CHI": "CHI", "CHICAGO": "CHI", "CHICAGO SKY": "CHI",
+    "CON": "CON", "CONN": "CON", "CONNECTICUT": "CON", "CONNECTICUT SUN": "CON",
+    "DAL": "DAL", "DALLAS": "DAL", "DALLAS WINGS": "DAL",
+    "GSV": "GSV", "GS": "GSV", "GOLDEN STATE": "GSV", "GOLDEN STATE VALKYRIES": "GSV",
+    "IND": "IND", "INDIANA": "IND", "INDIANA FEVER": "IND",
+    "LA": "LAS", "LAS": "LAS", "LOS ANGELES": "LAS", "LOS ANGELES SPARKS": "LAS",
+    "LVA": "LVA", "LV": "LVA", "LVS": "LVA", "LAS VEGAS": "LVA", "LAS VEGAS ACES": "LVA",
+    "MIN": "MIN", "MINNESOTA": "MIN", "MINNESOTA LYNX": "MIN",
+    "NY": "NYL", "NYL": "NYL", "NEW YORK": "NYL", "NEW YORK LIBERTY": "NYL",
+    "PHX": "PHX", "PHO": "PHX", "PHOENIX": "PHX", "PHOENIX MERCURY": "PHX",
+    "SEA": "SEA", "SEATTLE": "SEA", "SEATTLE STORM": "SEA",
+    "WAS": "WAS", "WSH": "WAS", "WASHINGTON": "WAS", "WASHINGTON MYSTICS": "WAS",
+}
+
+
+def _clean_team_text(x: Any) -> str:
+    s = str(x or "").strip().upper()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^A-Z0-9 @.-]+", " ", s).strip()
+    return s
+
+
 def _team_key_for_matchup(x: Any) -> str:
-    try:
-        return team_abbrev(x)
-    except Exception:
-        return str(x or "").strip().upper()[:3]
+    """Canonical WNBA team key used only for matchup/opponent matching.
+    This is intentionally more aggressive than team_abbrev because sportsbook APIs,
+    SportsDataverse, and ESPN often disagree on LA/LAS/LVA/NY/NYL labels.
+    """
+    s = _clean_team_text(x)
+    if not s or s in {"NAN", "NONE", "NULL"}:
+        return ""
+    if s in WNBA_TEAM_KEY_MAP:
+        return WNBA_TEAM_KEY_MAP[s]
+    # Remove common suffix/prefix noise but keep city/franchise clues.
+    s2 = re.sub(r"\b(WNBA|WOMEN|BASKETBALL|TEAM)\b", "", s).strip()
+    if s2 in WNBA_TEAM_KEY_MAP:
+        return WNBA_TEAM_KEY_MAP[s2]
+    # Handle raw phrases that contain a full team name.
+    for name, key in sorted(WNBA_TEAM_KEY_MAP.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if len(name) >= 4 and name in s2:
+            return key
+    # Final fallback: preserve short abbreviations instead of truncating full names blindly.
+    return s2[:3]
+
+
+def _parse_event_teams_from_text(raw: Any) -> Tuple[str, str]:
+    """Parse away/home teams from Odds API raw text like 'Washington Mystics @ Las Vegas Aces'."""
+    txt = str(raw or "").strip()
+    if not txt or txt.lower() in {"nan", "none"}:
+        return "", ""
+    # Normalize common separators used by sportsbooks/APIs.
+    pieces = None
+    for sep in [" @ ", " at ", " vs ", " v ", " - "]:
+        if sep.lower() in txt.lower():
+            # Use regex so case-insensitive split preserves original sides.
+            pieces = re.split(re.escape(sep), txt, maxsplit=1, flags=re.IGNORECASE)
+            break
+    if not pieces or len(pieces) != 2:
+        return "", ""
+    left, right = pieces[0].strip(), pieces[1].strip()
+    away = _team_key_for_matchup(left)
+    home = _team_key_for_matchup(right)
+    return away, home
+
+
+def _matchup_from_raw_event(row: pd.Series) -> Dict[str, str]:
+    """Use sportsbook event text before schedules. This fixes cases where Odds API pulled
+    player props but the cached SportsDataverse schedule date/team format did not match.
+    """
+    team = _team_key_for_matchup(row.get("Team"))
+    away, home = _parse_event_teams_from_text(row.get("Raw"))
+    if not away or not home:
+        return {}
+    if team and team == away:
+        return {"Opponent": home, "HomeAway": "AWAY", "Matchup": f"{away} @ {home}", "MatchupSource": "sportsbook event"}
+    if team and team == home:
+        return {"Opponent": away, "HomeAway": "HOME", "Matchup": f"{away} @ {home}", "MatchupSource": "sportsbook event"}
+    # If team is missing/failed, do not guess the player's team from the game. Keep both teams visible.
+    return {"Opponent": "", "HomeAway": "", "Matchup": f"{away} @ {home}", "MatchupSource": "sportsbook event - team not matched"}
+
+
+def _schedule_candidates_for_row(mode: str, row: pd.Series) -> pd.DataFrame:
+    """Get schedule candidates using line start date first, then selected slate, then full cached schedule."""
+    sched_all = load_dataset("schedules")
+    if sched_all is None or sched_all.empty:
+        return pd.DataFrame()
+    sched_all = standardize_schedules(sched_all)
+    # 1) Prefer line start date from sportsbook row.
+    start = pd.to_datetime(row.get("Start"), errors="coerce", utc=True)
+    if pd.notna(start) and "GameDate" in sched_all.columns:
+        line_date = start.tz_convert(None).date()
+        d = sched_all[pd.to_datetime(sched_all["GameDate"], errors="coerce").dt.date == line_date].copy()
+        if not d.empty:
+            return d
+    # 2) Use selected slate date.
+    d = schedule_for_slate(mode)
+    if d is not None and not d.empty:
+        return d
+    # 3) Full schedule fallback.
+    return sched_all
 
 
 def enrich_board_with_matchups(proj_df: pd.DataFrame, mode: str) -> pd.DataFrame:
-    """Attach Opponent/HomeAway/Matchup from cached schedules so every player card can show who they face."""
+    """Attach Opponent/HomeAway/Matchup and keep the opponent available to the projection engine.
+
+    Resolution priority:
+    1. Sportsbook/Odds API event text in Raw, e.g. 'WAS @ LVA'.
+    2. Cached SportsDataverse schedule using Start date or Today/Tomorrow mode.
+    3. Existing opponent/matchup columns if already present.
+    """
     if proj_df is None or proj_df.empty:
         return proj_df
     out = proj_df.copy()
-    for c in ["Team", "Opponent", "HomeAway", "Matchup"]:
+    for c in ["Team", "Opponent", "HomeAway", "Matchup", "Matchup Source"]:
         if c not in out.columns:
             out[c] = ""
-    sched = schedule_for_slate(mode)
-    if sched is None or sched.empty:
-        # Fallback: preserve existing matchup if line source supplied one.
-        out["Matchup"] = out.apply(lambda r: r.get("Matchup") or (f"{r.get('Team','')} vs {r.get('Opponent','')}" if r.get('Team') and r.get('Opponent') else r.get('Team','')), axis=1)
-        return out
-    sched = sched.copy()
-    sched["HomeKey"] = sched.get("Home", "").map(_team_key_for_matchup)
-    sched["AwayKey"] = sched.get("Away", "").map(_team_key_for_matchup)
     for i, r in out.iterrows():
         team = _team_key_for_matchup(r.get("Team"))
+
+        # First: use sportsbook event text. This is the most reliable for Odds API rows.
+        raw_hit = _matchup_from_raw_event(r)
+        if raw_hit and raw_hit.get("Matchup"):
+            # Only write opponent if the player's team matches one side; always write matchup text.
+            if raw_hit.get("Opponent"):
+                out.at[i, "Opponent"] = raw_hit.get("Opponent", "")
+                out.at[i, "HomeAway"] = raw_hit.get("HomeAway", "")
+            out.at[i, "Matchup"] = raw_hit.get("Matchup", "")
+            out.at[i, "Matchup Source"] = raw_hit.get("MatchupSource", "sportsbook event")
+            if raw_hit.get("Opponent"):
+                continue
+
+        # Second: use schedule cache/start-date fallback.
         if not team:
             continue
+        sched = _schedule_candidates_for_row(mode, r)
+        if sched is None or sched.empty:
+            continue
+        sched = sched.copy()
+        sched["HomeKey"] = sched.get("Home", "").map(_team_key_for_matchup)
+        sched["AwayKey"] = sched.get("Away", "").map(_team_key_for_matchup)
         hit = sched[(sched["HomeKey"] == team) | (sched["AwayKey"] == team)]
         if hit.empty:
             continue
+        # Prefer the closest date to the sportsbook start if available.
+        if "Start" in r and "GameDate" in hit.columns:
+            st_dt = pd.to_datetime(r.get("Start"), errors="coerce", utc=True)
+            if pd.notna(st_dt):
+                dd = pd.to_datetime(hit["GameDate"], errors="coerce", utc=True)
+                hit = hit.assign(_date_diff=(dd - st_dt).abs()).sort_values("_date_diff")
         g = hit.iloc[0]
-        home = str(g.get("Home", "")); away = str(g.get("Away", ""))
-        home_key = _team_key_for_matchup(home); away_key = _team_key_for_matchup(away)
+        home_key = _team_key_for_matchup(g.get("Home", ""))
+        away_key = _team_key_for_matchup(g.get("Away", ""))
         if team == home_key:
-            out.at[i, "Opponent"] = away_key or away
+            out.at[i, "Opponent"] = away_key
             out.at[i, "HomeAway"] = "HOME"
-            out.at[i, "Matchup"] = f"{away_key or away} @ {team}"
+            out.at[i, "Matchup"] = f"{away_key} @ {team}"
+            out.at[i, "Matchup Source"] = "cached schedule"
         elif team == away_key:
-            out.at[i, "Opponent"] = home_key or home
+            out.at[i, "Opponent"] = home_key
             out.at[i, "HomeAway"] = "AWAY"
-            out.at[i, "Matchup"] = f"{team} @ {home_key or home}"
-    out["Matchup"] = out.apply(lambda r: r.get("Matchup") or (f"{r.get('Team','')} vs {r.get('Opponent','')}" if r.get('Team') and r.get('Opponent') else r.get('Team','')), axis=1)
-    return out
+            out.at[i, "Matchup"] = f"{team} @ {home_key}"
+            out.at[i, "Matchup Source"] = "cached schedule"
 
+    def _final_matchup(r):
+        m = str(r.get("Matchup") or "").strip()
+        if m and m.lower() not in {"nan", "none"}:
+            return m
+        t = _team_key_for_matchup(r.get("Team"))
+        o = _team_key_for_matchup(r.get("Opponent"))
+        return f"{t} vs {o}" if t and o else t
+    out["Team"] = out["Team"].map(lambda x: _team_key_for_matchup(x) or str(x or ""))
+    out["Opponent"] = out["Opponent"].map(lambda x: _team_key_for_matchup(x) if str(x or "").strip() else "")
+    out["Matchup"] = out.apply(_final_matchup, axis=1)
+    return out
 
 
 def _latest_team_context(team: str, season: Any = None) -> Dict[str, Any]:
