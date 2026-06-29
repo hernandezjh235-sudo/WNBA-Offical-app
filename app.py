@@ -2721,27 +2721,40 @@ def _safe_series(df: pd.DataFrame, col: str, default=np.nan):
 
 
 def derive_team_ranks_from_logs_and_schedule(logs: pd.DataFrame, schedules: pd.DataFrame) -> pd.DataFrame:
-    """Extra team-context backup when team_season_stats lacks pace/ratings."""
+    """Extra team-context backup when team_season_stats lacks pace/ratings.
+
+    Important fix: avoid duplicate Team columns after groupby/rename. Duplicate columns
+    make out["Team"] return a DataFrame, which causes: DataFrame object has no attribute str.
+    """
     rows = []
     logs = standardize_player_logs(logs) if logs is not None and not logs.empty else pd.DataFrame()
     if not logs.empty:
         d = logs.copy()
-        d["TeamKey"] = d["Team"].map(normalize_team_code)
+        if "Team" not in d.columns:
+            d["Team"] = ""
+        d["TeamKey"] = d["Team"].apply(normalize_team_code)
         for c in ["PTS", "REB", "AST", "FGA", "FGM", "FG3M", "FTA", "TOV", "OREB"]:
             if c not in d.columns:
                 d[c] = 0
             d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+        if "Season" not in d.columns:
+            d["Season"] = np.nan
+        if "GameDate" not in d.columns:
+            d["GameDate"] = pd.NaT
         agg = d.groupby(["Season", "TeamKey"], dropna=False).agg(
-            Team=("Team", lambda x: x.dropna().iloc[-1] if len(x.dropna()) else ""),
-            Games=("GameDate", "nunique"), PTS=("PTS", "sum"), REB=("REB", "sum"), AST=("AST", "sum"),
-            FGA=("FGA", "sum"), FGM=("FGM", "sum"), FG3M=("FG3M", "sum"), FTA=("FTA", "sum"),
-            TOV=("TOV", "sum"), OREB=("OREB", "sum")
+            Games=("GameDate", "nunique"),
+            PTS=("PTS", "sum"), REB=("REB", "sum"), AST=("AST", "sum"),
+            FGA=("FGA", "sum"), FGM=("FGM", "sum"), FG3M=("FG3M", "sum"),
+            FTA=("FTA", "sum"), TOV=("TOV", "sum"), OREB=("OREB", "sum")
         ).reset_index()
-        poss = agg["FGA"] + 0.44*agg["FTA"] + agg["TOV"] - agg["OREB"]
+        agg["Team"] = agg["TeamKey"].apply(normalize_team_code)
+        agg = agg.drop(columns=["TeamKey"], errors="ignore")
+        poss = agg["FGA"] + 0.44 * agg["FTA"] + agg["TOV"] - agg["OREB"]
         agg["Pace"] = np.where(agg["Games"] > 0, poss / agg["Games"], np.nan)
         agg["ORtg"] = np.where(poss > 0, 100 * agg["PTS"] / poss, np.nan)
-        agg["eFG%"] = np.where(agg["FGA"] > 0, (agg["FGM"] + 0.5*agg["FG3M"]) / agg["FGA"], np.nan)
-        rows.append(agg.rename(columns={"TeamKey": "Team"}))
+        agg["eFG%"] = np.where(agg["FGA"] > 0, (agg["FGM"] + 0.5 * agg["FG3M"]) / agg["FGA"], np.nan)
+        rows.append(agg)
+
     sched = standardize_schedules(schedules) if schedules is not None and not schedules.empty else pd.DataFrame()
     if not sched.empty and {"Home", "Away", "HomeScore", "AwayScore"}.issubset(sched.columns):
         sr = []
@@ -2754,22 +2767,45 @@ def derive_team_ranks_from_logs_and_schedule(logs: pd.DataFrame, schedules: pd.D
                 sr.append({"Season": r.get("Season"), "Team": away, "PtsFor": r.get("AwayScore"), "PtsAllowed": r.get("HomeScore")})
         if sr:
             sg = pd.DataFrame(sr).groupby(["Season", "Team"], dropna=False).agg(
-                GamesSchedule=("PtsFor", "count"), PPG=("PtsFor", "mean"), PointsAllowed=("PtsAllowed", "mean")
+                GamesSchedule=("PtsFor", "count"),
+                PPG=("PtsFor", "mean"),
+                PointsAllowed=("PtsAllowed", "mean")
             ).reset_index()
+            sg["Team"] = sg["Team"].apply(normalize_team_code)
             sg["DRtg"] = sg["PointsAllowed"]
             rows.append(sg)
+
     if not rows:
         return pd.DataFrame()
-    out = pd.concat(rows, ignore_index=True, sort=False)
-    out["Team"] = out["Team"].map(normalize_team_code)
+
+    clean_rows = []
+    for r in rows:
+        if r is None or r.empty:
+            continue
+        rr = r.copy()
+        # Drop accidental duplicate-named columns, keeping the first occurrence.
+        rr = rr.loc[:, ~pd.Index(rr.columns).duplicated()]
+        if "Team" not in rr.columns:
+            continue
+        rr["Team"] = rr["Team"].apply(normalize_team_code)
+        rr = rr[rr["Team"].astype(str).str.len() > 0].copy()
+        clean_rows.append(rr)
+
+    if not clean_rows:
+        return pd.DataFrame()
+
+    out = pd.concat(clean_rows, ignore_index=True, sort=False)
+    out = out.loc[:, ~pd.Index(out.columns).duplicated()]
+    out["Team"] = out["Team"].apply(normalize_team_code)
     out = out[out["Team"].astype(str).str.len() > 0].copy()
-    out = out.groupby(["Season", "Team"], dropna=False).agg(lambda x: x.dropna().iloc[-1] if len(x.dropna()) else np.nan).reset_index()
+    out = out.groupby(["Season", "Team"], dropna=False).agg(
+        lambda x: x.dropna().iloc[-1] if len(x.dropna()) else np.nan
+    ).reset_index()
     if "NetRtg" not in out.columns:
         out["NetRtg"] = np.nan
     if "ORtg" in out.columns and "DRtg" in out.columns:
         out["NetRtg"] = out["NetRtg"].fillna(out["ORtg"] - out["DRtg"])
     return out
-
 
 def merge_team_context_robust(base: pd.DataFrame, team_ranks: pd.DataFrame, logs: pd.DataFrame, schedules: pd.DataFrame) -> pd.DataFrame:
     if base is None or base.empty:
