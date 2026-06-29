@@ -1403,12 +1403,227 @@ def pass_reason(data_score, edge, role_conf, minutes_grade, sim_over, sim_under,
     return "; ".join(reasons) if reasons else "Meets official gate"
 
 
+
+def explain_projection_parts(market: str, baseline: float, minutes_factor: float, usage_factor: float, pace_factor: float, matchup_factor: float, shot_boost: float, lineup_boost: float, learn_adj: float) -> Tuple[str, str, str]:
+    parts = []
+    parts.append(("Recent/Baseline", baseline - baseline, f"Weighted season + L3/L5/L10/L20 baseline = {baseline:.2f}"))
+    parts.append(("Minutes", baseline * (minutes_factor - 1), f"Minutes factor {minutes_factor:.3f}"))
+    parts.append(("Usage", baseline * (usage_factor - 1), f"Usage factor {usage_factor:.3f}"))
+    parts.append(("Pace", baseline * (pace_factor - 1), f"Pace factor {pace_factor:.3f}"))
+    parts.append(("Matchup", baseline * (matchup_factor - 1), f"Team/matchup factor {matchup_factor:.3f}"))
+    parts.append(("Shot Profile", shot_boost, f"Shot profile boost {shot_boost:+.2f}"))
+    parts.append(("Lineup", lineup_boost, f"Lineup/rotation boost {lineup_boost:+.2f}"))
+    parts.append(("Learning", learn_adj, f"Learning/Bayesian nudge {learn_adj:+.2f}"))
+    biggest_pos = max(parts[1:], key=lambda x: x[1]) if len(parts) > 1 else parts[0]
+    biggest_risk = min(parts[1:], key=lambda x: x[1]) if len(parts) > 1 else parts[0]
+    compact = " | ".join([f"{name}: {val:+.2f}" for name, val, _ in parts[1:]])
+    return compact, biggest_pos[2], biggest_risk[2]
+
+
+def shot_profile_boost_for_market(b: pd.Series, market: str) -> Tuple[float, str]:
+    three_rate = safe_float(b.get("ThreePARate"), np.nan)
+    make_rate = safe_float(b.get("ShotMakeRate"), np.nan)
+    rim_rate = safe_float(b.get("RimRate"), np.nan)
+    shot_score = safe_float(b.get("ShotProfileScore"), np.nan)
+    if market not in ["PTS", "PRA"]:
+        return 0.0, "Shot profile is tracked, but not heavily weighted for REB/AST."
+    boost = 0.0
+    notes = []
+    if pd.notna(three_rate):
+        boost += max(-0.35, min(0.45, (three_rate - 0.32) * 1.10))
+        notes.append(f"3PA rate {three_rate:.2f}")
+    if pd.notna(make_rate):
+        boost += max(-0.35, min(0.45, (make_rate - 0.42) * 1.25))
+        notes.append(f"shot make rate {make_rate:.2f}")
+    if pd.notna(rim_rate):
+        boost += max(-0.25, min(0.30, (rim_rate - 0.22) * 0.85))
+        notes.append(f"rim rate {rim_rate:.2f}")
+    if pd.notna(shot_score):
+        boost += max(-0.25, min(0.30, (shot_score - 55) / 100))
+        notes.append(f"shot profile score {shot_score:.1f}")
+    return round(float(boost), 3), "; ".join(notes) if notes else "No shot chart sample yet."
+
+
+def model_disagreement_label(edge: float, sim_over: float, sim_under: float, lean: str, bayes: float) -> str:
+    if pd.isna(edge):
+        return "No projection edge"
+    sim_side = sim_over if lean == "OVER" else sim_under
+    if abs(edge) >= 1.5 and sim_side >= 60 and bayes >= 58:
+        return "Models agree"
+    if abs(edge) < 0.75 or sim_side < 55:
+        return "Model disagreement / thin edge"
+    return "Moderate agreement"
+
+
+def player_similarity_engine(logs: pd.DataFrame, name_key: str, market: str, minutes_proj: float, usage_proxy: float, limit: int = 10) -> Dict[str, Any]:
+    """Find the player's closest historical games by minutes/usage-ish profile and return a similarity projection."""
+    out = {"Similarity Projection": np.nan, "Similarity Sample": 0, "Similarity Note": "No similarity sample."}
+    if logs is None or logs.empty or market not in logs.columns or "NameKey" not in logs.columns:
+        return out
+    d = logs[logs["NameKey"] == name_key].copy().sort_values("GameDate")
+    if d.empty:
+        return out
+    for c in [market, "MIN", "FGA", "FTA", "TOV"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=[market])
+    if d.empty:
+        return out
+    if "MIN" not in d.columns or d["MIN"].isna().all():
+        vals = d[market].tail(limit)
+        return {"Similarity Projection": round(float(vals.mean()), 2), "Similarity Sample": len(vals), "Similarity Note": f"Recent {len(vals)} game similarity fallback."}
+    d["UsageLike"] = d.get("FGA", 0).fillna(0) + 0.44*d.get("FTA", 0).fillna(0) + d.get("TOV", 0).fillna(0)
+    usage_ref = usage_proxy if pd.notna(usage_proxy) else d["UsageLike"].tail(10).mean()
+    d["SimilarityScore"] = (d["MIN"].fillna(minutes_proj).sub(minutes_proj).abs() * 1.0) + (d["UsageLike"].fillna(usage_ref).sub(usage_ref).abs() * 0.65)
+    sims = d.sort_values("SimilarityScore").head(limit)
+    if sims.empty:
+        return out
+    weights = 1 / (1 + sims["SimilarityScore"].fillna(0))
+    sim_proj = float(np.average(sims[market], weights=weights)) if weights.sum() else float(sims[market].mean())
+    return {"Similarity Projection": round(sim_proj, 2), "Similarity Sample": int(len(sims)), "Similarity Note": f"{len(sims)} closest historical games by minutes/usage."}
+
+
+def home_away_splits(logs: pd.DataFrame, name_key: str, market: str) -> Dict[str, Any]:
+    out = {"Home Avg": np.nan, "Away Avg": np.nan, "HomeAway Note": "Home/away unavailable."}
+    if logs is None or logs.empty or market not in logs.columns or "NameKey" not in logs.columns:
+        return out
+    d = logs[logs["NameKey"] == name_key].copy()
+    if d.empty:
+        return out
+    ha_col = "HomeAway" if "HomeAway" in d.columns else None
+    if not ha_col or d[ha_col].isna().all():
+        return out
+    d[market] = pd.to_numeric(d[market], errors="coerce")
+    h = d[d[ha_col].astype(str).str.upper().str.contains("HOME|H", na=False)][market].mean()
+    a = d[d[ha_col].astype(str).str.upper().str.contains("AWAY|A|ROAD", na=False)][market].mean()
+    if pd.notna(h) or pd.notna(a):
+        return {"Home Avg": round(float(h), 2) if pd.notna(h) else np.nan, "Away Avg": round(float(a), 2) if pd.notna(a) else np.nan, "HomeAway Note": f"Home {round(float(h),2) if pd.notna(h) else 'NA'} / Away {round(float(a),2) if pd.notna(a) else 'NA'}"}
+    return out
+
+
+def rest_travel_engine(logs: pd.DataFrame, name_key: str) -> Dict[str, Any]:
+    out = {"Rest Days": np.nan, "BackToBack": False, "RestTravel Boost": 0.0, "Travel Note": "No schedule/rest sample."}
+    if logs is None or logs.empty or "NameKey" not in logs.columns or "GameDate" not in logs.columns:
+        return out
+    d = logs[logs["NameKey"] == name_key].copy().sort_values("GameDate")
+    d["GameDate"] = pd.to_datetime(d["GameDate"], errors="coerce")
+    d = d.dropna(subset=["GameDate"])
+    if len(d) < 2:
+        return out
+    last = d.iloc[-1]["GameDate"]
+    prev = d.iloc[-2]["GameDate"]
+    rest = max(0, int((last.date() - prev.date()).days))
+    b2b = rest <= 1
+    boost = -0.25 if b2b else 0.08 if rest >= 3 else 0.0
+    return {"Rest Days": rest, "BackToBack": bool(b2b), "RestTravel Boost": boost, "Travel Note": f"Recent rest pattern: {rest} day(s); {'B2B risk' if b2b else 'normal/rested'}."}
+
+
+def blowout_engine(team_net: float, matchup_strength: float, minutes_proj: float) -> Dict[str, Any]:
+    net = 0 if pd.isna(team_net) else float(team_net)
+    ms = 50 if pd.isna(matchup_strength) else float(matchup_strength)
+    risk = max(0, min(100, 45 + abs(net)*2.2 + abs(ms-50)*0.9))
+    tax = -0.35 if risk >= 75 and minutes_proj >= 28 else -0.15 if risk >= 65 else 0.0
+    note = "High blowout/minutes tax" if tax <= -0.35 else "Moderate blowout watch" if tax < 0 else "Neutral blowout risk"
+    return {"Blowout Risk": round(risk, 1), "Blowout Tax": tax, "Blowout Note": note}
+
+
+def clutch_minutes_engine(logs: pd.DataFrame, name_key: str, minutes_proj: float) -> Dict[str, Any]:
+    boost = 0.0
+    note = "No clutch sample."
+    if logs is not None and not logs.empty and "NameKey" in logs.columns and "MIN" in logs.columns:
+        d = logs[logs["NameKey"] == name_key].copy().sort_values("GameDate")
+        mins = pd.to_numeric(d["MIN"], errors="coerce").dropna().tail(10)
+        if len(mins):
+            stable = float(mins.std(ddof=0)) <= 4.0 and float(mins.mean()) >= 28
+            boost = 0.18 if stable else 0.0
+            note = "Stable closing-minute profile" if stable else "No clear clutch-minute boost"
+    return {"Clutch Minute Boost": boost, "Clutch Note": note}
+
+
+def bench_rotation_engine(b: pd.Series) -> Dict[str, Any]:
+    starter_rate = safe_float(b.get("StarterRate"), np.nan)
+    lineup_mentions = safe_float(b.get("LineupMentions"), np.nan)
+    role_conf = safe_float(b.get("RoleConfidence"), 50)
+    if pd.notna(starter_rate):
+        role = "Starter" if starter_rate >= 0.60 else "Bench/variable" if starter_rate <= 0.25 else "Split role"
+        boost = 0.25 if starter_rate >= 0.75 else -0.20 if starter_rate <= 0.15 else 0.0
+    else:
+        role = "Unknown rotation"
+        boost = 0.0
+    if pd.notna(lineup_mentions) and lineup_mentions >= 20:
+        boost += 0.08
+    grade = "A" if role_conf >= 78 else "B" if role_conf >= 65 else "C" if role_conf >= 52 else "D"
+    return {"Bench Rotation Role": role, "Bench Rotation Boost": round(boost, 3), "Bench Rotation Grade": grade, "Bench Rotation Note": f"{role}; rotation grade {grade}."}
+
+
+def line_movement_engine(player: str, market: str, current_line: float) -> Dict[str, Any]:
+    hist = load_json(LINE_HISTORY_FILE, [])
+    rows = [r for r in hist if normalize_name(r.get("Player")) == normalize_name(player) and str(r.get("Market")) == str(market)]
+    if not rows or pd.isna(current_line):
+        return {"Opening Line": np.nan, "Line Move": 0.0, "Line Movement Note": "No saved opening-line history yet."}
+    first = safe_float(rows[0].get("Line"), np.nan)
+    if pd.isna(first):
+        return {"Opening Line": np.nan, "Line Move": 0.0, "Line Movement Note": "Opening line unavailable."}
+    move = float(current_line - first)
+    note = f"Opening {first:g} → current {current_line:g} ({move:+.1f})."
+    return {"Opening Line": first, "Line Move": round(move, 2), "Line Movement Note": note}
+
+
+def referee_engine_note() -> Dict[str, Any]:
+    return {"Referee Factor": 0.0, "Referee Note": "Neutral until official/referee data is imported; avoids fake ref edges."}
+
+
+def pace_projection_engine(team_pace: float, matchup_strength: float) -> Dict[str, Any]:
+    pace = 78.0 if pd.isna(team_pace) else float(team_pace)
+    ms = 50 if pd.isna(matchup_strength) else float(matchup_strength)
+    proj_pace = pace + (ms-50)/25
+    boost = max(-0.20, min(0.20, (proj_pace - 78)/25))
+    return {"Projected Pace": round(proj_pace, 2), "Pace Boost": round(boost, 3), "Pace Projection Note": f"Projected possessions pace proxy {proj_pace:.1f}."}
+
+
+def tier_grade(score: float, edge: float, sim_side: float, data_score: float) -> str:
+    if score >= 88 and abs(edge) >= 2.0 and sim_side >= 64 and data_score >= 80:
+        return "Tier 1 — Elite"
+    if score >= 80 and abs(edge) >= 1.6 and sim_side >= 60:
+        return "Tier 2 — Strong"
+    if score >= 72 and abs(edge) >= 1.2:
+        return "Tier 3 — Playable"
+    if score >= 64 and abs(edge) >= 0.8:
+        return "Tier 4 — Lean"
+    if score >= 56:
+        return "Tier 5 — Track"
+    if score >= 48:
+        return "Tier 6 — Thin"
+    if score >= 40:
+        return "Tier 7 — Avoid"
+    return "Tier 8 — Pass"
+
+
+def feature_importance_text(row: Dict[str, Any]) -> str:
+    items = []
+    for k in ["Projection Explanation", "Shot Profile Note", "Pace Projection Note", "Travel Note", "Bench Rotation Note", "Blowout Note", "Line Movement Note"]:
+        v = row.get(k)
+        if v not in [None, "", np.nan]:
+            items.append(f"{k.replace(' Note','')}: {v}")
+    return " || ".join(items[:7])
+
+
+def correlation_note_for_market(market: str) -> str:
+    if market == "AST":
+        return "AST props correlate positively with teammates' made shots/PTS environments."
+    if market == "PTS":
+        return "PTS props can correlate with teammates' AST, pace, and shot-volume profiles."
+    if market == "REB":
+        return "REB props can be negatively correlated with teammate rebounders and pace/shot-miss volume."
+    return "PRA combines scoring, rebounding, and assists; watch same-game correlation risk."
+
+
 def project_row(row, base, logs):
     player = row["Player"]; market = row["Market"]; line = row["Line"]
     b, score = match_player_base(player, base)
     if b is None or score < 0.76:
         proj = np.nan
-        info = {"Data Score": 20, "Projection Note": "No stat baseline match", "Matched Player": "", "Match Score": round(score, 3), "Role Confidence": 0, "Minutes Safety": "NA", "Bayesian Confidence": 50}
+        info = {"Data Score": 20, "Projection Note": "No stat baseline match", "Matched Player": "", "Match Score": round(score, 3), "Role Confidence": 0, "Minutes Safety": "NA", "Bayesian Confidence": 50, "Projection Explanation": "No matched player baseline.", "Biggest Positive": "None", "Biggest Risk": "Player name did not match SportsDataverse baseline.", "Shot Profile Boost": 0.0, "Shot Profile Note": "No shot data.", "Confidence Breakdown": "Data 20 | Role 0 | Minutes NA", "Model Agreement": "No model"}
         hit = {"L5 Hit%": np.nan, "L10 Hit%": np.nan, "L20 Hit%": np.nan, "Season Hit%": np.nan, "Last Values": ""}
         return proj, {**info, **hit}
 
@@ -1431,25 +1646,58 @@ def project_row(row, base, logs):
     usage_input = usage if pd.notna(usage) else usage_proxy
     usage_factor = 1.0
     if market in ["PTS", "PRA"] and pd.notna(usage_input):
-        # Works for either percentage-like or raw attempts proxy.
         target = 21 if usage_input > 1.5 and usage_input <= 100 else 11
         usage_factor = max(0.90, min(1.10, usage_input / target))
+    elif market == "AST" and pd.notna(safe_float(b.get("AST%"), np.nan)):
+        usage_factor = max(0.92, min(1.08, safe_float(b.get("AST%"), 18) / 18))
+    elif market == "REB" and pd.notna(safe_float(b.get("TRB%"), np.nan)):
+        usage_factor = max(0.92, min(1.08, safe_float(b.get("TRB%"), 10) / 10))
 
     pace = safe_float(b.get("Team_Pace"), np.nan)
     pace_factor = 1.0 if pd.isna(pace) else max(0.94, min(1.06, pace / np.nanmean([pace, 78])))
     team_net = safe_float(b.get("Team_NetRtg"), 0)
+    matchup_strength = safe_float(b.get("TeamMatchupStrengthScore"), np.nan)
     matchup_factor = max(0.94, min(1.06, 1 + team_net/250)) if pd.notna(team_net) else 1.0
+    if pd.notna(matchup_strength):
+        matchup_factor = max(0.92, min(1.08, matchup_factor + (matchup_strength - 50)/900))
 
     role_conf = safe_float(b.get("RoleConfidence"), 50)
     minutes_grade = str(b.get("MinutesSafetyGrade", "NA"))
     data_score = safe_float(b.get("DataScore"), 50)
+    lineup_cont = safe_float(b.get("LineupContinuityScore"), np.nan)
+    lineup_boost = 0.0 if pd.isna(lineup_cont) else max(-0.25, min(0.25, (lineup_cont - 55)/220))
+    shot_boost, shot_note = shot_profile_boost_for_market(b, market)
+
+    # Full advanced context layers: player similarity, rest/travel, blowout, clutch, bench rotation, line movement, referee neutral, pace projection.
+    sim_ctx = player_similarity_engine(logs, normalize_name(b.get("Player")), market, minutes_proj, usage_proxy)
+    rest_ctx = rest_travel_engine(logs, normalize_name(b.get("Player")))
+    blow_ctx = blowout_engine(team_net, matchup_strength, minutes_proj)
+    clutch_ctx = clutch_minutes_engine(logs, normalize_name(b.get("Player")), minutes_proj)
+    bench_ctx = bench_rotation_engine(b)
+    line_ctx = line_movement_engine(player, market, line)
+    ref_ctx = referee_engine_note()
+    pace_ctx = pace_projection_engine(pace, matchup_strength)
+    home_ctx = home_away_splits(logs, normalize_name(b.get("Player")), market)
 
     learn_adj, learn_note, bayes = learning_adjustment(player, market, baseline - line)
-    pre_ml = baseline * minutes_factor * usage_factor * pace_factor * matchup_factor + learn_adj
+    advanced_nudge = (
+        safe_float(rest_ctx.get("RestTravel Boost"), 0) +
+        safe_float(blow_ctx.get("Blowout Tax"), 0) +
+        safe_float(clutch_ctx.get("Clutch Minute Boost"), 0) +
+        safe_float(bench_ctx.get("Bench Rotation Boost"), 0) +
+        safe_float(ref_ctx.get("Referee Factor"), 0) +
+        safe_float(pace_ctx.get("Pace Boost"), 0)
+    )
+    sim_proj = safe_float(sim_ctx.get("Similarity Projection"), np.nan)
+    pre_ml_raw = baseline * minutes_factor * usage_factor * pace_factor * matchup_factor + shot_boost + lineup_boost + learn_adj + advanced_nudge
+    pre_ml = (0.82 * pre_ml_raw + 0.18 * sim_proj) if pd.notna(sim_proj) else pre_ml_raw
     ml_proj, ml_note = xgboost_blend_projection(b.to_dict(), pre_ml)
     proj = ml_proj
 
     hit = hit_rates_for_player(logs, normalize_name(b.get("Player")), market, line)
+    explanation, biggest_pos, biggest_risk = explain_projection_parts(market, baseline, minutes_factor, usage_factor, pace_factor, matchup_factor, shot_boost, lineup_boost, learn_adj)
+    confidence_breakdown = f"Data {data_score:.1f} | Role {role_conf:.1f} | Minutes {minutes_grade} | Bayesian {bayes:.1f} | Line {row.get('Source','')}"
+    volatility_note = "Low/medium/high comes from recent game standard deviation + Monte Carlo spread."
     info = {
         "Matched Player": b.get("Player"), "Match Score": round(score, 3),
         "MIN Proj": round(minutes_proj, 2), "Usage Proxy": round(usage_proxy, 2) if pd.notna(usage_proxy) else np.nan,
@@ -1461,17 +1709,51 @@ def project_row(row, base, logs):
         "Team ORtg": round(safe_float(b.get("Team_ORtg"), np.nan), 2) if pd.notna(safe_float(b.get("Team_ORtg"), np.nan)) else np.nan,
         "Team DRtg": round(safe_float(b.get("Team_DRtg"), np.nan), 2) if pd.notna(safe_float(b.get("Team_DRtg"), np.nan)) else np.nan,
         "Team Net": round(team_net, 2) if pd.notna(team_net) else np.nan,
-        "Team Matchup Strength": round(safe_float(b.get("TeamMatchupStrengthScore"), np.nan), 1) if pd.notna(safe_float(b.get("TeamMatchupStrengthScore"), np.nan)) else np.nan,
-        "Lineup Continuity": round(safe_float(b.get("LineupContinuityScore"), np.nan), 1) if pd.notna(safe_float(b.get("LineupContinuityScore"), np.nan)) else np.nan,
+        "Team Matchup Strength": round(matchup_strength, 1) if pd.notna(matchup_strength) else np.nan,
+        "Lineup Continuity": round(lineup_cont, 1) if pd.notna(lineup_cont) else np.nan,
         "Shot Profile": round(safe_float(b.get("ShotProfileScore"), np.nan), 1) if pd.notna(safe_float(b.get("ShotProfileScore"), np.nan)) else np.nan,
         "Rim Rate": round(safe_float(b.get("RimRate"), np.nan), 3) if pd.notna(safe_float(b.get("RimRate"), np.nan)) else np.nan,
         "3PA Rate": round(safe_float(b.get("ThreePARate"), np.nan), 3) if pd.notna(safe_float(b.get("ThreePARate"), np.nan)) else np.nan,
         "Shot Make Rate": round(safe_float(b.get("ShotMakeRate"), np.nan), 3) if pd.notna(safe_float(b.get("ShotMakeRate"), np.nan)) else np.nan,
+        "Shot Profile Boost": round(shot_boost, 3),
+        "Shot Profile Note": shot_note,
         "Position": b.get("Position", ""), "PositionGroup": b.get("PositionGroup", "Unknown"),
-        "Projection Note": f"{learn_note}; {ml_note}",
+        "Projection Note": f"{learn_note}; {ml_note}; advanced nudge {advanced_nudge:+.2f}",
+        "Projection Explanation": explanation + f" | Advanced Context: {advanced_nudge:+.2f}",
+        "Biggest Positive": biggest_pos if advanced_nudge <= 0.2 else f"Advanced context adds {advanced_nudge:+.2f} from rest/pace/bench/clutch layers.",
+        "Biggest Risk": biggest_risk if advanced_nudge >= -0.2 else f"Advanced context subtracts {advanced_nudge:+.2f}; review blowout/rest/bench risk.",
+        "Confidence Breakdown": confidence_breakdown,
+        "Volatility Note": volatility_note,
+        "Player Similarity Engine": sim_ctx.get("Similarity Note"),
+        "Similarity Projection": sim_ctx.get("Similarity Projection"),
+        "Similarity Sample": sim_ctx.get("Similarity Sample"),
+        "Defense vs Position": f"Position group: {b.get('PositionGroup', 'Unknown')}; matchup strength {round(matchup_strength,1) if pd.notna(matchup_strength) else 'NA'}",
+        "Rest Travel Blowout": f"{rest_ctx.get('Travel Note')} | {blow_ctx.get('Blowout Note')}",
+        "Rest Days": rest_ctx.get("Rest Days"),
+        "BackToBack": rest_ctx.get("BackToBack"),
+        "Travel Note": rest_ctx.get("Travel Note"),
+        "Blowout Risk": blow_ctx.get("Blowout Risk"),
+        "Blowout Tax": blow_ctx.get("Blowout Tax"),
+        "Blowout Note": blow_ctx.get("Blowout Note"),
+        "Clutch Minute Boost": clutch_ctx.get("Clutch Minute Boost"),
+        "Clutch Note": clutch_ctx.get("Clutch Note"),
+        "Bench Rotation Role": bench_ctx.get("Bench Rotation Role"),
+        "Bench Rotation Grade": bench_ctx.get("Bench Rotation Grade"),
+        "Bench Rotation Note": bench_ctx.get("Bench Rotation Note"),
+        "Opening Line": line_ctx.get("Opening Line"),
+        "Line Move": line_ctx.get("Line Move"),
+        "Line Movement Note": line_ctx.get("Line Movement Note"),
+        "Referee Factor": ref_ctx.get("Referee Factor"),
+        "Referee Note": ref_ctx.get("Referee Note"),
+        "Projected Pace": pace_ctx.get("Projected Pace"),
+        "Pace Boost": pace_ctx.get("Pace Boost"),
+        "Pace Projection Note": pace_ctx.get("Pace Projection Note"),
+        "Home Avg": home_ctx.get("Home Avg"),
+        "Away Avg": home_ctx.get("Away Avg"),
+        "HomeAway Note": home_ctx.get("HomeAway Note"),
+        "Correlation Note": correlation_note_for_market(market),
     }
     return proj, {**info, **hit}
-
 
 def make_projection_board(lines, logs, base):
     if lines is None or lines.empty:
@@ -1511,7 +1793,12 @@ def make_projection_board(lines, logs, base):
         official = "PASS"
         if reason == "Meets official gate" and official_score >= 62 and abs(edge) >= 0.8:
             official = "🔥 OVER" if lean == "OVER" else "⚠️ UNDER"
-        rows.append({**r.to_dict(), **info, **sim, "Projection": round(proj, 2) if pd.notna(proj) else np.nan, "Edge": round(edge, 2) if pd.notna(edge) else np.nan, "Lean": lean, "Official Play Score": official_score, "PASS Reason": reason, "Official": official})
+        model_agreement = model_disagreement_label(edge if pd.notna(edge) else np.nan, sim.get("Over %", np.nan), sim.get("Under %", np.nan), lean, safe_float(info.get("Bayesian Confidence"), 50))
+        sim_side_for_tier = sim.get("Over %", 0) if lean == "OVER" else sim.get("Under %", 0)
+        tier = tier_grade(official_score, edge if pd.notna(edge) else 0, sim_side_for_tier, safe_float(info.get("Data Score"), 0))
+        row_payload = {**r.to_dict(), **info, **sim, "Projection": round(proj, 2) if pd.notna(proj) else np.nan, "Edge": round(edge, 2) if pd.notna(edge) else np.nan, "Lean": lean, "Official Play Score": official_score, "PASS Reason": reason, "Official": official, "Model Agreement": model_agreement, "Tier": tier}
+        row_payload["Feature Importance"] = feature_importance_text(row_payload)
+        rows.append(row_payload)
     out = pd.DataFrame(rows)
     if not out.empty:
         out = out.sort_values(["Official", "Official Play Score", "Edge"], ascending=[True, False, False])
@@ -1587,38 +1874,41 @@ def reset_logs():
 # ============================================================
 # UI
 # ============================================================
+
 def inject_css():
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;800;900&display=swap');
     html, body, [class*="css"] {font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif;}
-    .stApp { background: radial-gradient(circle at top,#240607 0,#090101 42%,#050505 100%); color:#f7f7f7; }
-    section[data-testid="stSidebar"] { background:#09090d; border-right:1px solid rgba(255,65,65,.22); }
-    .block-container { padding-top: 1.2rem; max-width: 1200px; }
-    div[data-testid="stMetric"] { background:linear-gradient(145deg,rgba(45,3,3,.94),rgba(16,16,20,.95)); border:1px solid rgba(255,64,64,.45); border-radius:22px; padding:18px; box-shadow:0 0 18px rgba(255,0,0,.10); }
-    div[data-testid="stMetric"] label { color:#c9c9c9!important; text-transform:uppercase; font-weight:900; letter-spacing:.08em; }
+    .stApp { background: radial-gradient(circle at top,#2b0f55 0,#14051f 42%,#050509 100%); color:#f7f7ff; }
+    section[data-testid="stSidebar"] { background:#090712; border-right:1px solid rgba(179,113,255,.28); }
+    .block-container { padding-top: 1.2rem; max-width: 1240px; }
+    div[data-testid="stMetric"] { background:linear-gradient(145deg,rgba(55,18,92,.94),rgba(16,12,28,.95)); border:1px solid rgba(179,113,255,.50); border-radius:22px; padding:18px; box-shadow:0 0 22px rgba(155,92,255,.16); }
+    div[data-testid="stMetric"] label { color:#d6c6ff!important; text-transform:uppercase; font-weight:900; letter-spacing:.08em; }
     div[data-testid="stMetricValue"] { color:#ffffff!important; font-size:2.3rem!important; }
-    .stButton>button, .stDownloadButton>button { background:#111820; border:1px solid #334155; color:#f8fafc; border-radius:13px; padding:.75rem 1rem; font-weight:800; }
-    .stButton>button:hover, .stDownloadButton>button:hover { border-color:#ff3b3b; color:#ffffff; box-shadow:0 0 14px rgba(255,59,59,.22); }
-    .stTabs [data-baseweb="tab-list"] { gap:16px; border-bottom:1px solid rgba(255,255,255,.08); }
-    .stTabs [data-baseweb="tab"] { color:#bfc5cf; font-weight:900; letter-spacing:.04em; text-transform:uppercase; padding-left:0; padding-right:0; }
-    .stTabs [aria-selected="true"] { color:#39ff87!important; border-bottom:5px solid #39ff87!important; }
-    .owp-hero {background:linear-gradient(145deg,#1a0506 0%,#09090b 58%,#120202 100%); border:1px solid rgba(255,56,56,.55); border-radius:28px; padding:28px; margin: 8px 0 22px 0; box-shadow: inset 0 0 28px rgba(255,0,0,.08), 0 0 35px rgba(255,0,0,.12);}
+    .stButton>button, .stDownloadButton>button { background:#151024; border:1px solid #6d3cc7; color:#f8f3ff; border-radius:13px; padding:.75rem 1rem; font-weight:800; }
+    .stButton>button:hover, .stDownloadButton>button:hover { border-color:#c084fc; color:#ffffff; box-shadow:0 0 16px rgba(192,132,252,.30); }
+    .stTabs [data-baseweb="tab-list"] { gap:16px; border-bottom:1px solid rgba(255,255,255,.10); }
+    .stTabs [data-baseweb="tab"] { color:#d5c8ff; font-weight:900; letter-spacing:.04em; text-transform:uppercase; padding-left:0; padding-right:0; }
+    .stTabs [aria-selected="true"] { color:#d8b4fe!important; border-bottom:5px solid #a855f7!important; }
+    .owp-hero {background:linear-gradient(145deg,#32115e 0%,#0b0712 58%,#1b0630 100%); border:1px solid rgba(192,132,252,.65); border-radius:28px; padding:28px; margin: 8px 0 22px 0; box-shadow: inset 0 0 28px rgba(168,85,247,.12), 0 0 36px rgba(168,85,247,.16);}
     .owp-title {font-size:2.25rem; font-weight:1000; line-height:1.18; letter-spacing:.02em; color:#fff; text-transform:uppercase;}
-    .owp-subtitle {font-size:1.08rem; color:#d7d7dc; margin-top:10px;}
-    .owp-blue-note {background:#08243d; border-radius:16px; border:1px solid rgba(65,164,255,.35); color:#50adff; padding:16px; margin:16px 0 22px 0; line-height:1.55; font-weight:700;}
+    .owp-subtitle {font-size:1.08rem; color:#e9d5ff; margin-top:10px;}
+    .owp-blue-note {background:#1d1233; border-radius:16px; border:1px solid rgba(192,132,252,.40); color:#d8b4fe; padding:16px; margin:16px 0 22px 0; line-height:1.55; font-weight:700;}
     .owp-kpi-grid {display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; margin:18px 0;}
-    .owp-kpi-card {background:linear-gradient(145deg,rgba(39,3,4,.98),rgba(12,12,15,.98)); border:1px solid rgba(255,55,55,.40); border-radius:24px; padding:20px; min-height:125px;}
-    .owp-kpi-label {color:#b9b9c2; text-transform:uppercase; font-weight:1000; letter-spacing:.08em; font-size:.9rem;}
+    .owp-kpi-card {background:linear-gradient(145deg,rgba(54,18,91,.98),rgba(12,10,18,.98)); border:1px solid rgba(192,132,252,.45); border-radius:24px; padding:20px; min-height:125px;}
+    .owp-kpi-label {color:#d8c8ff; text-transform:uppercase; font-weight:1000; letter-spacing:.08em; font-size:.9rem;}
     .owp-kpi-value {font-size:2.7rem; font-weight:900; color:#fff; margin-top:16px;}
-    .owp-kpi-sub {color:#c7c7cc; margin-top:8px; font-size:.92rem;}
-    .section-title {font-size:2rem; font-weight:1000; border-left:7px solid #ff3838; padding-left:16px; margin:26px 0 8px 0;}
-    .card { background:linear-gradient(145deg,#170304,#0b0d12); border:1px solid rgba(255,59,59,.45); border-radius:24px; padding:18px; margin:14px 0; box-shadow: 0 0 20px rgba(255,0,0,.09); }
-    .badge { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid #3b4657; margin-right:6px; font-size:.82rem; }
-    .hot { color:#70ffbd; font-weight:900; }
-    .warn { color:#ffd166; font-weight:900; }
-    .pass { color:#aeb6c2; font-weight:800; }
-    .small-note { color:#9fb2c3; font-size:.86rem; }
+    .owp-kpi-sub {color:#e9d5ff; margin-top:8px; font-size:.92rem;}
+    .section-title {font-size:2rem; font-weight:1000; border-left:7px solid #a855f7; padding-left:16px; margin:26px 0 8px 0;}
+    .card { background:linear-gradient(145deg,#24113d,#0b0d12); border:1px solid rgba(192,132,252,.48); border-radius:24px; padding:18px; margin:14px 0; box-shadow: 0 0 22px rgba(168,85,247,.12); }
+    .badge { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid #7e57c2; margin-right:6px; font-size:.82rem; color:#f3e8ff; }
+    .hot { color:#86efac; font-weight:900; }
+    .warn { color:#facc15; font-weight:900; }
+    .pass { color:#c4b5fd; font-weight:800; }
+    .small-note { color:#d8b4fe; font-size:.86rem; }
+    .explain-box { background:rgba(88,28,135,.22); border:1px solid rgba(192,132,252,.30); border-radius:16px; padding:12px; margin-top:10px; }
+    .hidden-baseline-note { color:#d8b4fe; font-size:.92rem; margin:8px 0; }
     .owp-header { display:none; }
     @media (max-width: 760px) {
       .owp-title {font-size:1.8rem;}
@@ -1633,19 +1923,37 @@ def inject_css():
 
 def render_card(r):
     cls = "hot" if "OVER" in str(r.get("Official")) else "warn" if "UNDER" in str(r.get("Official")) else "pass"
+    line_val = r.get('Line', 'NO LINE')
+    source_val = r.get('Source', 'Baseline')
     st.markdown(f"""
     <div class='card'>
       <h3>{r.get('Player','')} <span class='badge'>{r.get('Market','')}</span> <span class='badge'>{r.get('PositionGroup','')}</span></h3>
       <div class='{cls}'>{r.get('Official','PASS')} — {r.get('Lean','')} <span class='badge'>Official Score {r.get('Official Play Score','')}</span></div>
-      <p><b>Line:</b> {r.get('Line','')} ({r.get('Source','')}) &nbsp; | &nbsp; <b>Projection:</b> {r.get('Projection','')} &nbsp; | &nbsp; <b>Edge:</b> {r.get('Edge','')}</p>
+      <p><b>Line:</b> {line_val} ({source_val}) &nbsp; | &nbsp; <b>Projection:</b> {r.get('Projection','')} &nbsp; | &nbsp; <b>Edge:</b> {r.get('Edge','')}</p>
       <p><b>UD:</b> {r.get('Underdog Line','')} &nbsp; <b>Sleeper:</b> {r.get('Sleeper Line','')} &nbsp; <b>Best Over:</b> {r.get('Best Over Line','')} &nbsp; <b>Best Under:</b> {r.get('Best Under Line','')}</p>
-      <p><b>MC:</b> Over {r.get('Over %','')}% / Under {r.get('Under %','')}% &nbsp; | &nbsp; <b>Floor/Median/Ceiling:</b> {r.get('Floor','')} / {r.get('Median','')} / {r.get('Ceiling','')} &nbsp; | &nbsp; <b>Vol:</b> {r.get('Volatility','')}</p>
+      <p><b>Distribution:</b> Floor {r.get('Floor','')} / Median {r.get('Median','')} / Ceiling {r.get('Ceiling','')} &nbsp; | &nbsp; <b>MC:</b> Over {r.get('Over %','')}% / Under {r.get('Under %','')}% &nbsp; | &nbsp; <b>Vol:</b> {r.get('Volatility','')}</p>
       <p><b>L5/L10/L20 Hit:</b> {r.get('L5 Hit%','')}% / {r.get('L10 Hit%','')}% / {r.get('L20 Hit%','')}% &nbsp; | &nbsp; <b>MIN:</b> {r.get('MIN Proj','')} &nbsp; | &nbsp; <b>Role:</b> {r.get('Role Confidence','')}/100 &nbsp; | &nbsp; <b>Data:</b> {r.get('Data Score','')}/100</p>
-      <p><b>PASS:</b> {r.get('PASS Reason','')}</p>
+      <div class='explain-box'>
+        <b>Projection Explanation:</b> {r.get('Projection Explanation','')}<br/>
+        <b>Biggest Positive:</b> {r.get('Biggest Positive','')}<br/>
+        <b>Biggest Risk:</b> {r.get('Biggest Risk','')}<br/>
+        <b>Shot Profile:</b> {r.get('Shot Profile Note','')} | Boost {r.get('Shot Profile Boost','')}<br/>
+        <b>Confidence:</b> {r.get('Confidence Breakdown','')}<br/>
+        <b>Model Agreement:</b> {r.get('Model Agreement','')}<br/>
+        <b>Defense/Position:</b> {r.get('Defense vs Position','')}<br/>
+        <b>Similarity:</b> {r.get('Player Similarity Engine','')} | Sim projection {r.get('Similarity Projection','NA')}<br/>
+        <b>Rest/Travel/Blowout:</b> {r.get('Rest Travel Blowout','')}<br/>
+        <b>Bench Rotation:</b> {r.get('Bench Rotation Note','')}<br/>
+        <b>Pace:</b> {r.get('Pace Projection Note','')}<br/>
+        <b>Line Movement:</b> {r.get('Line Movement Note','')}<br/>
+        <b>Referee:</b> {r.get('Referee Note','')}<br/>
+        <b>Home/Away:</b> {r.get('HomeAway Note','')}<br/>
+        <b>Correlation:</b> {r.get('Correlation Note','')}
+      </div>
+      <p><b>Tier:</b> {r.get('Tier','')} &nbsp; | &nbsp; <b>PASS:</b> {r.get('PASS Reason','')}</p>
       <small>{r.get('Projection Note','')}</small>
     </div>
     """, unsafe_allow_html=True)
-
 
 def dataset_status_table():
     rows = []
@@ -1676,7 +1984,7 @@ def kpi_card(label: str, value: Any, sub: str = ""):
 def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, strong: int = 0):
     st.markdown("""
     <div class='owp-hero'>
-      <div class='owp-title'>🔥 WNBA PROP ENGINE v1.4<br/>SAFETY GATES + MARKET TABS</div>
+      <div class='owp-title'>💜 WNBA PROP ENGINE v1.5<br/>PLAYER CARDS + EXPLANATION ENGINE</div>
       <div class='owp-subtitle'>Strict WNBA-only prop line lock → Refresh → Save → Grade</div>
     </div>
     """, unsafe_allow_html=True)
@@ -1793,6 +2101,51 @@ def get_lines_from_state_or_pull(use_ud_flag: bool, use_sleeper_flag: bool) -> T
     )
 
 
+
+def make_baseline_player_cards(master_global: pd.DataFrame, market: str, limit: int = 40) -> pd.DataFrame:
+    if master_global is None or master_global.empty:
+        return pd.DataFrame()
+    m = market if market in MARKETS else "PRA"
+    df = master_global.copy()
+    proj_col = f"{m}_l10" if f"{m}_l10" in df.columns else f"{m}_avg"
+    if proj_col not in df.columns:
+        return pd.DataFrame()
+    rows = []
+    for _, b in df.sort_values(["DataScore", "RoleConfidence", proj_col], ascending=[False, False, False]).head(limit).iterrows():
+        proj = safe_float(b.get(proj_col), np.nan)
+        if pd.isna(proj):
+            continue
+        fake_line = np.nan
+        dist = {"Floor": round(max(0, proj*0.75), 2), "Median": round(proj, 2), "Ceiling": round(proj*1.25, 2), "Over %": np.nan, "Under %": np.nan, "Volatility": "TRACK"}
+        rows.append({
+            "Player": b.get("Player"), "Team": b.get("Team"), "Market": m, "Line": "NO LINE", "Source": "Baseline Only",
+            "Projection": round(proj, 2), "Edge": np.nan, "Lean": "TRACK", "Official": "NO LINE / TRACK", "Official Play Score": round(safe_float(b.get("DataScore"), 50), 1),
+            "PASS Reason": "No sportsbook line loaded. This card is hidden-baseline tracking only.",
+            "PositionGroup": b.get("PositionGroup", "Unknown"), "MIN Proj": round(safe_float(b.get("MIN_l10"), safe_float(b.get("MIN_avg"), np.nan)), 2),
+            "Role Confidence": round(safe_float(b.get("RoleConfidence"), 50), 1), "Data Score": round(safe_float(b.get("DataScore"), 50), 1),
+            "L5 Hit%": np.nan, "L10 Hit%": np.nan, "L20 Hit%": np.nan,
+            "Projection Explanation": f"Baseline {m} projection from {proj_col}. Add Underdog/Sleeper/manual line to turn this into an official play.",
+            "Biggest Positive": f"Strong baseline sample: data score {round(safe_float(b.get('DataScore'), 50),1)}.",
+            "Biggest Risk": "No active sportsbook line yet, so edge/official decision is not calculated.",
+            "Shot Profile Note": f"3PA rate {round(safe_float(b.get('ThreePARate'), np.nan),3) if pd.notna(safe_float(b.get('ThreePARate'), np.nan)) else 'NA'}; make rate {round(safe_float(b.get('ShotMakeRate'), np.nan),3) if pd.notna(safe_float(b.get('ShotMakeRate'), np.nan)) else 'NA'}",
+            "Shot Profile Boost": 0.0,
+            "Confidence Breakdown": f"Data {round(safe_float(b.get('DataScore'), 50),1)} | Role {round(safe_float(b.get('RoleConfidence'), 50),1)} | Minutes {b.get('MinutesSafetyGrade','NA')}",
+            "Model Agreement": "Baseline only",
+            "Defense vs Position": f"Position group: {b.get('PositionGroup','Unknown')}",
+            "Player Similarity Engine": "Line needed for full similarity edge.",
+            "Similarity Projection": np.nan,
+            "Rest Travel Blowout": "No line/slate context yet.",
+            "Bench Rotation Note": f"Rotation grade {b.get('MinutesSafetyGrade','NA')} from current baseline.",
+            "Pace Projection Note": "No slate pace projection without opponent/line.",
+            "Line Movement Note": "No current line.",
+            "Referee Note": "Neutral.",
+            "HomeAway Note": "Line needed for slate context.",
+            "Correlation Note": correlation_note_for_market(m),
+            "Tier": "Tier 5 — Track",
+            **dist
+        })
+    return pd.DataFrame(rows)
+
 def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame, force_market: Optional[str] = None):
     market_label = f" — {force_market}" if force_market else ""
     st.markdown(f"<div class='section-title'>{mode}{market_label} Board</div>", unsafe_allow_html=True)
@@ -1841,10 +2194,10 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     if lines is None or lines.empty:
         st.error("No lines loaded for this slate. Add manual lines or check Debug. If there are no WNBA games, this is expected.")
         if not master_global.empty:
-            nl_cols = [c for c in ["Player", "Team", "PositionGroup", "MIN_l10", "PTS_l10", "REB_l10", "AST_l10", "PRA_l10", "RoleConfidence", "DataScore"] if c in master_global.columns]
-            nl = master_global[nl_cols].head(200)
-            st.caption("Baseline players available even without matched sportsbook lines:")
-            st.dataframe(nl, use_container_width=True)
+            st.markdown("<div class='hidden-baseline-note'>Baseline table is hidden. Showing player cards only so you can still review projections while waiting for lines.</div>", unsafe_allow_html=True)
+            baseline_cards = make_baseline_player_cards(master_global, force_market or "PRA", limit=30)
+            for _, rr in baseline_cards.iterrows():
+                render_card(rr)
         return pd.DataFrame()
 
     if force_market:
@@ -1938,7 +2291,7 @@ except Exception:
     hero_board_rows = hero_real_lines = hero_no_line = hero_strong = 0
 hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
 
-tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Manual Lines", "Data Manager", "Research Hub", "Team Ranks", "Official + Grade", "Log Tools", "Debug"])
+tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Manual Lines", "Data Manager", "Research Hub", "Team Ranks", "Official + Grade", "Log Tools", "Debug", "Best Bets", "Slate Copy"])
 
 MARKET_TAB_META = {
     "PTS": ("POINTS", "Points board: scoring projection, shot profile, pace, usage, matchup, line edge."),
@@ -2194,3 +2547,61 @@ with tabs[10]:
     st.dataframe(sl_debug, use_container_width=True)
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
+
+
+# ============================================================
+# Best Bets + Slate Copy tabs (full advanced layers)
+# ============================================================
+with tabs[11]:
+    st.subheader("Best Bets / Tier 1–8 Official Board")
+    st.caption("Uses edge, Monte Carlo %, Bayesian confidence, data score, role confidence, line source reliability, similarity, pace, rest/travel, blowout, bench rotation, and line movement.")
+    board_path = CACHE_FILES["projection_board"]
+    if board_path.exists():
+        try:
+            bb = pd.read_csv(board_path)
+        except Exception:
+            bb = pd.DataFrame()
+    else:
+        bb = pd.DataFrame()
+    if bb.empty:
+        st.warning("No projection board cached yet. Refresh a PTS/REB/AST/PRA board first.")
+    else:
+        tier_filter = st.multiselect("Tier filter", sorted(bb.get("Tier", pd.Series(dtype=str)).dropna().unique().tolist()), default=sorted(bb.get("Tier", pd.Series(dtype=str)).dropna().unique().tolist())[:4])
+        show = bb.copy()
+        if tier_filter and "Tier" in show.columns:
+            show = show[show["Tier"].isin(tier_filter)]
+        sort_cols = [c for c in ["Official Play Score", "Edge"] if c in show.columns]
+        if sort_cols:
+            show = show.sort_values(sort_cols, ascending=False)
+        st.metric("Best Bet Rows", len(show))
+        display_cols = [c for c in ["Tier", "Player", "Team", "Market", "Line", "Projection", "Edge", "Lean", "Official", "Official Play Score", "Over %", "Under %", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+        st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
+        st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
+        st.markdown("### Player Card View")
+        for _, rr in show.head(25).iterrows():
+            render_card(rr)
+
+with tabs[12]:
+    st.subheader("Slate Copy / Posting Format")
+    board_path = CACHE_FILES["projection_board"]
+    if board_path.exists():
+        try:
+            sc = pd.read_csv(board_path)
+        except Exception:
+            sc = pd.DataFrame()
+    else:
+        sc = pd.DataFrame()
+    if sc.empty:
+        st.warning("No projection board cached yet.")
+    else:
+        only_official = st.checkbox("Only official plays", value=True)
+        copy_df = sc.copy()
+        if only_official and "Official" in copy_df.columns:
+            copy_df = copy_df[copy_df["Official"].astype(str).str.contains("OVER|UNDER", na=False)]
+        lines_txt = []
+        for _, r in copy_df.sort_values([c for c in ["Market", "Official Play Score"] if c in copy_df.columns], ascending=[True, False] if "Official Play Score" in copy_df.columns else True).iterrows():
+            side = "O" if str(r.get("Lean")) == "OVER" else "U" if str(r.get("Lean")) == "UNDER" else "PASS"
+            lines_txt.append(f"• {r.get('Player','')} — {side} {r.get('Line','')} {r.get('Market','')} — {r.get('Projection','')} proj — Edge {r.get('Edge','')} — {r.get('Tier','')}")
+        text = "\n".join(lines_txt) if lines_txt else "No plays match this filter."
+        st.text_area("Copy slate", text, height=300)
+        st.download_button("Download slate copy TXT", text, "wnba_slate_copy.txt", "text/plain")
