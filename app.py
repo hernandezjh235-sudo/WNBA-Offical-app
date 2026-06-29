@@ -1476,18 +1476,41 @@ def fetch_underdog_board():
     def parse_market(txt):
         return infer_market(txt)
 
+    def _ud_options(o):
+        """Return Underdog option rows attached to one over_under_line object."""
+        if not isinstance(o, dict):
+            return []
+        opts = o.get("options")
+        if opts is None and isinstance(o.get("attributes"), dict):
+            opts = o["attributes"].get("options")
+        return opts if isinstance(opts, list) else []
+
+    def _ud_has_two_sided_options(o):
+        """Main board lines usually have Higher and Lower. Alternate ladders often do not."""
+        choices = set()
+        for opt in _ud_options(o):
+            if not isinstance(opt, dict):
+                continue
+            a = attrs(opt)
+            blob = " ".join(str(a.get(k, "")) for k in ["choice", "choice_display", "choice_display_short", "choice_id", "selection_header"]).lower()
+            if "higher" in blob or "over" in blob:
+                choices.add("higher")
+            if "lower" in blob or "under" in blob:
+                choices.add("lower")
+        return "higher" in choices and "lower" in choices
+
     def parse_line(*objs):
-        # Critical: only trust the official Underdog over_under_line value.
-        # Do NOT pull numbers from option text like "26+", payout multipliers,
-        # decimal prices, or ids. That was causing fake lines such as 1.0, 4.0, 7.0.
+        # Critical: only trust the official Underdog main over_under_line object.
+        # Never pull from related appearance objects, option text like "26+", payout
+        # multipliers, decimal prices, sort_by, game logs, or ids.
         safe_keys = ["stat_value", "line_score", "target_value"]
         for o in objs:
             if not isinstance(o, dict):
                 continue
-            typ = get_type(o)
-            path = str(o.get("_path", "")).lower()
-            # Ignore Higher/Lower option objects under over_under_lines.options.
-            if "options" in path or "option" in typ:
+            if not is_true_underdog_line_obj(o):
+                continue
+            if not _ud_has_two_sided_options(o):
+                # This filters alternate ladder rows that are usually Higher-only.
                 continue
             a = attr(o)
             for k in safe_keys:
@@ -1501,12 +1524,10 @@ def fetch_underdog_board():
             return False
         typ = get_type(o)
         path = str(o.get("_path", "")).lower()
-        a = attr(o)
         if "options" in path or "option" in typ:
             return False
-        if any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "target_value"]):
-            return True
-        # Accept the actual top-level over_under_line object, not nested option records.
+        # Only the real over_under_line container can be a line. Related appearances
+        # and appearance_stat objects can contain numbers, but those are not lines.
         return ("over_under_line" in typ or re.search(r"over_under_lines\[\d+\]$", path) is not None)
 
     def is_wnba_text(txt):
