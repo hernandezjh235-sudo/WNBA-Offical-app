@@ -1433,6 +1433,38 @@ def fetch_underdog_board():
 
     KNOWN_PLAYERS = known_player_records()
 
+    def active_schedule_teams(days_ahead=2):
+        """Teams with games today/tomorrow from cached schedule. Used only as a safety gate
+        so Underdog internal ids or unrelated WNBA rows do not become player cards.
+        If schedule is unavailable, this returns an empty set and does not hard-filter.
+        """
+        teams = set()
+        try:
+            sched = load_dataset("schedules")
+            if sched is None or sched.empty:
+                return teams
+            if "GameDate" not in sched.columns:
+                return teams
+            d = sched.copy()
+            d["GameDate"] = pd.to_datetime(d["GameDate"], errors="coerce")
+            today = pd.Timestamp(datetime.now().date())
+            max_day = today + pd.Timedelta(days=int(days_ahead))
+            dd = d[(d["GameDate"].dt.normalize() >= today) & (d["GameDate"].dt.normalize() <= max_day)].copy()
+            for c in ["Home", "Away"]:
+                if c in dd.columns:
+                    for v in dd[c].dropna().astype(str):
+                        vv = v.upper().strip()
+                        if 2 <= len(vv) <= 4:
+                            teams.add(vv)
+            # Normalize common SportsData abbreviations to sportsbook abbreviations.
+            remap = {"LV":"LVA", "NY":"NYL", "LA":"LAS", "WSH":"WAS", "CONN":"CON"}
+            teams |= {remap.get(t, t) for t in list(teams)}
+        except Exception:
+            pass
+        return teams
+
+    ACTIVE_TEAMS = active_schedule_teams()
+
     def bad_player_candidate(player):
         nk = normalize_name(player)
         if not nk or len(nk.split()) < 2:
@@ -1454,18 +1486,22 @@ def fetch_underdog_board():
         team_hint = str(team_hint or "").upper().strip()
 
         # If a candidate looks valid, map it back to the official cached name.
+        # Never return the raw candidate unless it strongly matches a known WNBA player.
         if candidate and not bad_player_candidate(candidate):
             cand_key = normalize_name(candidate)
             best, best_score = None, 0.0
             for rec in KNOWN_PLAYERS:
                 sc = name_score(cand_key, rec["NameKey"])
                 if team_hint and rec.get("Team") == team_hint:
-                    sc += 0.03
+                    sc += 0.04
+                if ACTIVE_TEAMS and rec.get("Team") not in ACTIVE_TEAMS:
+                    sc -= 0.20
                 if sc > best_score:
                     best, best_score = rec, sc
-            if best and best_score >= 0.86:
+            if best and best_score >= 0.90:
                 return best["Player"], best.get("Team", team_hint)
-            return candidate, team_hint
+            # Raw candidate may be an Underdog slug/id. Reject it so fallback can inspect raw_text.
+
 
         # Full-name containment.
         for rec in KNOWN_PLAYERS:
@@ -1474,19 +1510,25 @@ def fetch_underdog_board():
                 return rec["Player"], rec.get("Team", team_hint)
 
         # Underdog cards often show initials like J. Young -> normalized `j young`.
+        # IMPORTANT: do NOT match on last name alone. Raw Underdog JSON contains
+        # many generic keys/ids, which previously caused false players like Teonni Key.
         best, best_score = None, 0.0
         for rec in KNOWN_PLAYERS:
             abbrev = f"{rec['FirstInitial']} {rec['Last']}".strip()
             score = 0.0
-            if abbrev and abbrev in raw_norm:
-                score = 0.94
-            elif rec["LastUnique"] and re.search(rf"\b{re.escape(rec['Last'])}\b", raw_norm):
-                score = 0.88
+            if abbrev and re.search(rf"\b{re.escape(abbrev)}\b", raw_norm):
+                score = 0.95
+            # Also allow forms like J. Young / J Young / J-Young in the raw evidence.
+            dotted = rf"\b{re.escape(rec['FirstInitial'])}\.?\s+{re.escape(rec['Last'])}\b"
+            if re.search(dotted, raw_text, flags=re.I):
+                score = max(score, 0.96)
             if team_hint and rec.get("Team") == team_hint:
                 score += 0.04
+            if ACTIVE_TEAMS and rec.get("Team") not in ACTIVE_TEAMS:
+                score -= 0.18
             if score > best_score:
                 best, best_score = rec, score
-        if best and best_score >= 0.88:
+        if best and best_score >= 0.92:
             return best["Player"], best.get("Team", team_hint)
 
         return "", team_hint
@@ -1497,6 +1539,9 @@ def fetch_underdog_board():
         resolved_player, resolved_team = resolve_known_player(raw, candidate=player, team_hint=team)
         if not resolved_player or bad_player_candidate(resolved_player):
             # Keep fake Underdog ids out of the board. They can still be inspected in Raw/debug.
+            return
+        if ACTIVE_TEAMS and str(resolved_team or "").upper().strip() and str(resolved_team).upper().strip() not in ACTIVE_TEAMS:
+            # Today has a narrow WNBA slate; skip stale/unrelated prop rows.
             return
         rows.append({
             "Player": str(resolved_player),
