@@ -31,7 +31,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v2.0 — Underdog Mainline + Full Game Context Engine"
+APP_VERSION = "NO_MONEYLINE — WNBA v2.0 — Underdog Mainline + Full Game Context Engine"
 
 # ============================================================
 # Storage
@@ -2784,8 +2784,6 @@ def auto_backtest_engine(max_rows: int = 2500) -> pd.DataFrame:
 OFFICIAL_WNBA_TEAM_CONTEXT_FILE = DATA_DIR / "wnba_official_team_context.csv"
 GAME_CONTEXT_FILE = DATA_DIR / "wnba_game_context_today.csv"
 DAILY_TEAM_CONTEXT_FILE = DATA_DIR / "wnba_daily_team_context_cache_v2.csv"
-MONEYLINE_BOARD_FILE = DATA_DIR / "wnba_moneyline_board.csv"
-MONEYLINE_HISTORY_FILE = LOCAL_DIR / "wnba_moneyline_history.json"
 
 
 def _wnba_stats_headers() -> Dict[str, str]:
@@ -5165,12 +5163,6 @@ def refresh_today_pipeline(mode: str, use_ud_flag: bool = True) -> Dict[str, Any
             board = enrich_board_with_matchups(board, mode)
             board = apply_matchup_context_to_board(board)
             board = apply_daily_team_context_v2_to_board(board)
-            try:
-                moneyline_board = build_moneyline_board(mode)
-                status["Moneyline Rows"] = 0 if moneyline_board is None or moneyline_board.empty else len(moneyline_board)
-            except Exception as _mle:
-                status["Moneyline Rows"] = 0
-                status["Moneyline Status"] = str(_mle)[:100]
             save_dataset("projection_board", board)
             status["Cards"] = len(board)
             status["Status"] = "complete"
@@ -5187,7 +5179,7 @@ def refresh_today_pipeline(mode: str, use_ud_flag: bool = True) -> Dict[str, Any
 
 
 # ============================================================
-# Daily Team Context Cache 2.0 + Moneyline Engine 2.0
+# Daily Team Context Cache 2.0
 # ============================================================
 def _latest_logs_with_team_game_totals(logs: pd.DataFrame) -> pd.DataFrame:
     """Convert player logs into team-game totals. This powers daily defensive context."""
@@ -5223,7 +5215,7 @@ def build_daily_team_context_cache_v2(mode: str = "Today", force: bool = False) 
 
     Rebuilds team offense/defense, last-5/last-10 form, allowed-by-market, rest, home/away,
     rotation and injury context. It uses cached SportsDataverse logs/schedules/team stats and
-    the current slate schedule. This runs during Refresh Today and feeds both prop and moneyline engines.
+    the current slate schedule. This runs during Refresh Today and feeds the prop projection engine.
     """
     target = slate_target_date(mode) or datetime.utcnow().date()
     dbg = []
@@ -5382,94 +5374,6 @@ def apply_daily_team_context_v2_to_board(board: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _moneyline_prob_to_american(p: float) -> float:
-    try:
-        p = float(p)
-        p = min(max(p, 0.01), 0.99)
-        return round(-100*p/(1-p), 0) if p >= 0.5 else round(100*(1-p)/p, 0)
-    except Exception:
-        return np.nan
-
-
-def build_moneyline_board(mode: str = "Today") -> pd.DataFrame:
-    """Moneyline Engine 2.0 using the same daily context cache as props."""
-    ctx, _ = build_daily_team_context_cache_v2(mode, force=False)
-    sched = schedule_for_slate(mode)
-    if sched is None or sched.empty:
-        return pd.DataFrame()
-    s = standardize_schedules(sched)
-    rows = []
-    for _, g in s.iterrows():
-        home = _team_key_for_matchup(g.get("Home")); away = _team_key_for_matchup(g.get("Away"))
-        if not home or not away: continue
-        hctx = _team_context_v2_lookup(home); actx = _team_context_v2_lookup(away)
-        def score(c, home_flag=False):
-            ortg = safe_float(c.get("Ctx_ORtg"), 100.0); drtg = safe_float(c.get("Ctx_DRtg"), 100.0)
-            net = safe_float(c.get("Ctx_NetRtg"), ortg-drtg); pace = safe_float(c.get("Ctx_Pace"), 78.0)
-            l5pf = safe_float(c.get("PF_L5"), np.nan); l5pa = safe_float(c.get("Allowed_PTS_L5"), np.nan)
-            recent = 0 if pd.isna(l5pf) or pd.isna(l5pa) else (l5pf - l5pa) * 0.08
-            inj = -1.25*safe_float(c.get("Out Players"), 0) - 0.45*safe_float(c.get("Questionable Players"), 0)
-            rest = safe_float(c.get("RestDays"), np.nan); rest_adj = -0.8 if pd.notna(rest) and rest == 0 else 0.25 if pd.notna(rest) and rest >= 2 else 0
-            home_adj = 2.2 if home_flag else 0
-            rot = (safe_float(c.get("Rotation Confidence"), 65) - 65) * 0.025
-            return net*0.42 + recent + inj + rest_adj + home_adj + rot + (pace-78)*0.015
-        hs = score(hctx, True); aas = score(actx, False)
-        diff = hs - aas
-        # logistic win probability tuned conservatively for WNBA spreads.
-        home_prob = 1/(1+math.exp(-diff/7.5))
-        away_prob = 1-home_prob
-        total = np.nanmean([safe_float(hctx.get("PF_L5"), np.nan), safe_float(hctx.get("PF_L10"), np.nan), safe_float(actx.get("PF_L5"), np.nan), safe_float(actx.get("PF_L10"), np.nan)]) * 2
-        if pd.isna(total): total = 160.0
-        spread_home = round(-diff, 1)
-        game_id = str(g.get("GameID") or f"{away}_{home}_{slate_target_date(mode)}")
-        matchup = f"{away} @ {home}"
-        common = {"Mode":mode,"GameID":game_id,"Matchup":matchup,"Away":away,"Home":home,"Projected Total":round(float(total),1),"Projected Spread Home":spread_home,"UpdatedAt":now_iso()}
-        rows.append({**common,"Team":home,"Opponent":away,"HomeAway":"HOME","Win Probability":round(home_prob,4),"Fair American Odds":_moneyline_prob_to_american(home_prob),"Moneyline Edge Note":"Compare fair odds to sportsbook moneyline; positive edge when book is longer than fair.","Team Score":round(hs,2),"Opponent Score":round(aas,2),"Context Note":f"Home adv, net rating, L5 form, rest, injuries, rotation confidence."})
-        rows.append({**common,"Team":away,"Opponent":home,"HomeAway":"AWAY","Win Probability":round(away_prob,4),"Fair American Odds":_moneyline_prob_to_american(away_prob),"Moneyline Edge Note":"Compare fair odds to sportsbook moneyline; positive edge when book is longer than fair.","Team Score":round(aas,2),"Opponent Score":round(hs,2),"Context Note":f"Away team context uses net rating, L5 form, rest, injuries, rotation confidence."})
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out.to_csv(MONEYLINE_BOARD_FILE, index=False)
-    return out
-
-
-def render_moneyline_tab(mode: str = "Today"):
-    st.subheader("Moneyline Engine 2.0")
-    st.caption("Uses the same daily team context cache as props: ORtg/DRtg/Net, pace, L5/L10 form, injuries, rest, rotation confidence, and home court.")
-    c1, c2 = st.columns([1,1])
-    with c1:
-        if st.button("🔄 Build Moneyline Board", use_container_width=True):
-            ml = build_moneyline_board(mode)
-            st.session_state["wnba_moneyline_board"] = ml
-    with c2:
-        if st.button("📌 Save Moneyline Snapshot", use_container_width=True):
-            ml = st.session_state.get("wnba_moneyline_board", pd.DataFrame())
-            if ml is None or ml.empty and MONEYLINE_BOARD_FILE.exists():
-                try: ml = pd.read_csv(MONEYLINE_BOARD_FILE)
-                except Exception: ml = pd.DataFrame()
-            hist = load_json(MONEYLINE_HISTORY_FILE, [])
-            if ml is not None and not ml.empty:
-                hist.extend(ml.to_dict("records")); save_json(MONEYLINE_HISTORY_FILE, hist)
-                st.success(f"Saved {len(ml)} moneyline rows.")
-    ml = st.session_state.get("wnba_moneyline_board", pd.DataFrame())
-    if (ml is None or ml.empty) and MONEYLINE_BOARD_FILE.exists():
-        try: ml = pd.read_csv(MONEYLINE_BOARD_FILE)
-        except Exception: ml = pd.DataFrame()
-    if ml is None or ml.empty:
-        st.info("Click Build Moneyline Board after Refresh Today.")
-    else:
-        st.dataframe(ml, use_container_width=True)
-        st.download_button("Download moneyline board CSV", ml.to_csv(index=False), "wnba_moneyline_board.csv", "text/csv")
-    ctx = st.session_state.get("wnba_daily_team_context_v2", pd.DataFrame())
-    if (ctx is None or ctx.empty) and DAILY_TEAM_CONTEXT_FILE.exists():
-        try: ctx = pd.read_csv(DAILY_TEAM_CONTEXT_FILE)
-        except Exception: ctx = pd.DataFrame()
-    with st.expander("Daily Team Context Cache 2.0", expanded=False):
-        if ctx is None or ctx.empty:
-            st.info("No context cache yet. Run Refresh Today.")
-        else:
-            st.dataframe(ctx, use_container_width=True)
-            st.download_button("Download daily context cache CSV", ctx.to_csv(index=False), "wnba_daily_team_context_cache_v2.csv", "text/csv")
-
 def run_one_click_refresh_today(mode: str = "Today", use_ud_flag: bool = True) -> Dict[str, Any]:
     """One button pipeline: rebuild feature cache if data exists, refresh schedule/game context,
     pull Underdog/manual lines, rebuild projection board, and update visible refresh status.
@@ -5517,7 +5421,7 @@ def render_refresh_today_status():
     c[3].metric("Underdog", status.get("Underdog Lines", 0))
     c[4].metric("Cards", status.get("Cards", 0))
     c[5].metric("Seconds", status.get("Seconds", "-"))
-    st.caption(f"Status: {status.get('Status')} | Daily Context Rows: {status.get('Daily Context Rows', 0)} | Moneyline Rows: {status.get('Moneyline Rows', 0)}")
+    st.caption(f"Status: {status.get('Status')} | Daily Context Rows: {status.get('Daily Context Rows', 0)}")
 
 
 def clear_line_pull_caches():
@@ -6498,7 +6402,7 @@ except Exception:
     hero_board_rows = hero_real_lines = hero_no_line = hero_strong = 0
 hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
 
-tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Debug / Status", "Moneyline", "Model Reports"])
+tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Debug / Status", "Model Reports"])
 
 MARKET_TAB_META = {
     "PTS": ("POINTS", "Points board: scoring projection, shot profile, pace, usage, matchup, line edge."),
@@ -6634,9 +6538,6 @@ with tabs[6]:
     st.dataframe(master_global.head(50), use_container_width=True)
 
 with tabs[7]:
-    render_moneyline_tab("Today")
-
-with tabs[8]:
     st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
     st.caption("This page keeps the main UI clean while giving you the same deeper review tools: line movement, closing-line value, projection calibration, and historical model testing.")
 
