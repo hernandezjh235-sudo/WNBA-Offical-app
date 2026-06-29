@@ -2667,6 +2667,312 @@ def summarize_backtest(bt: pd.DataFrame) -> pd.DataFrame:
     s["Win Rate"] = s["Wins"] / s["Plays"].replace(0, np.nan)
     return s.sort_values("Win Rate", ascending=False)
 
+
+
+# ============================================================
+# Advanced Feature Refresh / Missing Column Repair v3
+# ============================================================
+TEAM_ALIAS_MAP = {
+    "ATLANTA DREAM": "ATL", "ATL DREAM": "ATL", "ATL": "ATL",
+    "CHICAGO SKY": "CHI", "CHI SKY": "CHI", "CHI": "CHI",
+    "CONNECTICUT SUN": "CON", "CONN SUN": "CON", "CON": "CON", "CONN": "CON",
+    "DALLAS WINGS": "DAL", "DAL WINGS": "DAL", "DAL": "DAL",
+    "GOLDEN STATE VALKYRIES": "GSV", "GOLDEN STATE": "GSV", "GS": "GSV", "GSV": "GSV",
+    "INDIANA FEVER": "IND", "IND FEVER": "IND", "IND": "IND",
+    "LAS VEGAS ACES": "LVA", "LAS VEGAS": "LVA", "LV": "LVA", "LVA": "LVA", "LAV": "LVA",
+    "LOS ANGELES SPARKS": "LAS", "LA SPARKS": "LAS", "LOS ANGELES": "LAS", "LA": "LAS", "LAS": "LAS",
+    "MINNESOTA LYNX": "MIN", "MIN LYNX": "MIN", "MIN": "MIN",
+    "NEW YORK LIBERTY": "NYL", "NEW YORK": "NYL", "NY LIBERTY": "NYL", "NY": "NYL", "NYL": "NYL",
+    "PHOENIX MERCURY": "PHX", "PHX MERCURY": "PHX", "PHOENIX": "PHX", "PHX": "PHX",
+    "SEATTLE STORM": "SEA", "SEA STORM": "SEA", "SEA": "SEA",
+    "WASHINGTON MYSTICS": "WAS", "WAS MYSTICS": "WAS", "WASHINGTON": "WAS", "WAS": "WAS",
+}
+
+REQUIRED_MASTER_FIELDS = [
+    "Team_Pace", "Team_DRtg", "Team_NetRtg", "Team_ORtg",
+    "ShotAttempts", "ThreePARate", "RimRate", "ShotProfileScore", "PointsPerShot",
+    "StarterRate", "RosterGames", "USG%", "TS%", "eFG%_Season",
+]
+
+def normalize_team_code(x) -> str:
+    raw = str(x or "").strip()
+    if raw == "" or raw.lower() in ["nan", "none"]:
+        return ""
+    s = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^A-Za-z0-9 ]+", " ", s).upper().strip()
+    s = re.sub(r"\s+", " ", s)
+    if s in TEAM_ALIAS_MAP:
+        return TEAM_ALIAS_MAP[s]
+    if len(s) <= 4:
+        return s
+    for key, val in TEAM_ALIAS_MAP.items():
+        if key in s or s in key:
+            return val
+    toks = s.split()
+    if toks:
+        return toks[0][:3]
+    return s[:3]
+
+
+def _safe_series(df: pd.DataFrame, col: str, default=np.nan):
+    if isinstance(default, pd.Series):
+        return df.get(col, default)
+    return df[col] if col in df.columns else pd.Series(default, index=df.index)
+
+
+def derive_team_ranks_from_logs_and_schedule(logs: pd.DataFrame, schedules: pd.DataFrame) -> pd.DataFrame:
+    """Extra team-context backup when team_season_stats lacks pace/ratings."""
+    rows = []
+    logs = standardize_player_logs(logs) if logs is not None and not logs.empty else pd.DataFrame()
+    if not logs.empty:
+        d = logs.copy()
+        d["TeamKey"] = d["Team"].map(normalize_team_code)
+        for c in ["PTS", "REB", "AST", "FGA", "FGM", "FG3M", "FTA", "TOV", "OREB"]:
+            if c not in d.columns:
+                d[c] = 0
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+        agg = d.groupby(["Season", "TeamKey"], dropna=False).agg(
+            Team=("Team", lambda x: x.dropna().iloc[-1] if len(x.dropna()) else ""),
+            Games=("GameDate", "nunique"), PTS=("PTS", "sum"), REB=("REB", "sum"), AST=("AST", "sum"),
+            FGA=("FGA", "sum"), FGM=("FGM", "sum"), FG3M=("FG3M", "sum"), FTA=("FTA", "sum"),
+            TOV=("TOV", "sum"), OREB=("OREB", "sum")
+        ).reset_index()
+        poss = agg["FGA"] + 0.44*agg["FTA"] + agg["TOV"] - agg["OREB"]
+        agg["Pace"] = np.where(agg["Games"] > 0, poss / agg["Games"], np.nan)
+        agg["ORtg"] = np.where(poss > 0, 100 * agg["PTS"] / poss, np.nan)
+        agg["eFG%"] = np.where(agg["FGA"] > 0, (agg["FGM"] + 0.5*agg["FG3M"]) / agg["FGA"], np.nan)
+        rows.append(agg.rename(columns={"TeamKey": "Team"}))
+    sched = standardize_schedules(schedules) if schedules is not None and not schedules.empty else pd.DataFrame()
+    if not sched.empty and {"Home", "Away", "HomeScore", "AwayScore"}.issubset(sched.columns):
+        sr = []
+        complete = sched.dropna(subset=["HomeScore", "AwayScore"]).copy()
+        for _, r in complete.iterrows():
+            home = normalize_team_code(r.get("Home")); away = normalize_team_code(r.get("Away"))
+            if home:
+                sr.append({"Season": r.get("Season"), "Team": home, "PtsFor": r.get("HomeScore"), "PtsAllowed": r.get("AwayScore")})
+            if away:
+                sr.append({"Season": r.get("Season"), "Team": away, "PtsFor": r.get("AwayScore"), "PtsAllowed": r.get("HomeScore")})
+        if sr:
+            sg = pd.DataFrame(sr).groupby(["Season", "Team"], dropna=False).agg(
+                GamesSchedule=("PtsFor", "count"), PPG=("PtsFor", "mean"), PointsAllowed=("PtsAllowed", "mean")
+            ).reset_index()
+            sg["DRtg"] = sg["PointsAllowed"]
+            rows.append(sg)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True, sort=False)
+    out["Team"] = out["Team"].map(normalize_team_code)
+    out = out[out["Team"].astype(str).str.len() > 0].copy()
+    out = out.groupby(["Season", "Team"], dropna=False).agg(lambda x: x.dropna().iloc[-1] if len(x.dropna()) else np.nan).reset_index()
+    if "NetRtg" not in out.columns:
+        out["NetRtg"] = np.nan
+    if "ORtg" in out.columns and "DRtg" in out.columns:
+        out["NetRtg"] = out["NetRtg"].fillna(out["ORtg"] - out["DRtg"])
+    return out
+
+
+def merge_team_context_robust(base: pd.DataFrame, team_ranks: pd.DataFrame, logs: pd.DataFrame, schedules: pd.DataFrame) -> pd.DataFrame:
+    if base is None or base.empty:
+        return base
+    base = base.copy()
+    base["TeamKey"] = base.get("Team", "").map(normalize_team_code)
+    candidates = []
+    tr0 = team_ranks.copy() if team_ranks is not None and not team_ranks.empty else pd.DataFrame()
+    if not tr0.empty:
+        tr0["Team"] = tr0["Team"].map(normalize_team_code)
+        candidates.append(tr0)
+    backup = derive_team_ranks_from_logs_and_schedule(logs, schedules)
+    if not backup.empty:
+        candidates.append(backup)
+    if not candidates:
+        return base
+    tr = pd.concat(candidates, ignore_index=True, sort=False)
+    tr = tr[tr["Team"].astype(str).str.len() > 0].copy()
+    tr = tr.sort_values("Season").groupby("Team", as_index=False).tail(1)
+    tr_pref = tr.add_prefix("Team_")
+    stale = [c for c in base.columns if c.startswith("Team_")]
+    if stale:
+        base = base.drop(columns=stale, errors="ignore")
+    base = base.merge(tr_pref, left_on="TeamKey", right_on="Team_Team", how="left")
+    return base
+
+
+def add_missing_feature_fallbacks(base: pd.DataFrame, logs: pd.DataFrame, season_stats: pd.DataFrame, shots: pd.DataFrame, game_rosters: pd.DataFrame) -> pd.DataFrame:
+    """Fill projection-critical columns so the model does not silently weaken."""
+    if base is None or base.empty:
+        return base
+    base = base.copy()
+    for c, default in {"Team_Pace": 78.0, "Team_DRtg": 82.0, "Team_ORtg": 82.0, "Team_NetRtg": 0.0}.items():
+        if c not in base.columns:
+            base[c] = np.nan
+        base[c] = pd.to_numeric(base[c], errors="coerce")
+        med = base[c].dropna().median()
+        base[c] = base[c].fillna(med if pd.notna(med) else default)
+
+    for c in ["ShotAttempts", "ThreePARate", "RimRate", "MidRangeRate", "ShotMakeRate", "PointsPerShot", "ShotProfileScore"]:
+        if c not in base.columns:
+            base[c] = np.nan
+    games = pd.to_numeric(base.get("Games", 0), errors="coerce").replace(0, np.nan)
+    fga = pd.to_numeric(base.get("FGA", np.nan), errors="coerce")
+    fg3a = pd.to_numeric(base.get("FG3A", np.nan), errors="coerce")
+    fgm = pd.to_numeric(base.get("FGM", np.nan), errors="coerce")
+    pts_total_est = pd.to_numeric(base.get("PTS_avg", 0), errors="coerce") * games
+    base["ShotAttempts"] = pd.to_numeric(base["ShotAttempts"], errors="coerce").fillna(fga / games).fillna(0)
+    base["ThreePARate"] = pd.to_numeric(base["ThreePARate"], errors="coerce").fillna(fg3a / fga.replace(0, np.nan)).fillna(0.22).clip(0, 1)
+    pos = base.get("PositionGroup", pd.Series("Unknown", index=base.index)).astype(str)
+    rim_default = np.select([pos.eq("Big"), pos.eq("Wing"), pos.eq("Guard")], [0.44, 0.30, 0.22], default=0.28)
+    base["RimRate"] = pd.to_numeric(base["RimRate"], errors="coerce").fillna(pd.Series(rim_default, index=base.index)).clip(0, 1)
+    base["MidRangeRate"] = pd.to_numeric(base["MidRangeRate"], errors="coerce").fillna((1 - base["ThreePARate"] - base["RimRate"]).clip(0, 1))
+    base["ShotMakeRate"] = pd.to_numeric(base["ShotMakeRate"], errors="coerce").fillna(fgm / fga.replace(0, np.nan)).fillna(0.42).clip(0, 1)
+    base["PointsPerShot"] = pd.to_numeric(base["PointsPerShot"], errors="coerce").fillna(pts_total_est / fga.replace(0, np.nan)).fillna(0.88)
+    base["ShotProfileScore"] = pd.to_numeric(base["ShotProfileScore"], errors="coerce").fillna(
+        np.clip(50 + base["ThreePARate"]*10 + base["RimRate"]*16 + (base["ShotMakeRate"]-0.42)*65, 0, 100)
+    ).round(1)
+
+    if "RosterGames" not in base.columns:
+        base["RosterGames"] = np.nan
+    if "StarterRate" not in base.columns:
+        base["StarterRate"] = np.nan
+    base["RosterGames"] = pd.to_numeric(base["RosterGames"], errors="coerce").fillna(pd.to_numeric(base.get("Games", 0), errors="coerce")).fillna(0)
+    min10 = pd.to_numeric(base.get("MIN_l10", base.get("MIN_avg", 0)), errors="coerce").fillna(0)
+    starter_proxy = np.select([min10 >= 30, min10 >= 24, min10 >= 18], [0.90, 0.72, 0.42], default=0.15)
+    base["StarterRate"] = pd.to_numeric(base["StarterRate"], errors="coerce").fillna(pd.Series(starter_proxy, index=base.index)).clip(0, 1)
+
+    if "USG%" not in base.columns:
+        base["USG%"] = np.nan
+    base["USG%"] = pd.to_numeric(base["USG%"], errors="coerce")
+    usage_proxy = pd.to_numeric(base.get("UsageProxy", np.nan), errors="coerce")
+    up_med = usage_proxy.dropna().median()
+    usg_proxy_pct = 20 + (usage_proxy - (up_med if pd.notna(up_med) else 10)) * 1.25
+    base["USG%"] = base["USG%"].fillna(usg_proxy_pct).fillna(20).clip(5, 40)
+    for c in ["TS%", "eFG%"]:
+        if c not in base.columns:
+            base[c] = np.nan
+        base[c] = pd.to_numeric(base[c], errors="coerce")
+    if "eFG%_Season" not in base.columns:
+        base["eFG%_Season"] = np.nan
+    base["TS%"] = base["TS%"].fillna(0.52)
+    base["eFG%"] = base["eFG%"].fillna(0.46)
+    base["eFG%_Season"] = pd.to_numeric(base["eFG%_Season"], errors="coerce").fillna(base["eFG%"])
+
+    if "LineupContinuityScore" not in base.columns:
+        base["LineupContinuityScore"] = 50
+    base["RoleConfidence"] = np.clip(
+        43 + pd.to_numeric(base.get("Games", 0), errors="coerce").fillna(0).clip(0, 25)*1.5
+        + min10.clip(0, 36)*0.75 + base["StarterRate"].fillna(0)*18
+        + pd.to_numeric(base.get("LineupContinuityScore", 50), errors="coerce").fillna(50)*0.08,
+        0, 100
+    ).round(1)
+    base["MinutesSafetyGrade"] = np.select([min10 >= 30, min10 >= 24, min10 >= 18], ["A", "B", "C"], default="D")
+    base["DataScore"] = np.clip(
+        30 + pd.to_numeric(base.get("Games", 0), errors="coerce").fillna(0).clip(0, 25)*1.85
+        + pd.to_numeric(base.get("MIN_avg", 0), errors="coerce").fillna(0).clip(0, 36)*0.72
+        + base["RoleConfidence"].fillna(0)*0.25 + base["ShotProfileScore"].fillna(50)*0.08,
+        0, 100
+    ).round(1)
+    for c in REQUIRED_MASTER_FIELDS:
+        if c not in base.columns:
+            base[c] = np.nan
+    return base
+
+
+def feature_missing_report(master: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    total = len(master) if master is not None else 0
+    for c in REQUIRED_MASTER_FIELDS:
+        if master is None or master.empty or c not in master.columns:
+            miss = total
+            pct = 100.0 if total else 0.0
+        else:
+            miss = int(master[c].isna().sum())
+            pct = round(100*miss/max(total, 1), 1)
+        rows.append({"Feature": c, "Missing Rows": miss, "Missing %": pct, "Status": "✅ filled" if miss == 0 and total else "⚠️ check"})
+    return pd.DataFrame(rows)
+
+
+def build_master_features_v3() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    logs = load_dataset("player_game_logs")
+    ss = load_dataset("player_season_stats")
+    ts = load_dataset("team_season_stats")
+    sched = load_dataset("schedules")
+    rosters = load_dataset("rosters")
+    gr = load_dataset("game_rosters")
+    lineups = load_dataset("lineups")
+    shots = load_dataset("shots")
+
+    team_ranks = build_team_ranks(logs, ts, sched)
+    if not team_ranks.empty:
+        team_ranks["Team"] = team_ranks["Team"].map(normalize_team_code)
+    backup_ranks = derive_team_ranks_from_logs_and_schedule(logs, sched)
+    if not backup_ranks.empty:
+        team_ranks = pd.concat([team_ranks, backup_ranks], ignore_index=True, sort=False) if not team_ranks.empty else backup_ranks
+        team_ranks = team_ranks.groupby(["Season", "Team"], dropna=False).agg(lambda x: x.dropna().iloc[-1] if len(x.dropna()) else np.nan).reset_index()
+    save_dataset("team_ranks", team_ranks)
+
+    base = compute_player_baselines(logs, ss, shots, rosters)
+    if base.empty:
+        return pd.DataFrame(), team_ranks
+    base = merge_team_context_robust(base, team_ranks, logs, sched)
+
+    grs = standardize_game_rosters(gr) if gr is not None and not gr.empty else pd.DataFrame()
+    if not grs.empty:
+        grs["StarterBool"] = grs.get("Starter", False).astype(str).str.lower().isin(["true", "1", "yes", "starter", "started"])
+        rconf = grs.groupby("NameKey").agg(RosterGames=("Player", "count"), StarterGames=("StarterBool", "sum")).reset_index()
+        rconf["StarterRate"] = rconf["StarterGames"] / rconf["RosterGames"].replace(0, np.nan)
+        base = base.drop(columns=[c for c in ["RosterGames", "StarterGames", "StarterRate"] if c in base.columns], errors="ignore").merge(rconf, on="NameKey", how="left")
+    lns = standardize_lineups(lineups) if lineups is not None and not lineups.empty else pd.DataFrame()
+    if not lns.empty and "LineupText" in lns.columns:
+        lns_text = lns["LineupText"].astype(str).map(normalize_name)
+        total_lineups = max(len(lns_text), 1)
+        mentions = []
+        for _, b in base[["NameKey", "Player"]].drop_duplicates().iterrows():
+            nk = b.get("NameKey", "")
+            cnt = int(lns_text.str.contains(nk, regex=False, na=False).sum()) if nk else 0
+            mentions.append({"NameKey": nk, "LineupMentions": cnt, "LineupShare": cnt/total_lineups, "LineupContinuityScore": round(min(100, 35 + 65*(cnt/total_lineups)*8), 1)})
+        base = base.drop(columns=[c for c in ["LineupMentions", "LineupShare", "LineupContinuityScore"] if c in base.columns], errors="ignore").merge(pd.DataFrame(mentions), on="NameKey", how="left")
+
+    base = add_missing_feature_fallbacks(base, logs, ss, shots, gr)
+    save_dataset("master_features", base)
+    feature_missing_report(base).to_csv(DATA_DIR / "wnba_feature_missing_report.csv", index=False)
+    return base, team_ranks
+
+# Override the older builder everywhere below this point.
+build_master_features = build_master_features_v3
+
+
+def refresh_data_and_build_advanced_features(dataset_choices=None, seasons=None, include_heavy=True):
+    """One-click pipeline used by Data Manager.
+    Pulls SportsDataverse, rebuilds team ranks/master features, repairs missing columns, and saves a report.
+    """
+    if seasons is None:
+        seasons = [int(season_last), int(season_now)] if "season_last" in globals() and "season_now" in globals() else [2025, 2026]
+    dataset_choices = dataset_choices or ["player_game_logs", "player_season_stats", "team_season_stats", "schedules", "rosters", "game_rosters"]
+    if include_heavy:
+        for k in ["lineups", "shots"]:
+            if k not in dataset_choices:
+                dataset_choices.append(k)
+    debug = []
+    for key in dataset_choices:
+        try:
+            df, dbg = download_sportsdataverse_dataset(key, seasons)
+            if dbg is not None and not dbg.empty:
+                debug.extend(dbg.to_dict("records"))
+            if df is not None and not df.empty:
+                std = standardize_dataset(key, df)
+                if std is not None and not std.empty:
+                    save_dataset(key, std)
+                    debug.append({"dataset": key, "status": "saved/standardized", "rows": len(std), "source": "SportsDataverse direct/manifest"})
+                else:
+                    debug.append({"dataset": key, "status": "downloaded but standardized empty", "rows": 0})
+            else:
+                debug.append({"dataset": key, "status": "empty/failed; existing cache kept if present", "rows": 0})
+        except Exception as e:
+            debug.append({"dataset": key, "status": f"error: {str(e)[:180]}", "rows": 0})
+    master, team_ranks = build_master_features()
+    audit = feature_missing_report(master)
+    audit.to_csv(DATA_DIR / "wnba_feature_missing_report.csv", index=False)
+    return master, team_ranks, pd.DataFrame(debug), audit
+
 # ============================================================
 # UI
 # ============================================================
@@ -3909,6 +4215,35 @@ with tabs[6]:
     st.subheader("SportsDataverse Data Manager")
     st.caption("Upload SportsDataverse CSV index files and/or actual CSV/Parquet files. Parquet is preferred. RDS is ignored. Team ranks, research, injury/referee, ML, and backtest tools are hidden from the main navigation but their backend logic remains available.")
     st.info("Importing files saves the stat database automatically under wnba_engine/data. Save Before is only for your betting slate; Grade After updates learning.")
+
+    st.markdown("### One-click pipeline")
+    st.caption("This fixes missing Team_Pace/DRtg/NetRtg, shot profile, starter/roster, and usage/efficiency fields by pulling data, rebuilding features, and applying safe fallbacks.")
+    pipe_cols = st.columns([1.15, 1.15, 1])
+    with pipe_cols[0]:
+        if st.button("🔄 Refresh WNBA Stats + ESPN Backup", use_container_width=True):
+            if not use_remote:
+                st.error("Turn on 'Allow SportsDataverse remote downloads' in the sidebar first.")
+            else:
+                with st.spinner("Refreshing SportsDataverse + backup feature pipeline..."):
+                    master, team_ranks, dbg, audit = refresh_data_and_build_advanced_features(include_heavy=True)
+                st.success(f"Refresh complete. Master rows: {len(master):,}. Team-rank rows: {len(team_ranks):,}.")
+                st.markdown("#### Missing-field audit")
+                st.dataframe(audit, use_container_width=True)
+                with st.expander("Refresh debug", expanded=False):
+                    st.dataframe(dbg, use_container_width=True)
+    with pipe_cols[1]:
+        if st.button("🧠 Build Advanced Features / Fix Missing Columns", use_container_width=True):
+            with st.spinner("Rebuilding team ranks, shot profile, role, usage, and efficiency features..."):
+                master, team_ranks = build_master_features()
+                audit = feature_missing_report(master)
+            st.success(f"Advanced features rebuilt. Master rows: {len(master):,}.")
+            st.dataframe(audit, use_container_width=True)
+    with pipe_cols[2]:
+        report_path = DATA_DIR / "wnba_feature_missing_report.csv"
+        if report_path.exists():
+            st.download_button("Download missing-field report", report_path.read_bytes(), file_name="wnba_feature_missing_report.csv", mime="text/csv", use_container_width=True)
+        else:
+            st.info("No missing-field report yet.")
 
     cA, cB, cC = st.columns(3)
     with cA:
