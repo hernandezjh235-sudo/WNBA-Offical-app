@@ -120,6 +120,18 @@ SLEEPER_URLS = [
     "https://api.sleeper.com/v1/projections/wnba",
 ]
 
+# Optional fallback for real sportsbook player-prop lines.
+# Add ODDS_API_KEY in Streamlit Secrets or paste it in the sidebar.
+ODDS_API_SPORT = "basketball_wnba"
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+ODDS_API_MARKETS = {
+    "PTS": "player_points",
+    "REB": "player_rebounds",
+    "AST": "player_assists",
+    "PRA": "player_points_rebounds_assists",
+}
+DEFAULT_ODDS_API_BOOKMAKERS = "draftkings,fanduel,betmgm,caesars,espnbet"
+
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
     "Accept": "application/json,text/plain,*/*",
@@ -198,6 +210,26 @@ def request_json(url, params=None, timeout=20):
         return r.json()
     except Exception:
         return None
+
+
+def request_json_with_status(url, params=None, timeout=20):
+    """Return (json, status_code, short_message) for debugging sportsbook pulls."""
+    try:
+        r = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=timeout)
+        status = int(getattr(r, "status_code", 0) or 0)
+        if status >= 400:
+            return None, status, (r.text or "")[:300]
+        return r.json(), status, "ok"
+    except Exception as e:
+        return None, 0, str(e)[:300]
+
+
+def get_streamlit_secret(name: str, default: str = "") -> str:
+    try:
+        val = st.secrets.get(name, default)
+        return str(val or "").strip()
+    except Exception:
+        return str(default or "").strip()
 
 
 def request_bytes(url, timeout=45) -> Optional[bytes]:
@@ -1270,6 +1302,123 @@ def fetch_sleeper_board():
     return df, pd.DataFrame(debug)
 
 
+def odds_api_market_to_internal(market_key: str) -> Optional[str]:
+    rev = {v: k for k, v in ODDS_API_MARKETS.items()}
+    return rev.get(str(market_key or ""))
+
+
+def normalize_line_upload(df: pd.DataFrame, source_name: str = "CSV Upload") -> pd.DataFrame:
+    """Normalize uploaded prop-line CSVs into the app line schema."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Player", "Team", "Market", "Line", "Source", "Start", "Raw", "OverOdds", "UnderOdds"])
+    d = df.copy()
+    player_col = find_col(d, ["Player", "player", "player_name", "athlete", "athlete_display_name", "Name"], contains_any=["player", "athlete"])
+    market_col = find_col(d, ["Market", "market", "stat", "stat_type", "prop", "category"])
+    line_col = find_col(d, ["Line", "line", "point", "points", "value", "target_value"])
+    team_col = find_col(d, ["Team", "team", "team_abbreviation", "team_name"])
+    source_col = find_col(d, ["Source", "source", "book", "sportsbook", "bookmaker"])
+    start_col = find_col(d, ["Start", "start", "start_time", "commence_time", "game_time", "date"])
+    over_col = find_col(d, ["OverOdds", "over_odds", "over price", "over_price"])
+    under_col = find_col(d, ["UnderOdds", "under_odds", "under price", "under_price"])
+    if not player_col or not line_col:
+        return pd.DataFrame(columns=["Player", "Team", "Market", "Line", "Source", "Start", "Raw", "OverOdds", "UnderOdds"])
+    out = pd.DataFrame()
+    out["Player"] = d[player_col].astype(str)
+    out["Team"] = d[team_col].astype(str) if team_col else ""
+    if market_col:
+        out["Market"] = d[market_col].astype(str).map(lambda x: infer_market(x) or str(x).upper().strip())
+    else:
+        out["Market"] = "PTS"
+    out["Market"] = out["Market"].map(lambda x: "PRA" if "PRA" in str(x).upper() else str(x).upper())
+    out["Line"] = pd.to_numeric(d[line_col], errors="coerce")
+    out["Source"] = d[source_col].astype(str) if source_col else source_name
+    out["Start"] = d[start_col].astype(str) if start_col else ""
+    out["Raw"] = "uploaded line csv"
+    out["OverOdds"] = pd.to_numeric(d[over_col], errors="coerce") if over_col else np.nan
+    out["UnderOdds"] = pd.to_numeric(d[under_col], errors="coerce") if under_col else np.nan
+    out = out.dropna(subset=["Player", "Line"])
+    out = out[out["Market"].isin(MARKETS)]
+    return out[["Player", "Team", "Market", "Line", "Source", "Start", "Raw", "OverOdds", "UnderOdds"]].copy()
+
+
+@st.cache_data(ttl=240, show_spinner=False)
+def fetch_odds_api_board(api_key: str, regions: str = "us", bookmakers: str = DEFAULT_ODDS_API_BOOKMAKERS, odds_format: str = "american"):
+    """Pull WNBA player props from The Odds API when an API key is supplied.
+    This is a fallback/secondary source, not a replacement for Underdog/Sleeper.
+    """
+    rows, debug = [], []
+    api_key = str(api_key or "").strip()
+    if not api_key:
+        return pd.DataFrame(columns=["Player", "Team", "Market", "Line", "Source", "Start", "Raw", "OverOdds", "UnderOdds"]), pd.DataFrame([{"source": "OddsAPI", "status": "skipped: no ODDS_API_KEY supplied"}])
+
+    events_url = f"{ODDS_API_BASE}/sports/{ODDS_API_SPORT}/events"
+    events, status, msg = request_json_with_status(events_url, params={"apiKey": api_key}, timeout=20)
+    debug.append({"source": "OddsAPI", "step": "events", "status_code": status, "status": msg, "rows": len(events) if isinstance(events, list) else 0})
+    if not isinstance(events, list) or not events:
+        return pd.DataFrame(columns=["Player", "Team", "Market", "Line", "Source", "Start", "Raw", "OverOdds", "UnderOdds"]), pd.DataFrame(debug)
+
+    market_keys = ",".join(ODDS_API_MARKETS.values())
+    for ev in events[:30]:
+        event_id = ev.get("id")
+        if not event_id:
+            continue
+        odds_url = f"{ODDS_API_BASE}/sports/{ODDS_API_SPORT}/events/{event_id}/odds"
+        params = {
+            "apiKey": api_key,
+            "regions": regions,
+            "markets": market_keys,
+            "oddsFormat": odds_format,
+        }
+        if bookmakers:
+            params["bookmakers"] = bookmakers
+        data, status, msg = request_json_with_status(odds_url, params=params, timeout=25)
+        books = data.get("bookmakers", []) if isinstance(data, dict) else []
+        debug.append({
+            "source": "OddsAPI", "step": "event_odds", "event": f"{ev.get('away_team','')} @ {ev.get('home_team','')}",
+            "event_id": event_id, "start": ev.get("commence_time"), "status_code": status, "status": msg,
+            "bookmakers": len(books)
+        })
+        if not books:
+            continue
+        # Pair over/under outcomes by player-market-book-line.
+        paired = {}
+        for book in books:
+            book_key = book.get("key") or book.get("title") or "book"
+            for mkt in book.get("markets", []) or []:
+                internal_market = odds_api_market_to_internal(mkt.get("key"))
+                if internal_market not in MARKETS:
+                    continue
+                for out in mkt.get("outcomes", []) or []:
+                    name = str(out.get("name") or "").strip()
+                    desc = str(out.get("description") or "").strip()
+                    player = desc if name.lower() in ["over", "under"] and desc else name
+                    if not player or normalize_name(player) in ["over", "under"]:
+                        continue
+                    line = safe_float(out.get("point"), np.nan)
+                    if pd.isna(line):
+                        continue
+                    side = "Over" if name.lower() == "over" else "Under" if name.lower() == "under" else ""
+                    key = (normalize_name(player), player, internal_market, float(line), str(book_key), ev.get("commence_time"))
+                    rec = paired.setdefault(key, {
+                        "Player": player, "Team": "", "Market": internal_market, "Line": float(line),
+                        "Source": f"OddsAPI:{book_key}", "Start": ev.get("commence_time") or "",
+                        "Raw": f"{ev.get('away_team','')} @ {ev.get('home_team','')}", "OverOdds": np.nan, "UnderOdds": np.nan
+                    })
+                    price = safe_float(out.get("price"), np.nan)
+                    if side == "Over":
+                        rec["OverOdds"] = price
+                    elif side == "Under":
+                        rec["UnderOdds"] = price
+        rows.extend(list(paired.values()))
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=["Player", "Team", "Market", "Line", "Source", "Start", "Raw", "OverOdds", "UnderOdds"])
+    else:
+        df = df.drop_duplicates(subset=["Player", "Market", "Line", "Source", "Start"])
+    debug.append({"source": "OddsAPI", "step": "final", "status": "parsed rows", "rows": len(df)})
+    return df, pd.DataFrame(debug)
+
+
 def load_manual_lines():
     data = load_json(MANUAL_LINES_FILE, [])
     return pd.DataFrame(data) if data else pd.DataFrame(columns=["Player", "Team", "Market", "Line", "Source"])
@@ -1279,26 +1428,49 @@ def save_manual_lines(df):
     save_json(MANUAL_LINES_FILE, df.to_dict("records"))
 
 
-def aggregate_lines(use_ud=True, use_sleeper=True, manual_df=None):
+def aggregate_lines(use_ud=True, use_sleeper=True, manual_df=None, use_odds_api=False, odds_api_key: str = "", line_upload_df=None):
     frames = []
-    ud_debug = pd.DataFrame(); sl_debug = pd.DataFrame()
+    ud_debug = pd.DataFrame(); sl_debug = pd.DataFrame(); extra_debug = []
     if use_ud:
         ud, ud_debug = fetch_underdog_board(); frames.append(ud)
     if use_sleeper:
         sl, sl_debug = fetch_sleeper_board(); frames.append(sl)
+    if use_odds_api:
+        oa, oa_debug = fetch_odds_api_board(odds_api_key)
+        frames.append(oa)
+        if oa_debug is not None and not oa_debug.empty:
+            extra_debug.extend(oa_debug.to_dict("records"))
     if manual_df is not None and len(manual_df):
         m = manual_df.copy(); m["Source"] = m.get("Source", "Manual").fillna("Manual"); frames.append(m)
+    if line_upload_df is not None and len(line_upload_df):
+        frames.append(line_upload_df)
     if not frames:
-        return pd.DataFrame(), ud_debug, sl_debug
+        combined_debug = pd.concat([sl_debug, pd.DataFrame(extra_debug)], ignore_index=True) if extra_debug else sl_debug
+        return pd.DataFrame(), ud_debug, combined_debug
     board = pd.concat(frames, ignore_index=True)
+    if board.empty:
+        combined_debug = pd.concat([sl_debug, pd.DataFrame(extra_debug)], ignore_index=True) if extra_debug else sl_debug
+        return board, ud_debug, combined_debug
     board["Market"] = board["Market"].astype(str).str.upper().map(lambda x: "PRA" if "PRA" in x else x)
     board = board[board["Market"].isin(MARKETS)].copy()
     board["Line"] = pd.to_numeric(board["Line"], errors="coerce")
     board = board.dropna(subset=["Player", "Market", "Line"])
+    for c in ["Team", "Source", "Start", "Raw", "OverOdds", "UnderOdds"]:
+        if c not in board.columns:
+            board[c] = "" if c not in ["OverOdds", "UnderOdds"] else np.nan
     board["NameKey"] = board["Player"].map(normalize_name)
-    priority = {"Underdog": 1, "Sleeper": 2, "Manual": 3}
-    board["Priority"] = board["Source"].map(priority).fillna(9)
-    return board.sort_values(["NameKey", "Market", "Priority"]), ud_debug, sl_debug
+    def source_priority(s):
+        s = str(s)
+        if s == "Underdog": return 1
+        if s == "Sleeper": return 2
+        if s.startswith("OddsAPI"): return 3
+        if s in ["Manual", "CSV Upload"]: return 4
+        return 9
+    board["Priority"] = board["Source"].map(source_priority)
+    # Store all source alternatives but keep the top source first. Projection board can still show line shopping columns.
+    board = board.sort_values(["NameKey", "Market", "Priority", "Line"]).drop_duplicates(subset=["NameKey", "Market", "Source", "Line"], keep="first")
+    combined_debug = pd.concat([sl_debug, pd.DataFrame(extra_debug)], ignore_index=True) if extra_debug else sl_debug
+    return board.sort_values(["NameKey", "Market", "Priority"]), ud_debug, combined_debug
 
 # ============================================================
 # Projection engine
@@ -2343,7 +2515,7 @@ def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, stron
     with c1:
         if st.button("🔄 REFRESH LIVE BOARD — Do Not Save Yet", use_container_width=True, key="hero_refresh_live_board"):
             clear_line_pull_caches()
-            pull_board_lines(use_ud, use_sleeper)
+            pull_board_lines(use_ud, use_sleeper, use_odds_api, odds_api_key)
             st.rerun()
     with c2:
         if st.button("💾 SAVE OFFICIAL BEFORE-GAME SNAPSHOT", use_container_width=True, key="hero_save_official_before"):
@@ -2425,16 +2597,24 @@ def schedule_for_slate(mode: str) -> pd.DataFrame:
 
 
 def clear_line_pull_caches():
-    for fn in [fetch_underdog_board, fetch_sleeper_board]:
+    for fn in [fetch_underdog_board, fetch_sleeper_board, fetch_odds_api_board]:
         try:
             fn.clear()
         except Exception:
             pass
 
 
-def pull_board_lines(use_ud_flag: bool, use_sleeper_flag: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def pull_board_lines(use_ud_flag: bool, use_sleeper_flag: bool, use_odds_api_flag: bool = False, odds_api_key: str = "") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     manual_df = load_manual_lines()
-    lines, ud_debug, sl_debug = aggregate_lines(use_ud=use_ud_flag, use_sleeper=use_sleeper_flag, manual_df=manual_df)
+    upload_df = st.session_state.get("wnba_uploaded_lines_df", pd.DataFrame())
+    lines, ud_debug, sl_debug = aggregate_lines(
+        use_ud=use_ud_flag,
+        use_sleeper=use_sleeper_flag,
+        use_odds_api=use_odds_api_flag,
+        odds_api_key=odds_api_key,
+        manual_df=manual_df,
+        line_upload_df=upload_df,
+    )
     st.session_state["wnba_lines_all"] = lines
     st.session_state["wnba_ud_debug"] = ud_debug
     st.session_state["wnba_sl_debug"] = sl_debug
@@ -2442,9 +2622,9 @@ def pull_board_lines(use_ud_flag: bool, use_sleeper_flag: bool) -> Tuple[pd.Data
     return lines, ud_debug, sl_debug
 
 
-def get_lines_from_state_or_pull(use_ud_flag: bool, use_sleeper_flag: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def get_lines_from_state_or_pull(use_ud_flag: bool, use_sleeper_flag: bool, use_odds_api_flag: bool = False, odds_api_key: str = "") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if "wnba_lines_all" not in st.session_state:
-        return pull_board_lines(use_ud_flag, use_sleeper_flag)
+        return pull_board_lines(use_ud_flag, use_sleeper_flag, use_odds_api_flag, odds_api_key)
     return (
         st.session_state.get("wnba_lines_all", pd.DataFrame()),
         st.session_state.get("wnba_ud_debug", pd.DataFrame()),
@@ -2606,13 +2786,15 @@ with st.sidebar:
     season_last = st.number_input("Last season baseline", min_value=2020, max_value=2032, value=datetime.now().year - 1, step=1)
     use_ud = st.toggle("Pull Underdog", value=True)
     use_sleeper = st.toggle("Pull Sleeper", value=True)
+    use_odds_api = st.toggle("Pull Odds API fallback", value=False, help="Optional: requires ODDS_API_KEY. Useful when Underdog/Sleeper are empty.")
+    odds_api_key = st.text_input("ODDS_API_KEY", value=get_streamlit_secret("ODDS_API_KEY", ""), type="password", help="Optional fallback for sportsbook WNBA player props.")
     use_remote = st.toggle("Allow SportsDataverse remote downloads", value=True)
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
     st.markdown("**Model:** Monte Carlo + Bayesian confidence + XGBoost-style blend")
     st.divider()
     if st.button("🔄 Refresh board lines", use_container_width=True):
         clear_line_pull_caches()
-        pull_board_lines(use_ud, use_sleeper)
+        pull_board_lines(use_ud, use_sleeper, use_odds_api, odds_api_key)
         st.rerun()
     if st.button("🧱 Rebuild database", use_container_width=True):
         try:
@@ -2790,6 +2972,21 @@ with tabs[5]:
 with tabs[4]:
     st.subheader("Manual fallback lines")
     st.caption("Use this when Underdog/Sleeper miss players. These lines are included with Source=Manual and route into the correct PTS/REB/AST/PRA tab.")
+    st.markdown("### CSV line upload fallback")
+    st.caption("Upload a CSV from any book/source with columns like Player, Market, Line, Team, Start, OverOdds, UnderOdds. It will route into PTS/REB/AST/PRA tabs.")
+    line_csv = st.file_uploader("Upload line CSV", type=["csv"], key="line_csv_upload")
+    if line_csv is not None:
+        try:
+            raw_lines = pd.read_csv(line_csv)
+            norm_lines = normalize_line_upload(raw_lines, source_name="CSV Upload")
+            if norm_lines.empty:
+                st.error("CSV loaded, but no usable Player/Market/Line rows were found.")
+            else:
+                st.session_state["wnba_uploaded_lines_df"] = norm_lines
+                st.success(f"Loaded {len(norm_lines)} uploaded line rows for this session. Refresh board lines to include them.")
+                st.dataframe(norm_lines.head(100), use_container_width=True)
+        except Exception as e:
+            st.error(f"Could not read line CSV: {e}")
     existing = load_manual_lines()
     edited = st.data_editor(existing, num_rows="dynamic", use_container_width=True, column_config={"Market": st.column_config.SelectboxColumn(options=MARKETS)})
     if st.button("Save manual lines"):
@@ -2890,11 +3087,11 @@ with tabs[10]:
     st.markdown("### Data status")
     st.dataframe(dataset_status_table(), use_container_width=True)
     st.markdown("### Aggregated lines")
-    lines, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud, use_sleeper)
+    lines, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud, use_sleeper, use_odds_api, odds_api_key)
     st.dataframe(lines, use_container_width=True)
     st.markdown("### Underdog debug")
     st.dataframe(ud_debug, use_container_width=True)
-    st.markdown("### Sleeper debug")
+    st.markdown("### Sleeper / Odds API debug")
     st.dataframe(sl_debug, use_container_width=True)
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
