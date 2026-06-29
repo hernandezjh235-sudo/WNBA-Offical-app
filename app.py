@@ -31,7 +31,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v1.6 — MLB Underdog Parser Port + Manual Line Fallback"
+APP_VERSION = "WNBA v1.7 — Underdog Decode Mode + Strict Live Line Matching"
 
 # ============================================================
 # Storage
@@ -1236,444 +1236,469 @@ def rel_id(obj, names):
     return None
 
 
-@st.cache_data(ttl=240, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def fetch_underdog_board():
-    """Robust WNBA Underdog board parser ported from the working MLB parser style.
+    """Underdog WNBA parser with deep decode mode.
 
-    The old WNBA parser depended on one specific nested path. This version:
-      - uses the same light Underdog request headers as the MLB app,
-      - tries every Underdog over_under_lines endpoint,
-      - parses relationship objects first,
-      - falls back to recursive object parsing,
-      - maps Underdog full market labels into PTS/REB/AST/PRA,
-      - accepts abbreviated display names like J. Young / C. Gray,
-      - keeps manual line fallback untouched when Underdog returns nothing.
+    This version is intentionally strict about player identity but generous about
+    where Underdog may place the player/stat/line inside JSON. It writes a decoder
+    table to DATA_DIR/wnba_underdog_decode.csv every refresh so we can see exactly
+    which raw rows were accepted or rejected.
     """
-    rows, debug = [], []
+    rows, debug, decode_rows = [], [], []
 
-    def ud_get_json(url, timeout=18):
-        try:
-            h = {
-                "User-Agent": "Mozilla/5.0 MLBKPropEngine/refresh-save-build",
-                "Accept": "application/json,text/plain,*/*",
-            }
-            r = requests.get(url, headers=h, timeout=timeout)
-            if r.status_code != 200:
-                debug.append({"source": "Underdog", "url": url, "status": f"HTTP {r.status_code}", "rows": 0, "message": (r.text or "")[:180]})
-                return None
-            try:
-                return r.json()
-            except Exception as e:
-                debug.append({"source": "Underdog", "url": url, "status": "bad json", "rows": 0, "message": str(e)[:180]})
-                return None
-        except Exception as e:
-            debug.append({"source": "Underdog", "url": url, "status": "request error", "rows": 0, "message": str(e)[:180]})
-            return None
-
-    def obj_type(obj, fallback=""):
-        return str(obj.get("type") or fallback or "").lower().replace("-", "_") if isinstance(obj, dict) else ""
-
-    def obj_id(obj):
-        if not isinstance(obj, dict):
-            return None
-        val = obj.get("id") or attrs(obj).get("id")
-        return str(val) if val not in [None, ""] else None
-
-    def collect_objects(data):
-        objects = []
-        def walk(x, parent_key=""):
-            if isinstance(x, dict):
-                y = dict(x)
-                if parent_key and "_parent_key" not in y:
-                    y["_parent_key"] = parent_key
-                objects.append(y)
-                for k, v in x.items():
-                    walk(v, k)
-            elif isinstance(x, list):
-                for item in x:
-                    walk(item, parent_key)
-        walk(data)
-        return objects
-
-    def text_from(*objs):
-        parts = []
-        wanted = [
-            "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
-            "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
-            "market_name", "sport", "league", "sport_name", "league_name", "position", "description",
-            "over_under", "over_under_title", "scoring_type", "projection_type", "team", "abbr_name",
-            "short_name", "event_title", "game_title", "home_team", "away_team", "scheduled_at", "start_time",
-        ]
-        for obj in objs:
-            if not isinstance(obj, dict):
+    master = load_dataset("master_features")
+    if master.empty:
+        master = compute_player_baselines(load_dataset("player_game_logs"), load_dataset("player_season_stats"), load_dataset("shots"), load_dataset("rosters"))
+    player_pool = []
+    if not master.empty and "Player" in master.columns:
+        for _, r in master.dropna(subset=["Player"]).iterrows():
+            player = str(r.get("Player", "")).strip()
+            if not player:
                 continue
-            a = attrs(obj)
-            for k in wanted:
-                v = a.get(k)
-                if isinstance(v, dict):
-                    for kk in wanted:
-                        if v.get(kk) not in [None, ""]:
-                            parts.append(str(v.get(kk)))
-                elif isinstance(v, list):
-                    parts.extend([str(x) for x in v if x not in [None, ""]][:4])
-                elif v not in [None, ""]:
-                    parts.append(str(v))
-        return " | ".join(parts)
-
-    def player_name_from(player_obj=None, appearance_obj=None, line_obj=None, ou_obj=None):
-        candidates = []
-        for obj in [player_obj, appearance_obj, line_obj, ou_obj]:
-            a = attrs(obj) if isinstance(obj, dict) else {}
-            candidates.extend([
-                a.get("display_name"), a.get("full_name"), a.get("name"), a.get("player_name"),
-                a.get("short_name"), a.get("abbreviation"), a.get("abbr_name"),
-                (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip(),
-            ])
-        for c in candidates:
-            if c and normalize_name(c):
-                return str(c)
-        return ""
-
-    def line_from_underdog(*objs):
-        # Do not use generic team/game totals. Only read true prop line fields.
-        safe_keys = ["stat_value", "line_score", "over_under_line", "target_value"]
-        for obj in objs:
-            a = attrs(obj)
-            for k in safe_keys:
-                val = safe_float(a.get(k), np.nan)
-                if pd.notna(val) and 0.5 <= val <= 80:
-                    return float(val)
-        blob = " | ".join(text_from(o) for o in objs if isinstance(o, dict))
-        nums = re.findall(r"(?<!\d)(\d{1,2}(?:\.5)?)(?!\d)", blob)
-        vals = [safe_float(n, np.nan) for n in nums]
-        vals = [v for v in vals if pd.notna(v) and 0.5 <= v <= 80]
-        return float(vals[0]) if vals else np.nan
-
-    def status_ok(*objs):
-        status_blob = " ".join(
-            str(attrs(o).get(k, ""))
-            for o in objs if isinstance(o, dict)
-            for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]
-        ).lower()
-        if any(x in status_blob for x in ["suspended", "removed", "hidden", "inactive", "closed", "disabled"]):
-            return False
-        return True
-
-    def bad_sport(blob):
-        low = str(blob or "").lower()
-        return any(x in low for x in ["mlb", "baseball", "nfl", "football", "nhl", "hockey", "tennis", "golf", "mma", "soccer", "cs2", "lol", "dota"])
-
-    def is_possible_wnba(blob):
-        low = str(blob or "").lower()
-        wnba_tokens = ["wnba", "women", "basketball"]
-        team_tokens = ["lva", "nyl", "atl", "was", "dal", "sea", "min", "phx", "chi", "ind", "con", "las", "gs", "golden state", "valkyries", "aces", "liberty", "dream", "mystics", "wings", "storm", "lynx", "mercury", "sky", "fever", "sun", "sparks"]
-        return any(t in low for t in wnba_tokens + team_tokens)
-
-    def infer_team(*objs):
-        for obj in objs:
-            a = attrs(obj) if isinstance(obj, dict) else {}
-            for k in ["team", "team_abbreviation", "abbr", "abbr_name", "short_name", "team_name"]:
-                v = a.get(k)
-                if isinstance(v, dict):
-                    v = v.get("abbr") or v.get("abbr_name") or v.get("name") or v.get("display_name")
-                if v not in [None, ""]:
-                    s = str(v).upper().strip()
-                    if 2 <= len(s) <= 4:
-                        return s
-        return ""
-
-    def start_from(*objs):
-        for obj in objs:
-            a = attrs(obj) if isinstance(obj, dict) else {}
-            for k in ["start_time", "scheduled_at", "start_date", "game_time", "match_time"]:
-                if a.get(k) not in [None, ""]:
-                    return str(a.get(k))
-        return ""
-
-    def known_player_records():
-        """Known WNBA players from the local feature/stat caches.
-
-        Underdog sometimes returns abbreviated display text or internal ids in the
-        fields we first inspect. Matching the full raw prop JSON against our known
-        player list prevents fake names like `ju4nn` or `none sh1n` from entering
-        the projection board.
-        """
-        frames = []
-        for key in ["master_features", "player_game_logs", "player_season_stats", "rosters"]:
-            try:
-                d = load_dataset(key)
-                if d is not None and not d.empty and "Player" in d.columns:
-                    cols = [c for c in ["Player", "Team", "Position", "PositionGroup"] if c in d.columns]
-                    frames.append(d[cols].copy())
-            except Exception:
-                pass
-        if not frames:
-            return []
-        kp = pd.concat(frames, ignore_index=True, sort=False)
-        kp["Player"] = kp["Player"].fillna("").astype(str)
-        kp["NameKey"] = kp["Player"].map(normalize_name)
-        kp = kp[kp["NameKey"].str.len() > 0].copy()
-        kp["Team"] = kp.get("Team", "").fillna("").astype(str).str.upper()
-        kp = kp.drop_duplicates("NameKey", keep="last")
-        last_counts = kp["NameKey"].map(lambda x: x.split()[-1] if x.split() else "").value_counts().to_dict()
-        records = []
-        for _, r in kp.iterrows():
-            toks = str(r.get("NameKey", "")).split()
-            if len(toks) < 2:
-                continue
-            records.append({
-                "Player": str(r.get("Player", "")),
-                "NameKey": str(r.get("NameKey", "")),
-                "Team": str(r.get("Team", "")),
-                "FirstInitial": toks[0][0] if toks[0] else "",
-                "Last": toks[-1],
-                "LastUnique": last_counts.get(toks[-1], 0) == 1,
+            nk = normalize_name(player)
+            toks = nk.split()
+            player_pool.append({
+                "Player": player,
+                "NameKey": nk,
+                "Team": str(r.get("Team", "")).upper().strip(),
+                "FirstInitial": toks[0][0] if toks else "",
+                "Last": toks[-1] if toks else "",
             })
-        return records
+    # de-dupe player pool
+    seen_keys, pp = set(), []
+    for rec in player_pool:
+        k = (rec["NameKey"], rec["Team"])
+        if k not in seen_keys:
+            seen_keys.add(k); pp.append(rec)
+    player_pool = pp
 
-    KNOWN_PLAYERS = known_player_records()
-
-    def active_schedule_teams(days_ahead=2):
-        """Teams with games today/tomorrow from cached schedule. Used only as a safety gate
-        so Underdog internal ids or unrelated WNBA rows do not become player cards.
-        If schedule is unavailable, this returns an empty set and does not hard-filter.
-        """
+    def active_schedule_teams():
+        sched = load_dataset("schedules")
         teams = set()
+        if sched is None or sched.empty:
+            return teams
         try:
-            sched = load_dataset("schedules")
-            if sched is None or sched.empty:
-                return teams
-            if "GameDate" not in sched.columns:
-                return teams
-            d = sched.copy()
-            d["GameDate"] = pd.to_datetime(d["GameDate"], errors="coerce")
-            today = pd.Timestamp(datetime.now().date())
-            max_day = today + pd.Timedelta(days=int(days_ahead))
-            dd = d[(d["GameDate"].dt.normalize() >= today) & (d["GameDate"].dt.normalize() <= max_day)].copy()
-            for c in ["Home", "Away"]:
-                if c in dd.columns:
-                    for v in dd[c].dropna().astype(str):
-                        vv = v.upper().strip()
-                        if 2 <= len(vv) <= 4:
-                            teams.add(vv)
-            # Normalize common SportsData abbreviations to sportsbook abbreviations.
-            remap = {"LV":"LVA", "NY":"NYL", "LA":"LAS", "WSH":"WAS", "CONN":"CON"}
-            teams |= {remap.get(t, t) for t in list(teams)}
+            s = standardize_schedules(sched)
         except Exception:
-            pass
-        return teams
+            s = sched.copy()
+        if s.empty:
+            return teams
+        if "GameDate" in s.columns:
+            gd = pd.to_datetime(s["GameDate"], errors="coerce")
+            today = pd.Timestamp(datetime.now().date())
+            # Include today + tomorrow because WNBA props can be posted after midnight/UTC mismatch.
+            mask = gd.dt.normalize().isin([today, today + pd.Timedelta(days=1), today - pd.Timedelta(days=1)])
+            if mask.any():
+                s = s[mask].copy()
+        for c in ["Home", "Away"]:
+            if c in s.columns:
+                teams.update([str(x).upper().strip() for x in s[c].dropna().tolist() if str(x).strip()])
+        return {t for t in teams if 2 <= len(t) <= 4}
 
     ACTIVE_TEAMS = active_schedule_teams()
 
-    def bad_player_candidate(player):
-        nk = normalize_name(player)
-        if not nk or len(nk.split()) < 2:
+    def attr(obj):
+        return attrs(obj) if isinstance(obj, dict) else {}
+
+    def collect_objects(data):
+        out = []
+        def walk(x, path="root"):
+            if isinstance(x, dict):
+                y = dict(x); y["_path"] = path
+                out.append(y)
+                for k, v in x.items():
+                    walk(v, f"{path}.{k}")
+            elif isinstance(x, list):
+                for i, v in enumerate(x):
+                    walk(v, f"{path}[{i}]")
+        walk(data)
+        return out
+
+    def get_id(obj):
+        if not isinstance(obj, dict):
+            return ""
+        v = obj.get("id") or attr(obj).get("id")
+        return str(v) if v not in [None, ""] else ""
+
+    def get_type(obj):
+        if not isinstance(obj, dict):
+            return ""
+        return str(obj.get("type") or obj.get("_parent_key") or obj.get("_path") or "").lower().replace("-", "_")
+
+    def relation_ids(obj):
+        ids = []
+        if not isinstance(obj, dict):
+            return ids
+        rels = obj.get("relationships", {})
+        if isinstance(rels, dict):
+            for _, node in rels.items():
+                data = node.get("data") if isinstance(node, dict) else node
+                if isinstance(data, dict) and data.get("id") not in [None, ""]:
+                    ids.append(str(data.get("id")))
+                elif isinstance(data, list):
+                    ids += [str(x.get("id")) for x in data if isinstance(x, dict) and x.get("id") not in [None, ""]]
+        a = attr(obj)
+        for k, v in a.items():
+            kn = col_norm(k)
+            if kn.endswith("_id") or kn in {"playerid", "appearanceid", "overunderid", "matchid", "gameid"}:
+                if v not in [None, ""]:
+                    ids.append(str(v))
+        return list(dict.fromkeys(ids))
+
+    def object_text(obj, max_len=900):
+        a = attr(obj)
+        keys = [
+            "title","display_title","name","display_name","full_name","first_name","last_name","player_name",
+            "short_name","abbr_name","stat","stat_type","appearance_stat","display_stat","label","market",
+            "market_name","description","league","league_name","sport","sport_name","team","team_abbreviation",
+            "home_team","away_team","match_title","event_title","game_title","scheduled_at","start_time"
+        ]
+        vals = []
+        for k in keys:
+            v = a.get(k)
+            if isinstance(v, dict):
+                vals += [str(v.get(kk)) for kk in keys if v.get(kk) not in [None, ""]]
+            elif isinstance(v, list):
+                vals += [str(x) for x in v[:4] if x not in [None, ""]]
+            elif v not in [None, ""]:
+                vals.append(str(v))
+        if not vals:
+            vals = [json.dumps(a, default=str)[:max_len]]
+        return " | ".join(vals)[:max_len]
+
+    def candidate_text(*objs):
+        parts = []
+        for o in objs:
+            if isinstance(o, dict):
+                parts.append(object_text(o))
+        return " | ".join([p for p in parts if p])[:2500]
+
+    def team_from_text(txt):
+        txt = str(txt or "").upper()
+        # Common WNBA abbreviations from your master file + sportsbook labels.
+        teams = sorted({r.get("Team", "") for r in player_pool if r.get("Team")}, key=len, reverse=True)
+        for t in teams:
+            if re.search(rf"\b{re.escape(t)}\b", txt):
+                return t
+        return ""
+
+    def bad_candidate(s):
+        nk = normalize_name(s)
+        if not nk:
             return True
-        if re.search(r"\d", str(player or "")):
+        toks = nk.split()
+        if len(toks) < 2:
             return True
-        bad_tokens = {"none", "null", "country", "player", "players", "over", "under", "higher", "lower", "wnba", "basketball"}
-        toks = set(nk.split())
-        if toks.intersection(bad_tokens):
+        if any(re.search(r"\d", t) for t in toks):
             return True
-        # Internal ids/slugs often have no normal full-name shape.
-        if any(len(t) <= 1 for t in toks):
+        if any(t in {"none","null","true","false","country","player","points","rebounds","assists","higher","lower","over","under","wnba","line"} for t in toks):
             return True
         return False
 
-    def resolve_known_player(raw_text, candidate="", team_hint=""):
-        raw_text = str(raw_text or "")
-        raw_norm = normalize_name(raw_text)
+    def clean_name_piece(s):
+        s = str(s or "")
+        # Remove market words when titles look like 'J. Young Points'.
+        s = re.sub(r"\b(Points|Point|Rebounds|Rebound|Assists|Assist|Pts\s*\+\s*Rebs\s*\+\s*Asts|Pts|Rebs|Asts|PRA|Higher|Lower)\b", " ", s, flags=re.I)
+        s = re.sub(r"[^A-Za-z.'\-\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def extract_name_candidates(*objs):
+        candidates = []
+        priority_keys = ["player_name","full_name","display_name","name","title","short_name","abbr_name","first_name","last_name"]
+        for o in objs:
+            if not isinstance(o, dict):
+                continue
+            a = attr(o)
+            first, last = a.get("first_name"), a.get("last_name")
+            if first and last:
+                candidates.append(f"{first} {last}")
+            for k in priority_keys:
+                v = a.get(k)
+                if isinstance(v, str) and v.strip():
+                    candidates.append(v)
+                elif isinstance(v, dict):
+                    for kk in priority_keys:
+                        if isinstance(v.get(kk), str):
+                            candidates.append(v.get(kk))
+        # Search whole evidence for full cached player names and initial-last forms.
+        evidence = candidate_text(*objs)
+        ev_norm = normalize_name(evidence)
+        for rec in player_pool:
+            if rec["NameKey"] and rec["NameKey"] in ev_norm:
+                candidates.append(rec["Player"])
+            if rec["FirstInitial"] and rec["Last"]:
+                if re.search(rf"\b{re.escape(rec['FirstInitial'])}\.?\s+{re.escape(rec['Last'])}\b", evidence, flags=re.I):
+                    candidates.append(f"{rec['FirstInitial']} {rec['Last']}")
+        # Clean and de-dupe
+        cleaned = []
+        for c in candidates:
+            cc = clean_name_piece(c)
+            if cc and cc not in cleaned:
+                cleaned.append(cc)
+        return cleaned[:30]
+
+    def resolve_player(candidates, evidence="", team_hint=""):
+        best = {"Player":"", "Team":"", "Score":0.0, "Candidate":"", "Reason":"no candidate"}
+        evidence_norm = normalize_name(evidence)
         team_hint = str(team_hint or "").upper().strip()
+        for cand in candidates:
+            if bad_candidate(cand) and not re.match(r"^[A-Za-z]\.?(\s+)[A-Za-z'\-]+$", str(cand).strip()):
+                continue
+            cn = normalize_name(cand)
+            ctoks = cn.split()
+            for rec in player_pool:
+                score = 0.0
+                reason = ""
+                if cn == rec["NameKey"]:
+                    score, reason = 1.00, "exact"
+                elif rec["NameKey"] and rec["NameKey"] in evidence_norm:
+                    score, reason = 0.99, "full name in raw"
+                elif len(ctoks) >= 2 and ctoks[-1] == rec["Last"] and ctoks[0][:1] == rec["FirstInitial"]:
+                    score, reason = 0.96, "initial+last"
+                else:
+                    ns = name_score(cn, rec["NameKey"])
+                    if ns >= 0.93:
+                        score, reason = ns, "fuzzy"
+                if score:
+                    if team_hint and rec["Team"] == team_hint:
+                        score += 0.03
+                    if ACTIVE_TEAMS and rec["Team"] not in ACTIVE_TEAMS:
+                        # Don't fully reject: schedule files can be stale, but heavily penalize.
+                        score -= 0.15
+                    if score > best["Score"]:
+                        best = {"Player":rec["Player"], "Team":rec["Team"], "Score":round(float(score), 4), "Candidate":cand, "Reason":reason}
+        if best["Score"] < 0.92:
+            best["Player"] = ""; best["Team"] = team_hint; best["Reason"] = "low match score"
+        return best
 
-        # If a candidate looks valid, map it back to the official cached name.
-        # Never return the raw candidate unless it strongly matches a known WNBA player.
-        if candidate and not bad_player_candidate(candidate):
-            cand_key = normalize_name(candidate)
-            best, best_score = None, 0.0
-            for rec in KNOWN_PLAYERS:
-                sc = name_score(cand_key, rec["NameKey"])
-                if team_hint and rec.get("Team") == team_hint:
-                    sc += 0.04
-                if ACTIVE_TEAMS and rec.get("Team") not in ACTIVE_TEAMS:
-                    sc -= 0.20
-                if sc > best_score:
-                    best, best_score = rec, sc
-            if best and best_score >= 0.90:
-                return best["Player"], best.get("Team", team_hint)
-            # Raw candidate may be an Underdog slug/id. Reject it so fallback can inspect raw_text.
+    def parse_market(txt):
+        return infer_market(txt)
 
+    def parse_line(*objs):
+        safe_keys = ["stat_value", "line_score", "over_under_line", "target_value", "value"]
+        for o in objs:
+            a = attr(o)
+            for k in safe_keys:
+                v = safe_float(a.get(k), np.nan)
+                if pd.notna(v) and 0.5 <= v <= 80:
+                    return float(v)
+        txt = candidate_text(*objs)
+        # Try patterns close to market names first.
+        m = re.search(r"(?:line|stat_value|line_score|target_value)[^0-9]{0,20}(\d{1,2}(?:\.5)?)", txt, flags=re.I)
+        if m:
+            v = safe_float(m.group(1), np.nan)
+            if pd.notna(v) and 0.5 <= v <= 80:
+                return float(v)
+        nums = [safe_float(x, np.nan) for x in re.findall(r"(?<!\d)(\d{1,2}(?:\.5)?)(?!\d)", txt)]
+        nums = [v for v in nums if pd.notna(v) and 0.5 <= v <= 80]
+        return float(nums[0]) if nums else np.nan
 
-        # Full-name containment.
-        for rec in KNOWN_PLAYERS:
-            nk = rec["NameKey"]
-            if nk and nk in raw_norm:
-                return rec["Player"], rec.get("Team", team_hint)
+    def is_wnba_text(txt):
+        low = str(txt or "").lower()
+        if any(x in low for x in ["mlb","baseball","nfl","football","nhl","soccer","tennis","golf","mma","pga"]):
+            return False
+        if "wnba" in low or "basketball" in low:
+            return True
+        # If it mentions any active/master WNBA player, treat as WNBA.
+        n = normalize_name(txt)
+        return any(rec["NameKey"] and rec["NameKey"] in n for rec in player_pool[:400])
 
-        # Underdog cards often show initials like J. Young -> normalized `j young`.
-        # IMPORTANT: do NOT match on last name alone. Raw Underdog JSON contains
-        # many generic keys/ids, which previously caused false players like Teonni Key.
-        best, best_score = None, 0.0
-        for rec in KNOWN_PLAYERS:
-            abbrev = f"{rec['FirstInitial']} {rec['Last']}".strip()
-            score = 0.0
-            if abbrev and re.search(rf"\b{re.escape(abbrev)}\b", raw_norm):
-                score = 0.95
-            # Also allow forms like J. Young / J Young / J-Young in the raw evidence.
-            dotted = rf"\b{re.escape(rec['FirstInitial'])}\.?\s+{re.escape(rec['Last'])}\b"
-            if re.search(dotted, raw_text, flags=re.I):
-                score = max(score, 0.96)
-            if team_hint and rec.get("Team") == team_hint:
-                score += 0.04
-            if ACTIVE_TEAMS and rec.get("Team") not in ACTIVE_TEAMS:
-                score -= 0.18
-            if score > best_score:
-                best, best_score = rec, score
-        if best and best_score >= 0.92:
-            return best["Player"], best.get("Team", team_hint)
+    def status_ok(*objs):
+        bad = ["suspended", "removed", "closed", "settled", "graded", "canceled", "cancelled"]
+        txt = candidate_text(*objs).lower()
+        return not any(b in txt for b in bad)
 
-        return "", team_hint
+    def add_decode(raw_name, raw_market, line, resolved, accepted, reason, parser, raw=""):
+        decode_rows.append({
+            "Raw Player": raw_name,
+            "Raw Market": raw_market,
+            "Line": line,
+            "Resolved Player": resolved.get("Player", "") if isinstance(resolved, dict) else "",
+            "Resolved Team": resolved.get("Team", "") if isinstance(resolved, dict) else "",
+            "Match Score": resolved.get("Score", 0) if isinstance(resolved, dict) else 0,
+            "Accepted": "✅" if accepted else "❌",
+            "Reason": reason,
+            "Parser": parser,
+            "Raw Sample": str(raw)[:700],
+        })
 
-    def add_row(player, team, market, line, source_mode, raw, start=""):
-        if market not in MARKETS or pd.isna(line):
-            return
-        resolved_player, resolved_team = resolve_known_player(raw, candidate=player, team_hint=team)
-        if not resolved_player or bad_player_candidate(resolved_player):
-            # Keep fake Underdog ids out of the board. They can still be inspected in Raw/debug.
-            return
-        if ACTIVE_TEAMS and str(resolved_team or "").upper().strip() and str(resolved_team).upper().strip() not in ACTIVE_TEAMS:
-            # Today has a narrow WNBA slate; skip stale/unrelated prop rows.
-            return
+    def append_row(player, team, market, line, raw, parser):
+        if market not in MARKETS:
+            return False
+        if pd.isna(line):
+            return False
         rows.append({
-            "Player": str(resolved_player),
-            "Team": str(resolved_team or team or ""),
+            "Player": player,
+            "Team": team,
             "Opponent": "",
             "Market": market,
             "Line": float(line),
             "Source": "Underdog",
-            "Start": start,
-            "Raw": str(raw)[:280],
-            "Parser Mode": source_mode,
+            "Start": "",
+            "Raw": str(raw)[:400],
+            "Parser Mode": parser,
+            "NameKey": normalize_name(player),
         })
+        return True
 
-    LINE_TYPES = {"over_under_line", "over_under_lines"}
-    OU_TYPES = {"over_under", "over_unders"}
-    APP_TYPES = {"appearance", "appearances"}
-    PLAYER_TYPES = {"player", "players"}
+    def get_json(url):
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Underdog/1.0",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://underdogfantasy.com",
+            "Referer": "https://underdogfantasy.com/",
+        }
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            status = int(getattr(r, "status_code", 0) or 0)
+            ctype = str(r.headers.get("content-type", ""))
+            if status != 200:
+                debug.append({"source":"Underdog", "url":url, "status":f"HTTP {status}", "rows":0, "message":(r.text or "")[:250]})
+                return None
+            try:
+                data = r.json()
+                debug.append({"source":"Underdog", "url":url, "status":"json ok", "rows":0, "message":f"content-type={ctype}"})
+                return data
+            except Exception:
+                debug.append({"source":"Underdog", "url":url, "status":"no json", "rows":0, "message":f"content-type={ctype}; body={(r.text or '')[:180]}"})
+                return None
+        except Exception as e:
+            debug.append({"source":"Underdog", "url":url, "status":"request error", "rows":0, "message":str(e)[:250]})
+            return None
 
+    # Try endpoints in newest-to-oldest order first.
     for url in UNDERDOG_URLS:
-        data = ud_get_json(url)
+        data = get_json(url)
         if not data:
             continue
-
         objects = collect_objects(data)
-        by_id_any = {}
-        over_unders, appearances, players, line_candidates = {}, {}, {}, []
-        for obj in objects:
-            typ = obj_type(obj, obj.get("_parent_key", ""))
-            oid = obj_id(obj)
-            if oid:
-                by_id_any[oid] = obj
-            if typ in LINE_TYPES or "over_under_line" in typ:
-                line_candidates.append(obj)
-            elif typ in OU_TYPES or typ == "over_under":
-                if oid:
-                    over_unders[oid] = obj
-            elif typ in APP_TYPES or "appearance" in typ:
-                if oid:
-                    appearances[oid] = obj
-            elif typ in PLAYER_TYPES or typ == "player":
-                if oid:
-                    players[oid] = obj
+        by_id = {get_id(o): o for o in objects if get_id(o)}
 
-        def get_by_id(oid):
-            return by_id_any.get(str(oid)) if oid not in [None, ""] else None
+        line_objs = []
+        for o in objects:
+            typ = get_type(o)
+            a = attr(o)
+            if "over_under_line" in typ or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value"]):
+                line_objs.append(o)
 
-        if not line_candidates:
-            for obj in objects:
-                a = attrs(obj)
-                if any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value"]):
-                    line_candidates.append(obj)
+        # If no specific line objects were found, still scan leaf objects containing a market and a line.
+        if not line_objs:
+            line_objs = [o for o in objects if parse_market(object_text(o)) and pd.notna(parse_line(o))]
 
-        # Relationship parser first.
-        for line_obj in line_candidates:
-            ou_id = rel_id(line_obj, ["over_under", "over_unders", "overUnder", "over_under_id", "over"])
-            ou_obj = over_unders.get(str(ou_id)) or get_by_id(ou_id)
-
-            app_id = rel_id(line_obj, ["appearance", "appearances", "appearance_id"])
-            if not app_id and isinstance(ou_obj, dict):
-                app_id = rel_id(ou_obj, ["appearance", "appearances", "appearance_id"])
-            app_obj = appearances.get(str(app_id)) or get_by_id(app_id)
-
-            player_id = rel_id(line_obj, ["player", "players", "player_id"])
-            if not player_id and isinstance(ou_obj, dict):
-                player_id = rel_id(ou_obj, ["player", "players", "player_id"])
-            if not player_id and isinstance(app_obj, dict):
-                player_id = rel_id(app_obj, ["player", "players", "player_id"])
-            if not player_id and isinstance(app_obj, dict):
-                player_id = attrs(app_obj).get("player_id") or attrs(app_obj).get("playerId")
-            player_obj = players.get(str(player_id)) or get_by_id(player_id)
-
-            evidence = text_from(line_obj, ou_obj, app_obj, player_obj)
-            blob = evidence + " | " + json.dumps(attrs(line_obj), default=str)
-            if bad_sport(blob):
+        for lo in line_objs:
+            rels = relation_ids(lo)
+            connected = [lo]
+            # add direct relations and one-hop relations
+            for rid in rels:
+                obj = by_id.get(rid)
+                if obj and obj not in connected:
+                    connected.append(obj)
+                    for rid2 in relation_ids(obj):
+                        obj2 = by_id.get(rid2)
+                        if obj2 and obj2 not in connected:
+                            connected.append(obj2)
+            raw = candidate_text(*connected)
+            if not is_wnba_text(raw):
+                add_decode("", "", np.nan, {}, False, "not WNBA / wrong sport", "relationship", raw)
                 continue
-            market = infer_market(blob)
+            market = parse_market(raw)
             if market not in MARKETS:
+                add_decode("", "", np.nan, {}, False, "unsupported/unknown market", "relationship", raw)
                 continue
-            if not is_possible_wnba(blob):
-                # Do not require this too strictly if player/team relationships are present.
-                pass
-            line = line_from_underdog(line_obj, ou_obj)
+            line = parse_line(*connected)
             if pd.isna(line):
+                add_decode("", market, np.nan, {}, False, "no line found", "relationship", raw)
                 continue
-            player = player_name_from(player_obj, app_obj, line_obj, ou_obj)
-            if not player:
+            if not status_ok(*connected):
+                add_decode("", market, line, {}, False, "suspended/closed", "relationship", raw)
                 continue
-            if not status_ok(line_obj, ou_obj, app_obj):
+            candidates = extract_name_candidates(*connected)
+            raw_name = candidates[0] if candidates else ""
+            team_hint = team_from_text(raw)
+            resolved = resolve_player(candidates, raw, team_hint)
+            if not resolved.get("Player"):
+                add_decode(raw_name, market, line, resolved, False, resolved.get("Reason", "unmatched player"), "relationship", raw)
                 continue
-            add_row(player, infer_team(player_obj, app_obj, line_obj, ou_obj), market, line, "relationship", evidence, start_from(app_obj, line_obj, ou_obj))
+            if ACTIVE_TEAMS and resolved.get("Team") and resolved.get("Team") not in ACTIVE_TEAMS:
+                add_decode(raw_name, market, line, resolved, False, "matched player not on active schedule team", "relationship", raw)
+                continue
+            append_row(resolved["Player"], resolved.get("Team", ""), market, line, raw, "relationship")
+            add_decode(raw_name, market, line, resolved, True, resolved.get("Reason", "accepted"), "relationship", raw)
 
-        # Recursive fallback parser for changed Underdog JSON.
-        for obj in objects:
-            if not isinstance(obj, dict):
+        # Fallback scan with full objects when relation path missed player info.
+        for o in objects:
+            raw = object_text(o, 1400)
+            if not raw or not is_wnba_text(raw):
                 continue
-            blob = json.dumps(obj, default=str)
-            low = blob.lower()
-            if bad_sport(low):
+            market = parse_market(raw)
+            line = parse_line(o)
+            if market not in MARKETS or pd.isna(line):
                 continue
-            market = infer_market(low)
-            if market not in MARKETS:
+            candidates = extract_name_candidates(o)
+            raw_name = candidates[0] if candidates else ""
+            resolved = resolve_player(candidates, raw, team_from_text(raw))
+            if not resolved.get("Player"):
+                add_decode(raw_name, market, line, resolved, False, resolved.get("Reason", "unmatched fallback"), "recursive", raw)
                 continue
-            if not is_possible_wnba(low):
+            if ACTIVE_TEAMS and resolved.get("Team") and resolved.get("Team") not in ACTIVE_TEAMS:
+                add_decode(raw_name, market, line, resolved, False, "matched player not on active schedule team", "recursive", raw)
                 continue
-            line = line_from_underdog(obj)
-            if pd.isna(line):
-                continue
-            player = player_name_from(obj, None, obj, None)
-            if not player:
-                continue
-            if not status_ok(obj):
-                continue
-            add_row(player, infer_team(obj), market, line, "recursive fallback", blob, start_from(obj))
+            append_row(resolved["Player"], resolved.get("Team", ""), market, line, raw, "recursive")
+            add_decode(raw_name, market, line, resolved, True, resolved.get("Reason", "accepted"), "recursive", raw)
 
-        debug.append({"source": "Underdog", "url": url, "status": "ok", "rows": len(rows), "message": f"parsed {len(rows)} WNBA rows"})
         if rows:
             break
 
+    decode_df = pd.DataFrame(decode_rows)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        decode_df.to_csv(DATA_DIR / "wnba_underdog_decode.csv", index=False)
+    except Exception:
+        pass
+
     if rows:
         df = pd.DataFrame(rows)
-        df["NameKey"] = df["Player"].map(normalize_name)
-        # Final safety: remove any internal ids/slugs that slipped through.
-        df = df[~df["Player"].map(bad_player_candidate)].copy()
-        if df.empty:
-            debug.append({"source": "Underdog", "url": "parser", "status": "name-match failed", "rows": 0, "message": "Lines parsed, but no Underdog player names matched cached WNBA players"})
-            return pd.DataFrame(columns=["Player", "Team", "Opponent", "Market", "Line", "Source", "Start", "Raw", "Parser Mode", "NameKey"]), pd.DataFrame(debug)
-        df = df.sort_values(["NameKey", "Market", "Line"]).drop_duplicates(subset=["NameKey", "Market", "Line", "Source"], keep="first")
+        df = df.sort_values(["NameKey", "Market", "Line"]).drop_duplicates(subset=["NameKey", "Market", "Line"], keep="first")
+        debug.append({"source":"Underdog", "url":"parser", "status":"ok", "rows":len(df), "message":f"accepted {len(df)} rows; decode rows {len(decode_df)}"})
         return df.reset_index(drop=True), pd.DataFrame(debug)
 
-    if not debug:
-        debug.append({"source": "Underdog", "url": "all", "status": "empty", "rows": 0, "message": "No endpoints checked"})
+    debug.append({"source":"Underdog", "url":"parser", "status":"no accepted rows", "rows":0, "message":f"decode rows {len(decode_df)}; active teams {sorted(ACTIVE_TEAMS) if ACTIVE_TEAMS else 'not detected'}"})
     return pd.DataFrame(columns=["Player", "Team", "Opponent", "Market", "Line", "Source", "Start", "Raw", "Parser Mode", "NameKey"]), pd.DataFrame(debug)
+
+@st.cache_data(ttl=240, show_spinner=False)
+def fetch_prizepicks_test_pull():
+    """Debug-only PrizePicks probe. It does not feed the board yet."""
+    urls = [
+        "https://api.prizepicks.com/projections?league_id=7",
+        "https://api.prizepicks.com/projections?league_id=3",
+        "https://api.prizepicks.com/projections",
+    ]
+    rows = []
+    headers = {"User-Agent":"Mozilla/5.0", "Accept":"application/json,text/plain,*/*"}
+    for u in urls:
+        try:
+            r = requests.get(u, headers=headers, timeout=15)
+            msg = (r.text or "")[:220]
+            status = f"HTTP {getattr(r,'status_code',0)}"
+            try:
+                data = r.json()
+                objs = flatten_json(data)
+                sample = []
+                for o in objs[:200]:
+                    txt = json.dumps(attrs(o), default=str)[:400]
+                    if "wnba" in txt.lower() or any(m in txt.lower() for m in ["points", "rebounds", "assists"]):
+                        sample.append(txt)
+                    if len(sample) >= 5:
+                        break
+                rows.append({"url":u, "status":status, "json":"yes", "objects":len(objs), "sample":" || ".join(sample)[:900]})
+            except Exception:
+                rows.append({"url":u, "status":status, "json":"no", "objects":0, "sample":msg})
+        except Exception as e:
+            rows.append({"url":u, "status":"request error", "json":"no", "objects":0, "sample":str(e)[:220]})
+    return pd.DataFrame(rows)
+
 
 @st.cache_data(ttl=240, show_spinner=False)
 def fetch_sleeper_board():
@@ -5060,6 +5085,26 @@ with tabs[7]:
     st.dataframe(lines, use_container_width=True)
     st.markdown("### Underdog debug")
     st.dataframe(ud_debug, use_container_width=True)
+
+    st.markdown("### Underdog Decode Mode")
+    decode_path = DATA_DIR / "wnba_underdog_decode.csv"
+    if decode_path.exists():
+        try:
+            decode_df = pd.read_csv(decode_path, low_memory=False)
+            st.caption("Raw Underdog row → parsed market/line → resolved player → accepted/rejected reason.")
+            st.dataframe(decode_df.tail(250), use_container_width=True)
+            st.download_button("Download Underdog decode CSV", decode_df.to_csv(index=False), "wnba_underdog_decode.csv", "text/csv")
+        except Exception as e:
+            st.warning(f"Decode file exists but could not be read: {e}")
+    else:
+        st.info("No decode file yet. Click Refresh / Pull Lines first.")
+
+    with st.expander("PrizePicks test pull — debug only", expanded=False):
+        st.caption("This only tests whether a public PrizePicks JSON response is reachable. It does not feed projections yet.")
+        if st.button("Test PrizePicks public pull", use_container_width=True):
+            pp_dbg = fetch_prizepicks_test_pull()
+            st.dataframe(pp_dbg, use_container_width=True)
+
     st.markdown("### Manual line debug")
     st.dataframe(sl_debug, use_container_width=True)
     st.markdown("### Cached master preview")
