@@ -1173,21 +1173,34 @@ def infer_market(blob):
     if any(x in low for x in ["3-pointers", "3 pointers", "three-pointers", "three pointers", "3pt", "3 pm", "3pm", "threes made"]):
         return None
 
-    # PRA can appear in several Underdog forms.
-    if (
+    # Hard reject combo markets we do NOT model as standalone tabs.
+    # This prevents Points+Rebounds / Points+Assists / Rebounds+Assists from
+    # being incorrectly routed into PTS/REB/AST and creating bad lines like 17.5/18.5.
+    combo_not_supported = [
+        "points rebounds", "points rebs", "pts rebs", "pts reb",
+        "points assists", "points asts", "pts asts", "pts ast",
+        "rebounds assists", "rebs asts", "reb ast", "rebs assists",
+        "points rebounds o", "points assists o", "rebounds assists o",
+    ]
+    # PRA can appear in several Underdog forms and is the only combo we keep.
+    is_pra = (
         ("points" in b and "rebounds" in b and "assists" in b)
         or ("pts" in b and ("reb" in b or "rebs" in b) and ("ast" in b or "asts" in b))
         or "pts rebs asts" in b
         or "pts reb ast" in b
         or "pra" in b
         or "points rebounds assists" in b
-    ):
+    )
+    if is_pra:
         return "PRA"
-    if "point" in b or "points" in b or "pts" in b:
+    if any(x in b for x in combo_not_supported):
+        return None
+    # Exact single-stat markets only.
+    if re.search(r"\b(points?|pts)\b", b):
         return "PTS"
-    if "rebound" in b or "rebounds" in b or "reb" in b or "rebs" in b:
+    if re.search(r"\b(rebounds?|rebs?|reb)\b", b):
         return "REB"
-    if "assist" in b or "assists" in b or "ast" in b or "asts" in b:
+    if re.search(r"\b(assists?|asts?|ast)\b", b):
         return "AST"
     return None
 
@@ -1675,12 +1688,16 @@ def fetch_underdog_board():
     if rows:
         df = pd.DataFrame(rows)
         df = df[pd.to_numeric(df["Line"], errors="coerce").between(0.5, 80)].copy()
-        # One main line per Player+Market. Prefer half-point standard prop lines, then larger
-        # market-looking values over small option/threshold values if any slipped through.
-        df["_half"] = pd.to_numeric(df["Line"], errors="coerce").map(lambda x: 1 if abs((x * 2) - round(x * 2)) < 1e-9 and abs(x - round(x)) > 1e-9 else 0)
-        df["_line_priority"] = df["_half"] * 100 + pd.to_numeric(df["Line"], errors="coerce").clip(0, 80)
+        # One main line per Player+Market. Underdog may include alternate ladders
+        # or combo lines for the same player. Real main WNBA props are almost always .5.
+        # Pick the LOWEST half-point line per player/market after unsupported combo
+        # markets are filtered. This selects 11.5 over 18.5 for PTS, 8.5 over 11.5 for REB, etc.
+        df["_line_num"] = pd.to_numeric(df["Line"], errors="coerce")
+        df["_is_half"] = df["_line_num"].map(lambda x: 1 if pd.notna(x) and abs((x * 2) - round(x * 2)) < 1e-9 and abs(x - round(x)) > 1e-9 else 0)
+        # Penalize whole-number values like 4/5/7 that often come from sort/rank/stat IDs.
+        df["_line_priority"] = df["_is_half"] * 1000 - df["_line_num"].clip(0, 80)
         df = df.sort_values(["NameKey", "Market", "_line_priority"], ascending=[True, True, False])
-        df = df.drop_duplicates(subset=["NameKey", "Market"], keep="first").drop(columns=["_half", "_line_priority"], errors="ignore")
+        df = df.drop_duplicates(subset=["NameKey", "Market"], keep="first").drop(columns=["_line_num", "_is_half", "_line_priority"], errors="ignore")
         debug.append({"source":"Underdog", "url":"parser", "status":"ok", "rows":len(df), "message":f"accepted {len(df)} real main-line rows; decode rows {len(decode_df)}"})
         return df.reset_index(drop=True), pd.DataFrame(debug)
 
