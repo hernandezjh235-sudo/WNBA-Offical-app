@@ -2783,6 +2783,9 @@ def auto_backtest_engine(max_rows: int = 2500) -> pd.DataFrame:
 # ============================================================
 OFFICIAL_WNBA_TEAM_CONTEXT_FILE = DATA_DIR / "wnba_official_team_context.csv"
 GAME_CONTEXT_FILE = DATA_DIR / "wnba_game_context_today.csv"
+DAILY_TEAM_CONTEXT_FILE = DATA_DIR / "wnba_daily_team_context_cache_v2.csv"
+MONEYLINE_BOARD_FILE = DATA_DIR / "wnba_moneyline_board.csv"
+MONEYLINE_HISTORY_FILE = LOCAL_DIR / "wnba_moneyline_history.json"
 
 
 def _wnba_stats_headers() -> Dict[str, str]:
@@ -5135,6 +5138,9 @@ def refresh_today_pipeline(mode: str, use_ud_flag: bool = True) -> Dict[str, Any
         game_ctx, game_dbg = build_game_context_cache(mode, force_official=True)
         status["Game Context Rows"] = 0 if game_ctx is None or game_ctx.empty else len(game_ctx)
         st.session_state["wnba_game_context_debug"] = game_dbg
+        daily_ctx, daily_dbg = build_daily_team_context_cache_v2(mode, force=True)
+        status["Daily Context Rows"] = 0 if daily_ctx is None or daily_ctx.empty else len(daily_ctx)
+        st.session_state["wnba_daily_team_context_v2_debug"] = daily_dbg
     except Exception as _gce:
         status["Game Context Rows"] = 0
         st.session_state["wnba_game_context_last_error"] = str(_gce)[:180]
@@ -5158,6 +5164,13 @@ def refresh_today_pipeline(mode: str, use_ud_flag: bool = True) -> Dict[str, Any
             board["SlateDate"] = str(slate_target_date(mode) or "ALL")
             board = enrich_board_with_matchups(board, mode)
             board = apply_matchup_context_to_board(board)
+            board = apply_daily_team_context_v2_to_board(board)
+            try:
+                moneyline_board = build_moneyline_board(mode)
+                status["Moneyline Rows"] = 0 if moneyline_board is None or moneyline_board.empty else len(moneyline_board)
+            except Exception as _mle:
+                status["Moneyline Rows"] = 0
+                status["Moneyline Status"] = str(_mle)[:100]
             save_dataset("projection_board", board)
             status["Cards"] = len(board)
             status["Status"] = "complete"
@@ -5171,6 +5184,291 @@ def refresh_today_pipeline(mode: str, use_ud_flag: bool = True) -> Dict[str, Any
 
 
 
+
+
+# ============================================================
+# Daily Team Context Cache 2.0 + Moneyline Engine 2.0
+# ============================================================
+def _latest_logs_with_team_game_totals(logs: pd.DataFrame) -> pd.DataFrame:
+    """Convert player logs into team-game totals. This powers daily defensive context."""
+    if logs is None or logs.empty:
+        return pd.DataFrame()
+    d = standardize_player_logs(logs)
+    if d.empty:
+        return pd.DataFrame()
+    d["TeamKey"] = d["Team"].map(_team_key_for_matchup)
+    d["OppKey"] = d["Opponent"].map(_team_key_for_matchup) if "Opponent" in d.columns else ""
+    d = d[d["TeamKey"].astype(str).str.len() > 0].copy()
+    for c in ["PTS","REB","AST","PRA","FGA","FGM","FG3A","FG3M","FTA","TOV","OREB","DREB","MIN"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+    agg = d.groupby(["GameDate","Season","TeamKey","OppKey"], dropna=False).agg(
+        TeamPTS=("PTS","sum"), TeamREB=("REB","sum"), TeamAST=("AST","sum"),
+        TeamPRA=("PRA","sum"), TeamFGA=("FGA","sum"), TeamFGM=("FGM","sum"),
+        TeamFG3A=("FG3A","sum"), TeamFG3M=("FG3M","sum"), TeamFTA=("FTA","sum"),
+        TeamTOV=("TOV","sum"), TeamOREB=("OREB","sum"), TeamDREB=("DREB","sum"),
+        TeamMIN=("MIN","sum"), PlayerRows=("Player","count")
+    ).reset_index()
+    poss = agg["TeamFGA"] + 0.44*agg["TeamFTA"] + agg["TeamTOV"] - agg["TeamOREB"]
+    agg["PossessionsProxy"] = poss.replace(0, np.nan)
+    agg["PaceProxy"] = poss
+    agg["ORtgProxy"] = np.where(poss > 0, 100*agg["TeamPTS"]/poss, np.nan)
+    agg["eFGProxy"] = np.where(agg["TeamFGA"] > 0, (agg["TeamFGM"]+0.5*agg["TeamFG3M"])/agg["TeamFGA"], np.nan)
+    agg["TSProxy"] = np.where((2*(agg["TeamFGA"]+0.44*agg["TeamFTA"])) > 0, agg["TeamPTS"]/(2*(agg["TeamFGA"]+0.44*agg["TeamFTA"])), np.nan)
+    return agg
+
+
+def build_daily_team_context_cache_v2(mode: str = "Today", force: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Daily opponent defensive profile update.
+
+    Rebuilds team offense/defense, last-5/last-10 form, allowed-by-market, rest, home/away,
+    rotation and injury context. It uses cached SportsDataverse logs/schedules/team stats and
+    the current slate schedule. This runs during Refresh Today and feeds both prop and moneyline engines.
+    """
+    target = slate_target_date(mode) or datetime.utcnow().date()
+    dbg = []
+    logs = load_dataset("player_game_logs")
+    sched = schedule_for_slate(mode)
+    team_stats = load_dataset("team_season_stats")
+    team_ranks = load_dataset("team_ranks")
+    team_games = _latest_logs_with_team_game_totals(logs)
+    rows = []
+    teams = set()
+    if sched is not None and not sched.empty:
+        ss = standardize_schedules(sched)
+        for _, g in ss.iterrows():
+            h = _team_key_for_matchup(g.get("Home")); a = _team_key_for_matchup(g.get("Away"))
+            if h: teams.add(h)
+            if a: teams.add(a)
+    if not teams and team_games is not None and not team_games.empty:
+        teams = set(team_games["TeamKey"].dropna().astype(str).unique().tolist())
+    dbg.append({"Step":"teams found", "Rows":len(teams), "Status":"ok" if teams else "empty"})
+
+    # standardize team season/rank context.
+    ts = standardize_team_season(team_stats) if team_stats is not None and not team_stats.empty else pd.DataFrame()
+    tr = team_ranks.copy() if team_ranks is not None and not team_ranks.empty else pd.DataFrame()
+    if not tr.empty and "Team" in tr.columns:
+        tr["TeamKey"] = tr["Team"].map(_team_key_for_matchup)
+    if not ts.empty and "Team" in ts.columns:
+        ts["TeamKey"] = ts["Team"].map(_team_key_for_matchup)
+
+    for team in sorted([t for t in teams if t]):
+        base = {"Team": team, "SlateDate": str(target), "UpdatedAt": now_iso()}
+        tg = team_games[team_games["TeamKey"] == team].sort_values("GameDate") if team_games is not None and not team_games.empty else pd.DataFrame()
+        if not tg.empty:
+            for window, suffix in [(None, "Season"), (10, "L10"), (5, "L5")]:
+                dd = tg.tail(window) if window else tg
+                base[f"Games_{suffix}"] = int(len(dd))
+                base[f"PF_{suffix}"] = float(dd["TeamPTS"].mean())
+                base[f"REB_{suffix}"] = float(dd["TeamREB"].mean())
+                base[f"AST_{suffix}"] = float(dd["TeamAST"].mean())
+                base[f"Pace_{suffix}"] = float(dd["PaceProxy"].mean()) if "PaceProxy" in dd else np.nan
+                base[f"ORtg_{suffix}"] = float(dd["ORtgProxy"].mean()) if "ORtgProxy" in dd else np.nan
+                base[f"eFG_{suffix}"] = float(dd["eFGProxy"].mean()) if "eFGProxy" in dd else np.nan
+                base[f"TS_{suffix}"] = float(dd["TSProxy"].mean()) if "TSProxy" in dd else np.nan
+        # allowed profile: rows where this team is opponent.
+        if team_games is not None and not team_games.empty and "OppKey" in team_games.columns:
+            al = team_games[team_games["OppKey"] == team].sort_values("GameDate")
+        else:
+            al = pd.DataFrame()
+        if not al.empty:
+            for window, suffix in [(None, "Season"), (10, "L10"), (5, "L5")]:
+                dd = al.tail(window) if window else al
+                base[f"Allowed_PTS_{suffix}"] = float(dd["TeamPTS"].mean())
+                base[f"Allowed_REB_{suffix}"] = float(dd["TeamREB"].mean())
+                base[f"Allowed_AST_{suffix}"] = float(dd["TeamAST"].mean())
+                base[f"Allowed_PRA_{suffix}"] = float(dd["TeamPRA"].mean())
+                base[f"Allowed_Pace_{suffix}"] = float(dd["PaceProxy"].mean()) if "PaceProxy" in dd else np.nan
+                # DRtg proxy = opponent points per 100 poss against this team.
+                poss = dd["PossessionsProxy"].replace(0, np.nan)
+                base[f"DRtg_{suffix}"] = float((100*dd["TeamPTS"]/poss).mean()) if poss.notna().any() else np.nan
+        # team season/rank fallback.
+        hit = pd.DataFrame()
+        if not tr.empty and "TeamKey" in tr.columns:
+            hit = tr[tr["TeamKey"] == team].tail(1)
+        if hit.empty and not ts.empty and "TeamKey" in ts.columns:
+            hit = ts[ts["TeamKey"] == team].tail(1)
+        if not hit.empty:
+            row = hit.iloc[-1]
+            for src, dst in [("Pace","Official_Pace"),("ORtg","Official_ORtg"),("DRtg","Official_DRtg"),("NetRtg","Official_NetRtg"),("PointsAllowed","Official_PointsAllowed"),("REB","Official_REB"),("AST","Official_AST")]:
+                if src in row.index and pd.notna(row.get(src)):
+                    base[dst] = safe_float(row.get(src), np.nan)
+            for src in ["OffensiveRank","DefensiveRank","NetRank","PaceRank","PointsAllowedRank"]:
+                if src in row.index and pd.notna(row.get(src)):
+                    base[src] = safe_float(row.get(src), np.nan)
+        rest, note = _rest_days_for_team(team, target)
+        base["RestDays"] = rest; base["RestNote"] = note; base["BackToBack"] = bool(pd.notna(rest) and rest == 0)
+        base.update(_projected_rotation_for_team(team))
+        base.update(_team_injury_context(team))
+        # Stable blended values used by engines.
+        base["Ctx_Pace"] = np.nanmean([safe_float(base.get("Pace_L5"), np.nan), safe_float(base.get("Pace_L10"), np.nan), safe_float(base.get("Official_Pace"), np.nan), 78.0])
+        base["Ctx_ORtg"] = np.nanmean([safe_float(base.get("ORtg_L5"), np.nan), safe_float(base.get("ORtg_L10"), np.nan), safe_float(base.get("Official_ORtg"), np.nan), 100.0])
+        base["Ctx_DRtg"] = np.nanmean([safe_float(base.get("DRtg_L5"), np.nan), safe_float(base.get("DRtg_L10"), np.nan), safe_float(base.get("Official_DRtg"), np.nan), 100.0])
+        base["Ctx_NetRtg"] = base["Ctx_ORtg"] - base["Ctx_DRtg"]
+        rows.append(base)
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out.to_csv(DAILY_TEAM_CONTEXT_FILE, index=False)
+    st.session_state["wnba_daily_team_context_v2"] = out
+    st.session_state["wnba_daily_team_context_v2_debug"] = pd.DataFrame(dbg)
+    return out, pd.DataFrame(dbg)
+
+
+def _team_context_v2_lookup(team: str) -> Dict[str, Any]:
+    df = st.session_state.get("wnba_daily_team_context_v2", pd.DataFrame())
+    if df is None or df.empty:
+        if DAILY_TEAM_CONTEXT_FILE.exists():
+            try: df = pd.read_csv(DAILY_TEAM_CONTEXT_FILE, low_memory=False)
+            except Exception: df = pd.DataFrame()
+    if df is None or df.empty or "Team" not in df.columns:
+        return {}
+    tk = _team_key_for_matchup(team)
+    d = df.copy(); d["_TeamKey"] = d["Team"].map(_team_key_for_matchup)
+    hit = d[d["_TeamKey"] == tk]
+    return hit.iloc[-1].to_dict() if not hit.empty else {}
+
+
+def apply_daily_team_context_v2_to_board(board: pd.DataFrame) -> pd.DataFrame:
+    """Apply market-specific opponent defensive context and log visible factors."""
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    for c in ["Daily Context Applied","Daily Context Factor","Daily Context Note","Opponent Allowed L5","Opponent Allowed L10","Opponent DRtg L5","Opponent Pace L5"]:
+        if c not in out.columns: out[c] = "" if c.endswith("Note") or c.endswith("Applied") else np.nan
+    for idx, r in out.iterrows():
+        opp = _team_key_for_matchup(r.get("Opponent"))
+        market = str(r.get("Market", "")).upper()
+        ctx = _team_context_v2_lookup(opp)
+        if not ctx or not opp:
+            out.at[idx,"Daily Context Applied"] = "NO"
+            out.at[idx,"Daily Context Note"] = "Daily opponent profile unavailable; fallback model used."
+            continue
+        allowed_l5 = safe_float(ctx.get(f"Allowed_{market}_L5"), np.nan)
+        allowed_l10 = safe_float(ctx.get(f"Allowed_{market}_L10"), np.nan)
+        drtg = safe_float(ctx.get("Ctx_DRtg"), np.nan)
+        pace = safe_float(ctx.get("Ctx_Pace"), np.nan)
+        base_proj = safe_float(r.get("Projection"), np.nan)
+        line = safe_float(r.get("Line"), np.nan)
+        factor = 1.0
+        notes = []
+        if pd.notna(allowed_l5) and pd.notna(allowed_l10):
+            # Compare recent allowed to season allowed or sane market baseline.
+            league_base = {"PTS": 77.0, "REB": 34.0, "AST": 19.0, "PRA": 130.0}.get(market, np.nan)
+            allowed_blend = 0.65*allowed_l5 + 0.35*allowed_l10
+            if pd.notna(league_base):
+                f = max(0.94, min(1.06, 1 + (allowed_blend - league_base) / (league_base * 18)))
+                factor *= f; notes.append(f"{market} allowed factor {f:.3f}")
+        if pd.notna(drtg):
+            f = max(0.96, min(1.05, 1 + (drtg - 100.0)/900.0))
+            factor *= f; notes.append(f"DRtg factor {f:.3f}")
+        if pd.notna(pace):
+            f = max(0.97, min(1.045, 1 + (pace - 78.0)/700.0))
+            factor *= f; notes.append(f"pace factor {f:.3f}")
+        if pd.notna(base_proj):
+            new_proj = round(float(base_proj) * factor, 2)
+            out.at[idx,"Projection"] = new_proj
+            if pd.notna(line):
+                out.at[idx,"Edge"] = round(new_proj - float(line), 2)
+                out.at[idx,"Lean"] = "OVER" if new_proj > float(line) else "UNDER"
+                if "Official" in out.columns:
+                    out.at[idx,"Official"] = "🔥 OVER" if new_proj > float(line) else "⚠️ UNDER"
+        out.at[idx,"Daily Context Applied"] = "YES"
+        out.at[idx,"Daily Context Factor"] = round(factor, 4)
+        out.at[idx,"Daily Context Note"] = "; ".join(notes) if notes else "Neutral daily context."
+        out.at[idx,"Opponent Allowed L5"] = allowed_l5
+        out.at[idx,"Opponent Allowed L10"] = allowed_l10
+        out.at[idx,"Opponent DRtg L5"] = safe_float(ctx.get("DRtg_L5"), np.nan)
+        out.at[idx,"Opponent Pace L5"] = safe_float(ctx.get("Pace_L5"), np.nan)
+    return out
+
+
+def _moneyline_prob_to_american(p: float) -> float:
+    try:
+        p = float(p)
+        p = min(max(p, 0.01), 0.99)
+        return round(-100*p/(1-p), 0) if p >= 0.5 else round(100*(1-p)/p, 0)
+    except Exception:
+        return np.nan
+
+
+def build_moneyline_board(mode: str = "Today") -> pd.DataFrame:
+    """Moneyline Engine 2.0 using the same daily context cache as props."""
+    ctx, _ = build_daily_team_context_cache_v2(mode, force=False)
+    sched = schedule_for_slate(mode)
+    if sched is None or sched.empty:
+        return pd.DataFrame()
+    s = standardize_schedules(sched)
+    rows = []
+    for _, g in s.iterrows():
+        home = _team_key_for_matchup(g.get("Home")); away = _team_key_for_matchup(g.get("Away"))
+        if not home or not away: continue
+        hctx = _team_context_v2_lookup(home); actx = _team_context_v2_lookup(away)
+        def score(c, home_flag=False):
+            ortg = safe_float(c.get("Ctx_ORtg"), 100.0); drtg = safe_float(c.get("Ctx_DRtg"), 100.0)
+            net = safe_float(c.get("Ctx_NetRtg"), ortg-drtg); pace = safe_float(c.get("Ctx_Pace"), 78.0)
+            l5pf = safe_float(c.get("PF_L5"), np.nan); l5pa = safe_float(c.get("Allowed_PTS_L5"), np.nan)
+            recent = 0 if pd.isna(l5pf) or pd.isna(l5pa) else (l5pf - l5pa) * 0.08
+            inj = -1.25*safe_float(c.get("Out Players"), 0) - 0.45*safe_float(c.get("Questionable Players"), 0)
+            rest = safe_float(c.get("RestDays"), np.nan); rest_adj = -0.8 if pd.notna(rest) and rest == 0 else 0.25 if pd.notna(rest) and rest >= 2 else 0
+            home_adj = 2.2 if home_flag else 0
+            rot = (safe_float(c.get("Rotation Confidence"), 65) - 65) * 0.025
+            return net*0.42 + recent + inj + rest_adj + home_adj + rot + (pace-78)*0.015
+        hs = score(hctx, True); aas = score(actx, False)
+        diff = hs - aas
+        # logistic win probability tuned conservatively for WNBA spreads.
+        home_prob = 1/(1+math.exp(-diff/7.5))
+        away_prob = 1-home_prob
+        total = np.nanmean([safe_float(hctx.get("PF_L5"), np.nan), safe_float(hctx.get("PF_L10"), np.nan), safe_float(actx.get("PF_L5"), np.nan), safe_float(actx.get("PF_L10"), np.nan)]) * 2
+        if pd.isna(total): total = 160.0
+        spread_home = round(-diff, 1)
+        game_id = str(g.get("GameID") or f"{away}_{home}_{slate_target_date(mode)}")
+        matchup = f"{away} @ {home}"
+        common = {"Mode":mode,"GameID":game_id,"Matchup":matchup,"Away":away,"Home":home,"Projected Total":round(float(total),1),"Projected Spread Home":spread_home,"UpdatedAt":now_iso()}
+        rows.append({**common,"Team":home,"Opponent":away,"HomeAway":"HOME","Win Probability":round(home_prob,4),"Fair American Odds":_moneyline_prob_to_american(home_prob),"Moneyline Edge Note":"Compare fair odds to sportsbook moneyline; positive edge when book is longer than fair.","Team Score":round(hs,2),"Opponent Score":round(aas,2),"Context Note":f"Home adv, net rating, L5 form, rest, injuries, rotation confidence."})
+        rows.append({**common,"Team":away,"Opponent":home,"HomeAway":"AWAY","Win Probability":round(away_prob,4),"Fair American Odds":_moneyline_prob_to_american(away_prob),"Moneyline Edge Note":"Compare fair odds to sportsbook moneyline; positive edge when book is longer than fair.","Team Score":round(aas,2),"Opponent Score":round(hs,2),"Context Note":f"Away team context uses net rating, L5 form, rest, injuries, rotation confidence."})
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out.to_csv(MONEYLINE_BOARD_FILE, index=False)
+    return out
+
+
+def render_moneyline_tab(mode: str = "Today"):
+    st.subheader("Moneyline Engine 2.0")
+    st.caption("Uses the same daily team context cache as props: ORtg/DRtg/Net, pace, L5/L10 form, injuries, rest, rotation confidence, and home court.")
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("🔄 Build Moneyline Board", use_container_width=True):
+            ml = build_moneyline_board(mode)
+            st.session_state["wnba_moneyline_board"] = ml
+    with c2:
+        if st.button("📌 Save Moneyline Snapshot", use_container_width=True):
+            ml = st.session_state.get("wnba_moneyline_board", pd.DataFrame())
+            if ml is None or ml.empty and MONEYLINE_BOARD_FILE.exists():
+                try: ml = pd.read_csv(MONEYLINE_BOARD_FILE)
+                except Exception: ml = pd.DataFrame()
+            hist = load_json(MONEYLINE_HISTORY_FILE, [])
+            if ml is not None and not ml.empty:
+                hist.extend(ml.to_dict("records")); save_json(MONEYLINE_HISTORY_FILE, hist)
+                st.success(f"Saved {len(ml)} moneyline rows.")
+    ml = st.session_state.get("wnba_moneyline_board", pd.DataFrame())
+    if (ml is None or ml.empty) and MONEYLINE_BOARD_FILE.exists():
+        try: ml = pd.read_csv(MONEYLINE_BOARD_FILE)
+        except Exception: ml = pd.DataFrame()
+    if ml is None or ml.empty:
+        st.info("Click Build Moneyline Board after Refresh Today.")
+    else:
+        st.dataframe(ml, use_container_width=True)
+        st.download_button("Download moneyline board CSV", ml.to_csv(index=False), "wnba_moneyline_board.csv", "text/csv")
+    ctx = st.session_state.get("wnba_daily_team_context_v2", pd.DataFrame())
+    if (ctx is None or ctx.empty) and DAILY_TEAM_CONTEXT_FILE.exists():
+        try: ctx = pd.read_csv(DAILY_TEAM_CONTEXT_FILE)
+        except Exception: ctx = pd.DataFrame()
+    with st.expander("Daily Team Context Cache 2.0", expanded=False):
+        if ctx is None or ctx.empty:
+            st.info("No context cache yet. Run Refresh Today.")
+        else:
+            st.dataframe(ctx, use_container_width=True)
+            st.download_button("Download daily context cache CSV", ctx.to_csv(index=False), "wnba_daily_team_context_cache_v2.csv", "text/csv")
 
 def run_one_click_refresh_today(mode: str = "Today", use_ud_flag: bool = True) -> Dict[str, Any]:
     """One button pipeline: rebuild feature cache if data exists, refresh schedule/game context,
@@ -5219,7 +5517,7 @@ def render_refresh_today_status():
     c[3].metric("Underdog", status.get("Underdog Lines", 0))
     c[4].metric("Cards", status.get("Cards", 0))
     c[5].metric("Seconds", status.get("Seconds", "-"))
-    st.caption(f"Status: {status.get('Status')}")
+    st.caption(f"Status: {status.get('Status')} | Daily Context Rows: {status.get('Daily Context Rows', 0)} | Moneyline Rows: {status.get('Moneyline Rows', 0)}")
 
 
 def clear_line_pull_caches():
@@ -6110,6 +6408,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     proj_df["SlateDate"] = str(slate_target_date(mode) or "ALL")
     proj_df = enrich_board_with_matchups(proj_df, mode)
     proj_df = apply_matchup_context_to_board(proj_df)
+    proj_df = apply_daily_team_context_v2_to_board(proj_df)
     CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
     proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
 
@@ -6199,7 +6498,7 @@ except Exception:
     hero_board_rows = hero_real_lines = hero_no_line = hero_strong = 0
 hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
 
-tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Debug / Status", "Model Reports"])
+tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Debug / Status", "Moneyline", "Model Reports"])
 
 MARKET_TAB_META = {
     "PTS": ("POINTS", "Points board: scoring projection, shot profile, pace, usage, matchup, line edge."),
@@ -6323,10 +6622,21 @@ with tabs[6]:
 
     st.markdown("### Manual line debug")
     st.dataframe(sl_debug, use_container_width=True)
+    st.markdown("### Daily Team Context Cache 2.0")
+    ctx_debug = st.session_state.get("wnba_daily_team_context_v2", pd.DataFrame())
+    if (ctx_debug is None or ctx_debug.empty) and DAILY_TEAM_CONTEXT_FILE.exists():
+        try:
+            ctx_debug = pd.read_csv(DAILY_TEAM_CONTEXT_FILE, low_memory=False)
+        except Exception:
+            ctx_debug = pd.DataFrame()
+    st.dataframe(ctx_debug, use_container_width=True)
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
 
 with tabs[7]:
+    render_moneyline_tab("Today")
+
+with tabs[8]:
     st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
     st.caption("This page keeps the main UI clean while giving you the same deeper review tools: line movement, closing-line value, projection calibration, and historical model testing.")
 
