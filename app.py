@@ -1804,6 +1804,357 @@ def make_projection_board(lines, logs, base):
         out = out.sort_values(["Official", "Official Play Score", "Edge"], ascending=[True, False, False])
     return out
 
+
+
+# ============================================================
+# Advanced Production Engines v2.2
+# Full implementations: XGBoost training, similarity, referee,
+# travel, injury ripple, line movement/CLV, feature importance,
+# model disagreement, backtesting, EV/Kelly, opponent lineup.
+# ============================================================
+TEAM_COORDS = {
+    "ATL": (33.7490, -84.3880), "CHI": (41.8781, -87.6298), "CON": (41.4918, -72.0912),
+    "DAL": (32.7767, -96.7970), "IND": (39.7684, -86.1581), "LA": (34.0522, -118.2437),
+    "LAS": (36.1699, -115.1398), "LV": (36.1699, -115.1398), "MIN": (44.9778, -93.2650),
+    "NY": (40.7128, -74.0060), "PHX": (33.4484, -112.0740), "SEA": (47.6062, -122.3321),
+    "WAS": (38.9072, -77.0369), "GS": (37.7749, -122.4194), "TOR": (43.6532, -79.3832),
+}
+TEAM_ALIASES = {
+    "ATLANTA DREAM":"ATL", "CHICAGO SKY":"CHI", "CONNECTICUT SUN":"CON", "DALLAS WINGS":"DAL",
+    "INDIANA FEVER":"IND", "LOS ANGELES SPARKS":"LA", "LAS VEGAS ACES":"LV", "MINNESOTA LYNX":"MIN",
+    "NEW YORK LIBERTY":"NY", "PHOENIX MERCURY":"PHX", "SEATTLE STORM":"SEA", "WASHINGTON MYSTICS":"WAS",
+    "GOLDEN STATE VALKYRIES":"GS", "TORONTO TEMPO":"TOR"
+}
+REFEREE_FILE = LOCAL_DIR / "wnba_referee_tendencies.csv"
+INJURY_STATUS_FILE = LOCAL_DIR / "wnba_injury_status.json"
+MODEL_DIR = LOCAL_DIR / "models"
+MODEL_DIR.mkdir(exist_ok=True)
+BACKTEST_FILE = DATA_DIR / "wnba_backtest_results.csv"
+
+
+def team_abbrev(x) -> str:
+    s = str(x or "").strip().upper()
+    if s in TEAM_COORDS:
+        return s
+    s2 = re.sub(r"[^A-Z ]+", "", s).strip()
+    return TEAM_ALIASES.get(s2, s[:3])
+
+
+def haversine_miles(a, b):
+    if not a or not b:
+        return np.nan
+    lat1, lon1 = map(math.radians, a); lat2, lon2 = map(math.radians, b)
+    dlat = lat2-lat1; dlon = lon2-lon1
+    q = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+    return 3958.8 * 2 * math.asin(min(1, math.sqrt(q)))
+
+
+def latest_travel_context(logs: pd.DataFrame, name_key: str, team: str = "") -> Dict[str, Any]:
+    out = {"Travel Miles": np.nan, "Travel Tax": 0.0, "Travel Engine Note": "Travel unavailable."}
+    if logs is None or logs.empty or "NameKey" not in logs.columns or "GameDate" not in logs.columns:
+        return out
+    d = logs[logs["NameKey"] == name_key].copy().sort_values("GameDate")
+    if len(d) < 2:
+        return out
+    cur_team = team_abbrev(team or d.iloc[-1].get("Team"))
+    prev_team = team_abbrev(d.iloc[-2].get("Team") or cur_team)
+    miles = haversine_miles(TEAM_COORDS.get(prev_team), TEAM_COORDS.get(cur_team))
+    if pd.isna(miles):
+        return out
+    tax = -0.18 if miles >= 1500 else -0.10 if miles >= 900 else -0.04 if miles >= 400 else 0.0
+    return {"Travel Miles": round(float(miles), 1), "Travel Tax": tax, "Travel Engine Note": f"Estimated travel {miles:.0f} miles; tax {tax:+.2f}."}
+
+
+def referee_tendency_engine(row: Dict[str, Any]) -> Dict[str, Any]:
+    if not REFEREE_FILE.exists():
+        return {"Referee Factor": 0.0, "Referee Note": "No referee CSV loaded; neutral."}
+    try:
+        refs = pd.read_csv(REFEREE_FILE)
+    except Exception:
+        return {"Referee Factor": 0.0, "Referee Note": "Referee CSV unreadable; neutral."}
+    if refs.empty:
+        return {"Referee Factor": 0.0, "Referee Note": "Referee table empty; neutral."}
+    market = str(row.get("Market", ""))
+    # Accept either market-specific columns or generic FTA/Foul/Total columns.
+    factor = 0.0; notes=[]
+    for col, weight in [("FTA_Index", .35), ("Foul_Index", .25), ("Pace_Index", .20), ("Points_Index", .20)]:
+        if col in refs.columns:
+            val = pd.to_numeric(refs[col], errors="coerce").dropna().mean()
+            if pd.notna(val):
+                factor += max(-0.20, min(0.20, (float(val)-100)/100))*weight
+                notes.append(f"{col} {val:.1f}")
+    if market in ["REB"]:
+        factor *= .35
+    if market in ["AST"]:
+        factor *= .55
+    return {"Referee Factor": round(float(factor), 3), "Referee Note": "; ".join(notes) if notes else "Referee file loaded, no usable index columns."}
+
+
+def injury_ripple_engine(row: Dict[str, Any], base_row: pd.Series) -> Dict[str, Any]:
+    bumps = load_json(INJURY_BUMPS_FILE, [])
+    status = load_json(INJURY_STATUS_FILE, [])
+    player = row.get("Player", ""); team = str(row.get("Team") or base_row.get("Team") or ""); market = row.get("Market", "")
+    active_out = {normalize_name(x.get("Player")): x for x in status if str(x.get("Status", "")).upper() in ["OUT", "DOUBTFUL", "INACTIVE"]}
+    total_usage = 0.0; total_min = 0.0; notes=[]
+    for b in bumps:
+        if normalize_name(b.get("Player")) not in ["", normalize_name(player)] and normalize_name(b.get("Player")) != normalize_name(player):
+            continue
+        if str(b.get("Team", "")).strip() and team and str(b.get("Team", "")).strip().upper() != team.upper():
+            continue
+        bm = str(b.get("Market", "ALL")).upper()
+        if bm not in ["ALL", market]:
+            continue
+        teammate = normalize_name(b.get("Teammate Out"))
+        # If no status table is loaded, a bump row still acts as manual active bump.
+        if teammate and active_out and teammate not in active_out:
+            continue
+        ub = safe_float(b.get("Usage Bump %"), 0)/100.0
+        mb = safe_float(b.get("Minutes Bump"), 0)
+        total_usage += ub; total_min += mb
+        notes.append(f"{b.get('Teammate Out','manual')} usage {ub:+.1%}, min {mb:+.1f}")
+    proj_bump = 0.0
+    if market in ["PTS", "PRA"]:
+        proj_bump += total_usage * max(8.0, safe_float(base_row.get("UsageProxy"), 10)) * 0.25
+    if total_min:
+        ppm = safe_float(base_row.get(f"{market}_per_min"), np.nan)
+        if pd.notna(ppm): proj_bump += total_min * ppm
+    return {"Injury Ripple Bump": round(float(proj_bump), 3), "Injury Ripple Note": "; ".join(notes) if notes else "No active injury ripple bump."}
+
+
+def opponent_lineup_adjustment(row: Dict[str, Any], base_row: pd.Series) -> Dict[str, Any]:
+    gr = load_dataset("game_rosters")
+    market = str(row.get("Market", "")); opp = str(row.get("Opponent", ""))
+    if gr.empty or not opp:
+        return {"Opponent Lineup Adj": 0.0, "Opponent Lineup Note": "Opponent lineup unavailable."}
+    d = gr.copy()
+    if "Team" not in d.columns:
+        return {"Opponent Lineup Adj": 0.0, "Opponent Lineup Note": "Opponent lineup unavailable."}
+    od = d[d["Team"].astype(str).str.upper().map(team_abbrev) == team_abbrev(opp)].copy()
+    if od.empty:
+        return {"Opponent Lineup Adj": 0.0, "Opponent Lineup Note": "No matched opponent active roster."}
+    # Defensive size/position proxy from active opponent roster.
+    bigs = od.get("PositionGroup", pd.Series(dtype=str)).astype(str).str.contains("Big", na=False).mean() if "PositionGroup" in od.columns else np.nan
+    guards = od.get("PositionGroup", pd.Series(dtype=str)).astype(str).str.contains("Guard", na=False).mean() if "PositionGroup" in od.columns else np.nan
+    adj = 0.0
+    if market == "REB" and pd.notna(bigs): adj += max(-0.20, min(0.20, (0.30 - bigs) * 0.7))
+    if market == "AST" and pd.notna(guards): adj += max(-0.15, min(0.15, (guards - 0.35) * 0.35))
+    if market == "PTS" and pd.notna(bigs): adj += max(-0.12, min(0.12, (0.28 - bigs) * 0.4))
+    return {"Opponent Lineup Adj": round(float(adj), 3), "Opponent Lineup Note": f"Opponent roster mix: Big {bigs:.0%} / Guard {guards:.0%}" if pd.notna(bigs) or pd.notna(guards) else "Opponent position mix unavailable."}
+
+
+def build_training_frame_from_logs(logs: pd.DataFrame, market: str) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
+    if logs is None or logs.empty or market not in logs.columns:
+        return pd.DataFrame(), pd.Series(dtype=float), []
+    d = logs.copy().sort_values(["NameKey", "GameDate"])
+    needed = [market, "MIN", "PTS", "REB", "AST", "PRA", "FGA", "FTA", "TOV"]
+    for c in needed:
+        if c in d.columns: d[c] = pd.to_numeric(d[c], errors="coerce")
+    feats=[]
+    for key, g in d.groupby("NameKey"):
+        g=g.sort_values("GameDate").copy()
+        for c in [market, "MIN", "FGA", "FTA", "TOV"]:
+            if c not in g.columns: g[c]=0
+        g["roll3"] = g[market].shift(1).rolling(3, min_periods=1).mean()
+        g["roll5"] = g[market].shift(1).rolling(5, min_periods=1).mean()
+        g["roll10"] = g[market].shift(1).rolling(10, min_periods=1).mean()
+        g["min_roll5"] = g["MIN"].shift(1).rolling(5, min_periods=1).mean()
+        g["usage_roll5"] = (g["FGA"].fillna(0)+0.44*g["FTA"].fillna(0)+g["TOV"].fillna(0)).shift(1).rolling(5, min_periods=1).mean()
+        g["home_flag"] = g.get("HomeAway", "").astype(str).str.upper().str.contains("HOME|H", na=False).astype(int) if "HomeAway" in g.columns else 0
+        g["games_seen"] = np.arange(len(g))
+        feats.append(g)
+    if not feats: return pd.DataFrame(), pd.Series(dtype=float), []
+    dd=pd.concat(feats, ignore_index=True)
+    feature_cols=["roll3","roll5","roll10","min_roll5","usage_roll5","home_flag","games_seen"]
+    dd=dd.dropna(subset=[market,"roll3","roll5","roll10"])
+    if len(dd) < 50:
+        return pd.DataFrame(), pd.Series(dtype=float), feature_cols
+    X=dd[feature_cols].replace([np.inf,-np.inf],np.nan).fillna(0)
+    y=pd.to_numeric(dd[market], errors="coerce")
+    return X, y, feature_cols
+
+
+@st.cache_resource(show_spinner=False)
+def train_market_model_cached(market: str, logs_csv_signature: str):
+    logs = load_dataset("player_game_logs")
+    X, y, feature_cols = build_training_frame_from_logs(logs, market)
+    if X.empty or len(y) < 50:
+        return None, feature_cols, pd.DataFrame(), "Not enough historical rows to train."
+    try:
+        from xgboost import XGBRegressor
+        model = XGBRegressor(n_estimators=220, max_depth=3, learning_rate=0.035, subsample=0.9, colsample_bytree=0.9, random_state=42, objective="reg:squarederror")
+        model.fit(X, y)
+        imp = pd.DataFrame({"Feature": feature_cols, "Importance": getattr(model, "feature_importances_", np.zeros(len(feature_cols)))})
+        return model, feature_cols, imp.sort_values("Importance", ascending=False), "XGBoost trained."
+    except Exception as e:
+        try:
+            from sklearn.ensemble import HistGradientBoostingRegressor
+            model = HistGradientBoostingRegressor(max_iter=250, learning_rate=0.04, max_leaf_nodes=16, random_state=42)
+            model.fit(X, y)
+            imp = pd.DataFrame({"Feature": feature_cols, "Importance": np.nan})
+            return model, feature_cols, imp, f"Sklearn gradient boosting trained; XGBoost unavailable: {str(e)[:80]}"
+        except Exception as e2:
+            return None, feature_cols, pd.DataFrame(), f"Model training failed: {str(e2)[:120]}"
+
+
+def current_model_features_for_row(row: Dict[str, Any]) -> Dict[str, float]:
+    return {
+        "roll3": safe_float(row.get("Similarity Projection"), safe_float(row.get("Projection"), 0)),
+        "roll5": safe_float(row.get("L5 Avg"), safe_float(row.get("Projection"), 0)),
+        "roll10": safe_float(row.get("L10 Avg"), safe_float(row.get("Projection"), 0)),
+        "min_roll5": safe_float(row.get("MIN Proj"), 0),
+        "usage_roll5": safe_float(row.get("Usage Proxy"), 0),
+        "home_flag": 1 if str(row.get("HomeAway", "")).upper().startswith("H") else 0,
+        "games_seen": safe_float(row.get("Games", 20), 20),
+    }
+
+
+def model_prediction_for_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    market = str(row.get("Market", ""))
+    logs_path = CACHE_FILES.get("player_game_logs")
+    sig = str(logs_path.stat().st_mtime) if logs_path and logs_path.exists() else "none"
+    model, cols, imp, note = train_market_model_cached(market, sig)
+    if model is None or not cols:
+        return {"XGBoost Projection": np.nan, "XGBoost Note": note, "XGBoost Feature Importance": "Unavailable"}
+    feat = current_model_features_for_row(row)
+    X = pd.DataFrame([{c: feat.get(c, 0) for c in cols}])
+    try:
+        pred = float(model.predict(X)[0])
+    except Exception:
+        return {"XGBoost Projection": np.nan, "XGBoost Note": "Prediction failed", "XGBoost Feature Importance": "Unavailable"}
+    imp_text = ", ".join([f"{r.Feature}:{r.Importance:.3f}" if pd.notna(r.Importance) else f"{r.Feature}" for _, r in imp.head(6).iterrows()]) if not imp.empty else "No importances"
+    return {"XGBoost Projection": round(pred, 2), "XGBoost Note": note, "XGBoost Feature Importance": imp_text}
+
+
+def implied_prob_from_odds(american_odds: float = -110) -> float:
+    o = safe_float(american_odds, -110)
+    if o < 0: return abs(o)/(abs(o)+100)
+    return 100/(o+100)
+
+
+def ev_kelly_engine(prob_pct: float, american_odds: float = -110) -> Dict[str, Any]:
+    p = max(0, min(1, safe_float(prob_pct, 0)/100))
+    o = safe_float(american_odds, -110)
+    dec = 1 + (100/abs(o) if o < 0 else o/100)
+    b = dec - 1
+    ev = p*b - (1-p)
+    kelly = max(0.0, min(0.08, (p*b - (1-p))/b)) if b > 0 else 0.0
+    return {"Break Even %": round(implied_prob_from_odds(o)*100, 1), "EV %": round(ev*100, 2), "Kelly %": round(kelly*100, 2), "Odds Used": o}
+
+
+def clv_engine(player: str, market: str, current_line: float, saved_line: float = np.nan) -> Dict[str, Any]:
+    hist = load_json(LINE_HISTORY_FILE, [])
+    rows = [r for r in hist if normalize_name(r.get("Player")) == normalize_name(player) and str(r.get("Market")) == str(market)]
+    if pd.isna(saved_line) and rows:
+        saved_line = safe_float(rows[0].get("Line"), np.nan)
+    if pd.isna(saved_line) or pd.isna(current_line):
+        return {"CLV": np.nan, "CLV Note": "No saved/opening line for CLV."}
+    clv = safe_float(saved_line) - safe_float(current_line)
+    return {"CLV": round(clv, 2), "CLV Note": f"Saved/open {saved_line:g} vs current {current_line:g}: CLV {clv:+.1f}"}
+
+
+def sharp_money_detector(line_move: float, edge: float, lean: str) -> str:
+    if pd.isna(line_move): return "No movement sample"
+    if lean == "OVER" and line_move > 0: return "Market moved against Over (worse line)"
+    if lean == "OVER" and line_move < 0: return "Reverse/value: Over line improved"
+    if lean == "UNDER" and line_move > 0: return "Value: Under line improved"
+    if lean == "UNDER" and line_move < 0: return "Market moved against Under"
+    return "Neutral movement"
+
+
+def model_disagreement_full(row: Dict[str, Any]) -> Dict[str, Any]:
+    vals=[]; names=[]
+    for k in ["Projection", "XGBoost Projection", "Similarity Projection", "Median"]:
+        v=safe_float(row.get(k), np.nan)
+        if pd.notna(v): vals.append(v); names.append(k)
+    if len(vals) < 2:
+        return {"Model Disagreement Score": np.nan, "Model Disagreement Note": "Not enough model outputs."}
+    spread=float(np.max(vals)-np.min(vals))
+    note="Low disagreement" if spread < 1.2 else "Moderate disagreement" if spread < 2.4 else "High disagreement - review manually"
+    return {"Model Disagreement Score": round(spread,2), "Model Disagreement Note": note + " (" + ", ".join(names) + ")"}
+
+
+def auto_backtest_engine(max_rows: int = 2500) -> pd.DataFrame:
+    logs = load_dataset("player_game_logs")
+    if logs.empty:
+        return pd.DataFrame()
+    rows=[]
+    d=logs.sort_values(["NameKey","GameDate"]).copy()
+    for market in MARKETS:
+        if market not in d.columns: continue
+        for nk,g in d.groupby("NameKey"):
+            g=g.sort_values("GameDate").copy()
+            vals=pd.to_numeric(g[market], errors="coerce")
+            pred=vals.shift(1).rolling(10, min_periods=3).mean()*0.55 + vals.shift(1).rolling(5, min_periods=3).mean()*0.45
+            for idx, r in g.assign(Pred=pred).dropna(subset=[market,"Pred"]).tail(50).iterrows():
+                # Synthetic historical line = recent rolling median rounded to .5, used only for model QA when no historical book lines exist.
+                line=round(float(r["Pred"])*2)/2
+                lean="OVER" if r["Pred"]>line else "UNDER"
+                actual=float(r[market]); hit=(actual>line) if lean=="OVER" else (actual<line)
+                rows.append({"Player":r.get("Player"), "Market":market, "GameDate":r.get("GameDate"), "Projection":round(float(r["Pred"]),2), "Synthetic Line":line, "Lean":lean, "Actual":actual, "Result":"WIN" if hit else "LOSS"})
+                if len(rows)>=max_rows: break
+            if len(rows)>=max_rows: break
+        if len(rows)>=max_rows: break
+    bt=pd.DataFrame(rows)
+    if not bt.empty: bt.to_csv(BACKTEST_FILE, index=False)
+    return bt
+
+
+# Preserve prior projection builder and enhance it with full advanced engines.
+_make_projection_board_core = make_projection_board
+
+def make_projection_board(lines, logs, base):
+    core = _make_projection_board_core(lines, logs, base)
+    if core is None or core.empty:
+        return core
+    out=[]
+    for _, r in core.iterrows():
+        row=r.to_dict()
+        b, score = match_player_base(row.get("Player", ""), base if base is not None and not base.empty else load_dataset("master_features"))
+        if b is None:
+            b = pd.Series(dtype=object)
+        xgb = model_prediction_for_row(row)
+        row.update(xgb)
+        # Ensemble recalibration: blend current projection with trained model when available.
+        p0=safe_float(row.get("Projection"), np.nan); px=safe_float(row.get("XGBoost Projection"), np.nan)
+        if pd.notna(p0) and pd.notna(px):
+            row["Ensemble Projection"] = round(0.72*p0 + 0.28*px, 2)
+            row["Projection"] = row["Ensemble Projection"]
+            row["Edge"] = round(row["Projection"] - safe_float(row.get("Line"), np.nan), 2)
+        inj = injury_ripple_engine(row, b); row.update(inj)
+        opp = opponent_lineup_adjustment(row, b); row.update(opp)
+        ref = referee_tendency_engine(row); row.update(ref)
+        trav = latest_travel_context(logs, normalize_name(row.get("Matched Player") or row.get("Player")), row.get("Team")); row.update(trav)
+        # Apply small final additive context to edge/projection.
+        context_add = safe_float(row.get("Injury Ripple Bump"),0) + safe_float(row.get("Opponent Lineup Adj"),0) + safe_float(row.get("Referee Factor"),0) + safe_float(row.get("Travel Tax"),0)
+        if pd.notna(safe_float(row.get("Projection"), np.nan)):
+            row["Projection"] = round(safe_float(row.get("Projection")) + context_add, 2)
+            row["Edge"] = round(row["Projection"] - safe_float(row.get("Line"), np.nan), 2)
+        lean = "OVER" if safe_float(row.get("Edge"), 0) > 0 else "UNDER"
+        row["Lean"] = lean
+        # EV/Kelly based on Monte Carlo side probability.
+        side_prob = safe_float(row.get("Over %"), 0) if lean == "OVER" else safe_float(row.get("Under %"), 0)
+        row.update(ev_kelly_engine(side_prob, -110))
+        row.update(clv_engine(row.get("Player"), row.get("Market"), safe_float(row.get("Line"), np.nan), safe_float(row.get("Opening Line"), np.nan)))
+        row["Sharp Money Note"] = sharp_money_detector(safe_float(row.get("Line Move"), np.nan), safe_float(row.get("Edge"), np.nan), lean)
+        row.update(model_disagreement_full(row))
+        # Re-score official with EV and disagreement penalties.
+        official_score = safe_float(row.get("Official Play Score"), 0)
+        official_score += max(-8, min(8, safe_float(row.get("EV %"), 0)*0.6))
+        if safe_float(row.get("Model Disagreement Score"), 0) > 2.4: official_score -= 8
+        if safe_float(row.get("Kelly %"), 0) >= 2: official_score += 3
+        row["Official Play Score"] = round(max(0, min(100, official_score)), 1)
+        sim_side = side_prob
+        row["Tier"] = tier_grade(row["Official Play Score"], safe_float(row.get("Edge"),0), sim_side, safe_float(row.get("Data Score"),0))
+        row["Feature Importance"] = feature_importance_text(row) + " | XGB: " + str(row.get("XGBoost Feature Importance", ""))
+        row["Full Engine Note"] = "Similarity + trained ML + referee + travel + injury ripple + opponent lineup + CLV + EV/Kelly active."
+        out.append(row)
+    df=pd.DataFrame(out)
+    if not df.empty:
+        df=df.sort_values(["Official Play Score","Edge"], ascending=[False, False])
+        save_dataset("projection_board", df)
+    return df
+
+
 # ============================================================
 # Logs / backup tools
 # ============================================================
@@ -2291,7 +2642,7 @@ except Exception:
     hero_board_rows = hero_real_lines = hero_no_line = hero_strong = 0
 hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
 
-tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Manual Lines", "Data Manager", "Research Hub", "Team Ranks", "Official + Grade", "Log Tools", "Debug", "Best Bets", "Slate Copy"])
+tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Manual Lines", "Data Manager", "Research Hub", "Team Ranks", "Official + Grade", "Log Tools", "Debug", "Best Bets", "Slate Copy", "ML Lab", "Backtest", "EV / CLV", "Injuries / Refs"])
 
 MARKET_TAB_META = {
     "PTS": ("POINTS", "Points board: scoring projection, shot profile, pace, usage, matchup, line edge."),
@@ -2605,3 +2956,78 @@ with tabs[12]:
         text = "\n".join(lines_txt) if lines_txt else "No plays match this filter."
         st.text_area("Copy slate", text, height=300)
         st.download_button("Download slate copy TXT", text, "wnba_slate_copy.txt", "text/plain")
+
+
+# ============================================================
+# Advanced Engine Tabs
+# ============================================================
+with tabs[13]:
+    st.subheader("ML Lab — XGBoost / Feature Importance")
+    st.caption("Trains real market models from imported player game logs. Falls back to sklearn gradient boosting if xgboost is not installed.")
+    logs = load_dataset("player_game_logs")
+    if logs.empty:
+        st.warning("Import player game logs first.")
+    else:
+        market_ml = st.selectbox("Market to train", MARKETS, key="ml_market_train")
+        sig = str(CACHE_FILES["player_game_logs"].stat().st_mtime) if CACHE_FILES["player_game_logs"].exists() else "none"
+        model, cols, imp, note = train_market_model_cached(market_ml, sig)
+        st.info(note)
+        st.write("Training features:", cols)
+        if imp is not None and not imp.empty:
+            st.dataframe(imp, use_container_width=True)
+            st.download_button("Download feature importance CSV", imp.to_csv(index=False), f"wnba_{market_ml}_feature_importance.csv", "text/csv")
+
+with tabs[14]:
+    st.subheader("Automated Backtest")
+    st.caption("Uses historical player logs to QA the projection logic. When sportsbook historical lines are unavailable, it uses synthetic rolling lines only for model diagnostics.")
+    if st.button("Run automated historical backtest"):
+        bt = auto_backtest_engine()
+        if bt.empty:
+            st.warning("No backtest rows built. Import player game logs first.")
+        else:
+            st.success(f"Backtest built: {len(bt)} rows")
+    bt = pd.read_csv(BACKTEST_FILE) if BACKTEST_FILE.exists() else pd.DataFrame()
+    if not bt.empty:
+        wins = (bt["Result"] == "WIN").sum(); total=len(bt)
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Backtest Rows", total)
+        c2.metric("Win Rate", f"{wins/total:.1%}" if total else "0%")
+        c3.metric("Markets", bt["Market"].nunique() if "Market" in bt.columns else 0)
+        st.dataframe(bt.tail(500), use_container_width=True)
+        st.download_button("Download backtest CSV", bt.to_csv(index=False), "wnba_backtest_results.csv", "text/csv")
+
+with tabs[15]:
+    st.subheader("EV / Kelly / CLV Tracker")
+    board = load_dataset("projection_board")
+    if board.empty:
+        st.warning("No projection board cached yet. Refresh a market board first.")
+    else:
+        cols = [c for c in ["Player","Market","Line","Projection","Edge","Lean","Over %","Under %","Break Even %","EV %","Kelly %","CLV","CLV Note","Sharp Money Note","Official Play Score","Tier"] if c in board.columns]
+        st.dataframe(board[cols].sort_values(["EV %","Official Play Score"], ascending=False) if "EV %" in board.columns else board[cols], use_container_width=True)
+        st.download_button("Download EV/CLV board", board.to_csv(index=False), "wnba_ev_clv_board.csv", "text/csv")
+
+with tabs[16]:
+    st.subheader("Injuries / Referees / Opponent Lineup Inputs")
+    st.markdown("### Injury status table")
+    status = pd.DataFrame(load_json(INJURY_STATUS_FILE, []))
+    if status.empty:
+        status = pd.DataFrame(columns=["Player", "Team", "Status", "Note"])
+    edited_status = st.data_editor(status, num_rows="dynamic", use_container_width=True, column_config={"Status": st.column_config.SelectboxColumn(options=["ACTIVE","QUESTIONABLE","DOUBTFUL","OUT","INACTIVE"])} )
+    if st.button("Save injury status"):
+        save_json(INJURY_STATUS_FILE, edited_status.to_dict("records"))
+        st.success("Injury status saved.")
+    st.markdown("### Referee tendencies CSV")
+    st.caption("Optional columns: Referee, FTA_Index, Foul_Index, Pace_Index, Points_Index. 100 = neutral.")
+    ref_up = st.file_uploader("Upload referee tendency CSV", type=["csv"], key="ref_csv_upload")
+    if ref_up is not None:
+        try:
+            refs = pd.read_csv(ref_up)
+            refs.to_csv(REFEREE_FILE, index=False)
+            st.success(f"Referee file saved: {len(refs)} rows")
+        except Exception as e:
+            st.error(f"Could not read referee CSV: {e}")
+    if REFEREE_FILE.exists():
+        try:
+            st.dataframe(pd.read_csv(REFEREE_FILE), use_container_width=True)
+        except Exception:
+            st.warning("Referee file exists but could not be previewed.")
