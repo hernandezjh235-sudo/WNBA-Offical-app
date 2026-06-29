@@ -31,7 +31,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v1.9 — Underdog Mainline + Refresh Today Matchup Resolver"
+APP_VERSION = "WNBA v2.0 — Underdog Mainline + Full Game Context Engine"
 
 # ============================================================
 # Storage
@@ -2759,13 +2759,502 @@ def auto_backtest_engine(max_rows: int = 2500) -> pd.DataFrame:
     return bt
 
 
+
+
+# ============================================================
+# Full Game Context Engine v2.0
+# Adds matchup-aware team/offense/defense/pace/rest/home-away/rotation/injury context.
+# This layer does NOT touch the working Underdog parser; it enriches rows after lines match.
+# ============================================================
+OFFICIAL_WNBA_TEAM_CONTEXT_FILE = DATA_DIR / "wnba_official_team_context.csv"
+GAME_CONTEXT_FILE = DATA_DIR / "wnba_game_context_today.csv"
+
+
+def _wnba_stats_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.wnba.com",
+        "Referer": "https://www.wnba.com/stats/",
+        "x-nba-stats-origin": "stats",
+        "x-nba-stats-token": "true",
+    }
+
+
+def _wnba_stats_get(path: str, params: Dict[str, Any], timeout: int = 12) -> Tuple[pd.DataFrame, str]:
+    """Read official WNBA Stats JSON endpoints when Streamlit has network access.
+    Fails quietly and returns an empty frame so projections still run from cached SportsDataverse.
+    """
+    url = f"https://stats.wnba.com/stats/{path.lstrip('/')}"
+    try:
+        r = requests.get(url, params=params, headers=_wnba_stats_headers(), timeout=timeout)
+        if r.status_code != 200:
+            return pd.DataFrame(), f"WNBA stats {path} HTTP {r.status_code}"
+        js = r.json()
+        rs = None
+        if isinstance(js, dict):
+            sets = js.get("resultSets") or js.get("resultSet") or []
+            if isinstance(sets, list) and sets:
+                rs = sets[0]
+            elif isinstance(sets, dict):
+                rs = sets
+        if not rs:
+            return pd.DataFrame(), f"WNBA stats {path}: no resultSets"
+        headers = rs.get("headers") or rs.get("Headers") or []
+        rows = rs.get("rowSet") or rs.get("RowSet") or []
+        if not headers or not rows:
+            return pd.DataFrame(), f"WNBA stats {path}: empty rows"
+        return pd.DataFrame(rows, columns=headers), f"WNBA stats {path}: ok {len(rows)} rows"
+    except Exception as e:
+        return pd.DataFrame(), f"WNBA stats {path}: {str(e)[:120]}"
+
+
+def _official_team_stats_params(season: int, measure: str) -> Dict[str, Any]:
+    # These parameters mirror the official stats dashboard style used by wnba.com/stats.
+    return {
+        "Conference": "",
+        "DateFrom": "",
+        "DateTo": "",
+        "Division": "",
+        "GameScope": "",
+        "GameSegment": "",
+        "LastNGames": "0",
+        "LeagueID": "10",
+        "Location": "",
+        "MeasureType": measure,
+        "Month": "0",
+        "OpponentTeamID": "0",
+        "Outcome": "",
+        "PORound": "0",
+        "PaceAdjust": "N",
+        "PerMode": "PerGame",
+        "Period": "0",
+        "PlusMinus": "N",
+        "Rank": "N",
+        "Season": str(season),
+        "SeasonSegment": "",
+        "SeasonType": "Regular Season",
+        "ShotClockRange": "",
+        "StarterBench": "",
+        "TeamID": "0",
+        "TwoWay": "0",
+        "VsConference": "",
+        "VsDivision": "",
+    }
+
+
+def refresh_official_wnba_team_context(season: Optional[int] = None, force: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Pull official WNBA team base/advanced/four-factor context and cache it.
+    Used as a richer source for opponent defense, pace, rebounding, assists, and efficiency.
+    """
+    if season is None:
+        try:
+            season = int(datetime.utcnow().year)
+        except Exception:
+            season = 2026
+    if OFFICIAL_WNBA_TEAM_CONTEXT_FILE.exists() and not force:
+        try:
+            cached = pd.read_csv(OFFICIAL_WNBA_TEAM_CONTEXT_FILE)
+            if not cached.empty:
+                return cached, pd.DataFrame([{"Step":"official_wnba_team_context", "Status":"cached", "Rows":len(cached)}])
+        except Exception:
+            pass
+    dbg = []
+    base, msg = _wnba_stats_get("leaguedashteamstats", _official_team_stats_params(season, "Base")); dbg.append({"Step":"Base", "Status":msg, "Rows":len(base)})
+    adv, msg = _wnba_stats_get("leaguedashteamstats", _official_team_stats_params(season, "Advanced")); dbg.append({"Step":"Advanced", "Status":msg, "Rows":len(adv)})
+    four, msg = _wnba_stats_get("leaguedashteamstats", _official_team_stats_params(season, "Four Factors")); dbg.append({"Step":"Four Factors", "Status":msg, "Rows":len(four)})
+
+    frames = []
+    for df, tag in [(base, "Base"), (adv, "Adv"), (four, "Four")]:
+        if df is None or df.empty:
+            continue
+        d = df.copy()
+        team_col = find_col(d, ["TEAM_ABBREVIATION", "TEAM_NAME", "TEAM", "TEAM_CITY"])
+        if not team_col:
+            continue
+        d["Team"] = d[team_col].map(_team_key_for_matchup)
+        keep = ["Team"]
+        for c in d.columns:
+            cu = str(c).upper()
+            if cu in ["PACE", "OFF_RATING", "DEF_RATING", "NET_RATING", "AST_PCT", "OREB_PCT", "DREB_PCT", "REB_PCT", "EFG_PCT", "TS_PCT", "PTS", "REB", "OREB", "DREB", "AST", "TOV", "PLUS_MINUS", "FG_PCT", "FG3_PCT", "FTA_RATE", "TM_TOV_PCT"]:
+                keep.append(c)
+        d = d[[c for c in keep if c in d.columns]].drop_duplicates("Team")
+        d = d.rename(columns={c: f"{tag}_{c}" for c in d.columns if c != "Team"})
+        frames.append(d)
+    if not frames:
+        fallback = _build_team_context_from_cached_sources()
+        return fallback, pd.DataFrame(dbg + [{"Step":"fallback", "Status":"official pull empty; using cached sources", "Rows":len(fallback)}])
+    out = frames[0]
+    for d in frames[1:]:
+        out = out.merge(d, on="Team", how="outer")
+
+    # Canonical fields used by the projection layer.
+    def first_col(cols):
+        for c in cols:
+            if c in out.columns:
+                return pd.to_numeric(out[c], errors="coerce")
+        return pd.Series(np.nan, index=out.index)
+    out["Team_Pace_Official"] = first_col(["Adv_PACE", "Base_PACE", "Four_PACE"])
+    out["Team_ORtg_Official"] = first_col(["Adv_OFF_RATING"])
+    out["Team_DRtg_Official"] = first_col(["Adv_DEF_RATING"])
+    out["Team_NetRtg_Official"] = first_col(["Adv_NET_RATING"])
+    out["Team_PTS_Official"] = first_col(["Base_PTS"])
+    out["Team_REB_Official"] = first_col(["Base_REB"])
+    out["Team_AST_Official"] = first_col(["Base_AST"])
+    out["Team_OREB_Official"] = first_col(["Base_OREB"])
+    out["Team_DREB_Official"] = first_col(["Base_DREB"])
+    out["Team_eFG_Official"] = first_col(["Four_EFG_PCT", "Adv_EFG_PCT"])
+    out["Team_TS_Official"] = first_col(["Adv_TS_PCT"])
+    out["Team_OREB_PCT_Official"] = first_col(["Four_OREB_PCT", "Adv_OREB_PCT"])
+    out["Team_DREB_PCT_Official"] = first_col(["Four_DREB_PCT", "Adv_DREB_PCT"])
+    out["Season"] = season
+    try:
+        OFFICIAL_WNBA_TEAM_CONTEXT_FILE.parent.mkdir(exist_ok=True)
+        out.to_csv(OFFICIAL_WNBA_TEAM_CONTEXT_FILE, index=False)
+    except Exception:
+        pass
+    return out, pd.DataFrame(dbg + [{"Step":"official_wnba_team_context", "Status":"saved", "Rows":len(out)}])
+
+
+def _build_team_context_from_cached_sources() -> pd.DataFrame:
+    """Fallback/team context from SportsDataverse-built team_ranks/team season stats."""
+    tr = load_dataset("team_ranks")
+    ts = load_dataset("team_season_stats")
+    frames=[]
+    for df, tag in [(tr, "Rank"), (ts, "Season")]:
+        if df is None or df.empty:
+            continue
+        d=df.copy()
+        team_col = find_col(d, ["Team", "team", "TEAM", "team_abbreviation", "team_name", "TEAM_NAME"])
+        if not team_col:
+            continue
+        d["Team"] = d[team_col].map(_team_key_for_matchup)
+        keep=["Team"]
+        for c in d.columns:
+            cu=str(c).upper().replace(" ", "_")
+            if any(x in cu for x in ["PACE", "ORTG", "OFF_RATING", "DRTG", "DEF_RATING", "NET", "PTS", "POINTS", "REB", "OREB", "DREB", "AST", "TOV", "EFG", "TS", "RANK", "ALLOWED"]):
+                keep.append(c)
+        d=d[[c for c in keep if c in d.columns]].drop_duplicates("Team")
+        d=d.rename(columns={c:f"{tag}_{c}" for c in d.columns if c!="Team"})
+        frames.append(d)
+    if not frames:
+        return pd.DataFrame(columns=["Team"])
+    out=frames[0]
+    for d in frames[1:]:
+        out=out.merge(d,on="Team",how="outer")
+    # Canonical fallback fields.
+    def pick_contains(names):
+        for c in out.columns:
+            cu=str(c).upper().replace(" ", "_")
+            if any(n in cu for n in names):
+                return pd.to_numeric(out[c], errors="coerce")
+        return pd.Series(np.nan, index=out.index)
+    out["Team_Pace_Official"] = pick_contains(["TEAM_PACE", "PACE"])
+    out["Team_ORtg_Official"] = pick_contains(["TEAM_ORTG", "ORTG", "OFF_RATING"])
+    out["Team_DRtg_Official"] = pick_contains(["TEAM_DRTG", "DRTG", "DEF_RATING"])
+    out["Team_NetRtg_Official"] = pick_contains(["TEAM_NETRTG", "NET_RATING", "NETRTG"])
+    out["Team_PTS_Official"] = pick_contains(["PTS", "POINTS"])
+    out["Team_REB_Official"] = pick_contains(["REB"])
+    out["Team_AST_Official"] = pick_contains(["AST"])
+    out["Team_OREB_Official"] = pick_contains(["OREB"])
+    out["Team_DREB_Official"] = pick_contains(["DREB"])
+    out["Team_eFG_Official"] = pick_contains(["EFG"])
+    out["Team_TS_Official"] = pick_contains(["TS"])
+    return out
+
+
+def _team_context_table(force_official: bool = False) -> pd.DataFrame:
+    season = int(datetime.utcnow().year)
+    official, dbg = refresh_official_wnba_team_context(season, force=force_official)
+    st.session_state["wnba_official_team_context_debug"] = dbg
+    fallback = _build_team_context_from_cached_sources()
+    if official is None or official.empty:
+        return fallback
+    if fallback is not None and not fallback.empty:
+        # Fill any official blanks from fallback.
+        out = official.merge(fallback, on="Team", how="outer", suffixes=("", "_fb"))
+        for c in list(out.columns):
+            if c.endswith("_fb"):
+                base = c[:-3]
+                if base in out.columns:
+                    out[base] = out[base].combine_first(out[c])
+                else:
+                    out[base] = out[c]
+        out = out[[c for c in out.columns if not c.endswith("_fb")]]
+        return out
+    return official
+
+
+def _last_game_date_for_team(team: str, before_date: Optional[date]) -> Optional[date]:
+    sched = load_dataset("schedules")
+    if sched is None or sched.empty or before_date is None:
+        return None
+    s = standardize_schedules(sched)
+    if s.empty or "GameDate" not in s.columns:
+        return None
+    s["_date"] = pd.to_datetime(s["GameDate"], errors="coerce").dt.date
+    s["HomeKey"] = s.get("Home", "").map(_team_key_for_matchup)
+    s["AwayKey"] = s.get("Away", "").map(_team_key_for_matchup)
+    t = _team_key_for_matchup(team)
+    hit = s[((s["HomeKey"] == t) | (s["AwayKey"] == t)) & (s["_date"] < before_date)].dropna(subset=["_date"])
+    if hit.empty:
+        return None
+    return max(hit["_date"])
+
+
+def _rest_days_for_team(team: str, game_date: Optional[date]) -> Tuple[float, str]:
+    lg = _last_game_date_for_team(team, game_date)
+    if lg is None or game_date is None:
+        return np.nan, "Rest unavailable"
+    rest = max(0, (game_date - lg).days - 1)
+    note = "Back-to-back" if rest == 0 else f"{rest} rest day(s)"
+    return float(rest), note
+
+
+def _projected_rotation_for_team(team: str) -> Dict[str, Any]:
+    """Use lineups → game_rosters → master features as rotation proxy."""
+    t = _team_key_for_matchup(team)
+    out = {"Projected Starters": 0, "Rotation Players": 0, "Rotation Confidence": 50.0, "Projected Rotation Note": "Projected rotation from cached master only."}
+    candidates=[]
+    for key in ["lineups", "game_rosters", "master_features"]:
+        df=load_dataset(key)
+        if df is None or df.empty:
+            continue
+        d=df.copy()
+        if "Team" not in d.columns:
+            tc=find_col(d,["Team","team","TEAM","team_abbreviation"])
+            if tc: d["Team"]=d[tc]
+        if "Team" not in d.columns:
+            continue
+        d["_TeamKey"]=d["Team"].map(_team_key_for_matchup)
+        d=d[d["_TeamKey"]==t].copy()
+        if d.empty:
+            continue
+        if "StarterRate" in d.columns:
+            starters = int((pd.to_numeric(d["StarterRate"], errors="coerce").fillna(0) >= 0.55).sum())
+        elif "Starter" in d.columns:
+            starters = int(d["Starter"].astype(str).str.upper().isin(["1","Y","YES","TRUE","STARTER"]).sum())
+        else:
+            starters = min(5, len(d)) if key == "lineups" else 0
+        rot = int(len(d.drop_duplicates(subset=[c for c in ["Player", "NameKey"] if c in d.columns])) if any(c in d.columns for c in ["Player","NameKey"]) else len(d))
+        conf = 90 if key == "lineups" and starters >= 4 else 78 if key == "game_rosters" else 65
+        candidates.append({"Projected Starters": starters, "Rotation Players": rot, "Rotation Confidence": conf, "Projected Rotation Note": f"{key} loaded: {starters} starter proxy, {rot} rotation rows."})
+    if candidates:
+        return candidates[0]
+    return out
+
+
+def _team_injury_context(team: str) -> Dict[str, Any]:
+    t = _team_key_for_matchup(team)
+    status = load_json(INJURY_STATUS_FILE, [])
+    if not status:
+        return {"Out Players": 0, "Questionable Players": 0, "Injury Context Note": "No injury status table loaded; neutral."}
+    out_ct=q_ct=0; names=[]
+    for r in status:
+        rt = _team_key_for_matchup(r.get("Team"))
+        if rt and rt != t:
+            continue
+        stt = str(r.get("Status", "")).upper()
+        if stt in ["OUT", "DOUBTFUL", "INACTIVE"]:
+            out_ct += 1; names.append(str(r.get("Player", "")))
+        elif stt in ["QUESTIONABLE", "GTD", "GAME TIME DECISION"]:
+            q_ct += 1
+    note = f"{out_ct} out/doubtful, {q_ct} questionable" + (f": {', '.join([n for n in names if n][:3])}" if names else "")
+    return {"Out Players": out_ct, "Questionable Players": q_ct, "Injury Context Note": note}
+
+
+def build_game_context_cache(mode: str = "Today", force_official: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Build per-team, per-game context for the selected slate."""
+    target = slate_target_date(mode) or datetime.utcnow().date()
+    sched = schedule_for_slate(mode)
+    team_ctx = _team_context_table(force_official=force_official)
+    dbg=[]
+    rows=[]
+    if sched is None or sched.empty:
+        dbg.append({"Step":"schedule", "Status":"empty", "Rows":0})
+        # If no schedule, still build team-only context so active board fallback can enrich teams.
+        if team_ctx is not None and not team_ctx.empty:
+            for _, tc in team_ctx.iterrows():
+                rows.append({"Team": _team_key_for_matchup(tc.get("Team")), "Opponent":"", "Matchup":"", "HomeAway":"", "GameDate": str(target), **tc.to_dict()})
+    else:
+        s=standardize_schedules(sched)
+        dbg.append({"Step":"schedule", "Status":"loaded", "Rows":len(s)})
+        for _, g in s.iterrows():
+            home=_team_key_for_matchup(g.get("Home")); away=_team_key_for_matchup(g.get("Away"))
+            if not home or not away:
+                continue
+            gdate = pd.to_datetime(g.get("GameDate"), errors="coerce").date() if pd.notna(pd.to_datetime(g.get("GameDate"), errors="coerce")) else target
+            for team, opp, ha in [(away, home, "AWAY"), (home, away, "HOME")]:
+                base={"Team":team,"Opponent":opp,"Matchup":f"{away} @ {home}","HomeAway":ha,"GameDate":str(gdate)}
+                if team_ctx is not None and not team_ctx.empty and "Team" in team_ctx.columns:
+                    hit=team_ctx[team_ctx["Team"].map(_team_key_for_matchup)==team]
+                    if not hit.empty:
+                        base.update(hit.iloc[-1].to_dict())
+                opp_extra={}
+                if team_ctx is not None and not team_ctx.empty and "Team" in team_ctx.columns:
+                    ohit=team_ctx[team_ctx["Team"].map(_team_key_for_matchup)==opp]
+                    if not ohit.empty:
+                        for k,v in ohit.iloc[-1].to_dict().items():
+                            if k != "Team": opp_extra[f"Opp_{k}"]=v
+                base.update(opp_extra)
+                rest, rest_note=_rest_days_for_team(team,gdate); base["RestDays"]=rest; base["RestNote"]=rest_note; base["BackToBack"]=bool(pd.notna(rest) and rest==0)
+                base.update(_projected_rotation_for_team(team))
+                base.update(_team_injury_context(team))
+                rows.append(base)
+    out=pd.DataFrame(rows)
+    if not out.empty:
+        try:
+            out.to_csv(GAME_CONTEXT_FILE, index=False)
+        except Exception:
+            pass
+    st.session_state["wnba_game_context_cache"] = out
+    st.session_state["wnba_game_context_debug"] = pd.DataFrame(dbg)
+    return out, pd.DataFrame(dbg)
+
+
+def _get_game_context_for_row(row: Dict[str, Any], mode: str = "Today") -> Dict[str, Any]:
+    ctx = st.session_state.get("wnba_game_context_cache", pd.DataFrame())
+    if ctx is None or ctx.empty:
+        ctx, _ = build_game_context_cache(mode, force_official=False)
+    if ctx is None or ctx.empty:
+        return {}
+    team=_team_key_for_matchup(row.get("Team"))
+    opp=_team_key_for_matchup(row.get("Opponent"))
+    d=ctx.copy()
+    if "Team" not in d.columns:
+        return {}
+    d["_TeamKey"]=d["Team"].map(_team_key_for_matchup)
+    if opp and "Opponent" in d.columns:
+        d["_OppKey"]=d["Opponent"].map(_team_key_for_matchup)
+        hit=d[(d["_TeamKey"]==team)&(d["_OppKey"]==opp)]
+    else:
+        hit=d[d["_TeamKey"]==team]
+    if hit.empty:
+        return {}
+    return hit.iloc[-1].to_dict()
+
+
+def _ctx_num(ctx: Dict[str, Any], keys: List[str], default=np.nan):
+    for k in keys:
+        v = safe_float(ctx.get(k), np.nan)
+        if pd.notna(v):
+            return float(v)
+    return default
+
+
+def game_context_projection_engine(row: Dict[str, Any], base_row: pd.Series, logs: pd.DataFrame, mode: str = "Today") -> Dict[str, Any]:
+    """Conservative additive/multiplicative context layer for today's game."""
+    ctx = _get_game_context_for_row(row, mode)
+    if not ctx:
+        return {"Game Context Factor": 1.0, "Game Context Add": 0.0, "Game Context Score": 40, "Game Context Note": "Game context unavailable; player baseline only."}
+    market=str(row.get("Market","")).upper()
+    team=_team_key_for_matchup(row.get("Team")); opp=_team_key_for_matchup(row.get("Opponent"))
+    notes=[]; factors=[]; add=0.0; score=55
+    pace=_ctx_num(ctx,["Opp_Team_Pace_Official","Opp_Adv_PACE","Opp_Base_PACE","Team_Pace_Official","Team_Pace","Rank_Team_Pace"],np.nan)
+    if pd.notna(pace):
+        f=max(0.965,min(1.045,1+(pace-78.0)/620.0)); factors.append(f); notes.append(f"pace {pace:.1f} factor {f:.3f}"); score+=8
+    opp_drtg=_ctx_num(ctx,["Opp_Team_DRtg_Official","Opp_Adv_DEF_RATING","Opp_Team_DRtg","Opp_Rank_Team_DRtg"],np.nan)
+    if pd.notna(opp_drtg):
+        f=max(0.955,min(1.055,1+(opp_drtg-100.0)/820.0)); factors.append(f); notes.append(f"opp DRtg {opp_drtg:.1f} factor {f:.3f}"); score+=12
+    homeaway=str(ctx.get("HomeAway") or row.get("HomeAway") or "").upper()
+    if homeaway == "HOME":
+        add += 0.12 if market in ["PTS","PRA"] else 0.05
+        notes.append("home +0.12/+0.05")
+        score+=5
+    elif homeaway == "AWAY":
+        add -= 0.05 if market in ["PTS","PRA"] else 0.02
+        notes.append("away small tax")
+        score+=5
+    rest=safe_float(ctx.get("RestDays"), np.nan)
+    if pd.notna(rest):
+        if rest == 0:
+            add -= 0.22 if market in ["PTS","PRA"] else 0.08
+            notes.append("B2B fatigue tax")
+        elif rest >= 2:
+            add += 0.08
+            notes.append(f"rested {int(rest)}d")
+        score+=7
+    rot_conf=safe_float(ctx.get("Rotation Confidence"), np.nan)
+    if pd.notna(rot_conf):
+        add += max(-0.18,min(0.18,(rot_conf-65)/240.0))
+        notes.append(f"rotation conf {rot_conf:.0f}")
+        score+=7
+    out_players=safe_float(ctx.get("Out Players"), 0)
+    if out_players:
+        # If own team has outs, small usage volatility/ripple; manual injury table remains stronger if provided.
+        add += min(0.35, 0.08*out_players) if market in ["PTS","PRA","AST"] else min(0.18, 0.04*out_players)
+        notes.append(f"injury ripple proxy {int(out_players)} out")
+        score+=5
+    if market == "REB":
+        opp_reb=_ctx_num(ctx,["Opp_Team_REB_Official","Opp_Base_REB","Opp_Season_REB"],np.nan)
+        opp_dreb_pct=_ctx_num(ctx,["Opp_Team_DREB_PCT_Official","Opp_Four_DREB_PCT","Opp_Adv_DREB_PCT"],np.nan)
+        if pd.notna(opp_reb):
+            add += max(-0.18,min(0.18,(82-opp_reb)/90.0)); notes.append("rebound environment")
+        if pd.notna(opp_dreb_pct):
+            add += max(-0.16,min(0.16,(0.72-opp_dreb_pct)/1.8)); notes.append("opp DREB% context")
+    if market == "AST":
+        opp_ast=_ctx_num(ctx,["Opp_Team_AST_Official","Opp_Base_AST","Opp_Season_AST"],np.nan)
+        if pd.notna(opp_ast):
+            add += max(-0.14,min(0.14,(opp_ast-19)/70.0)); notes.append("assist environment")
+    if market in ["PTS","PRA"]:
+        opp_efg=_ctx_num(ctx,["Opp_Team_eFG_Official","Opp_Four_EFG_PCT","Opp_Adv_EFG_PCT"],np.nan)
+        if pd.notna(opp_efg):
+            add += max(-0.16,min(0.16,(opp_efg-0.50)*1.5)); notes.append("efficiency environment")
+    factor=float(np.prod(factors)) if factors else 1.0
+    factor=max(0.92,min(1.09,factor))
+    score=max(0,min(100,score))
+    return {
+        "Game Context Factor": round(factor,4),
+        "Game Context Add": round(float(add),3),
+        "Game Context Score": round(score,1),
+        "Game Context Team": team,
+        "Game Context Opponent": opp,
+        "Game Context Matchup": str(ctx.get("Matchup") or row.get("Matchup") or ""),
+        "Game Context HomeAway": homeaway,
+        "Game Context Pace": pace if pd.notna(pace) else np.nan,
+        "Opponent DRtg Used": opp_drtg if pd.notna(opp_drtg) else np.nan,
+        "Rest Days Used": rest if pd.notna(rest) else np.nan,
+        "Projected Rotation Note": ctx.get("Projected Rotation Note", "Rotation unavailable"),
+        "Injury Context Note": ctx.get("Injury Context Note", "No injury table loaded; neutral."),
+        "Game Context Note": "; ".join(notes) if notes else "Opponent matched; neutral context factors.",
+    }
+
+
+def attach_game_context_columns(lines_df: pd.DataFrame, mode: str = "Today") -> pd.DataFrame:
+    if lines_df is None or lines_df.empty:
+        return lines_df
+    out=lines_df.copy()
+    build_game_context_cache(mode, force_official=False)
+    for idx,row in out.iterrows():
+        ctx=_get_game_context_for_row(row.to_dict(), mode)
+        if not ctx:
+            continue
+        for c in ["Matchup","Opponent","HomeAway"]:
+            if c in ctx and (c not in out.columns or not str(out.at[idx,c] if c in out.columns else "").strip()):
+                out.at[idx,c]=ctx.get(c)
+    return out
+
+
 # Preserve prior projection builder and enhance it with full advanced engines.
 _make_projection_board_core = make_projection_board
 
-def make_projection_board(lines, logs, base):
+def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+    mode = mode or st.session_state.get("wnba_current_mode", "Today")
+    if lines is not None and not lines.empty:
+        try:
+            lines = enrich_board_with_matchups(lines, mode)
+            lines = attach_game_context_columns(lines, mode)
+        except Exception as _ctx_e:
+            st.session_state["wnba_game_context_last_error"] = str(_ctx_e)[:180]
     core = _make_projection_board_core(lines, logs, base)
     if core is None or core.empty:
         return core
+    try:
+        core = enrich_board_with_matchups(core, mode)
+        core = attach_game_context_columns(core, mode)
+    except Exception:
+        pass
     out=[]
     for _, r in core.iterrows():
         row=r.to_dict()
@@ -2784,10 +3273,14 @@ def make_projection_board(lines, logs, base):
         opp = opponent_lineup_adjustment(row, b); row.update(opp)
         ref = referee_tendency_engine(row); row.update(ref)
         trav = latest_travel_context(logs, normalize_name(row.get("Matched Player") or row.get("Player")), row.get("Team")); row.update(trav)
-        # Apply small final additive context to edge/projection.
-        context_add = safe_float(row.get("Injury Ripple Bump"),0) + safe_float(row.get("Opponent Lineup Adj"),0) + safe_float(row.get("Referee Factor"),0) + safe_float(row.get("Travel Tax"),0)
+        game_ctx = game_context_projection_engine(row, b, logs, mode); row.update(game_ctx)
+        # Apply final live context: injury ripple, opponent lineup, referee, travel, and game-context team/pace/defense/rest.
+        context_add = safe_float(row.get("Injury Ripple Bump"),0) + safe_float(row.get("Opponent Lineup Adj"),0) + safe_float(row.get("Referee Factor"),0) + safe_float(row.get("Travel Tax"),0) + safe_float(row.get("Game Context Add"),0)
+        context_factor = safe_float(row.get("Game Context Factor"), 1.0)
         if pd.notna(safe_float(row.get("Projection"), np.nan)):
-            row["Projection"] = round(safe_float(row.get("Projection")) + context_add, 2)
+            raw_context_projection = safe_float(row.get("Projection"))
+            row["Projection Before Game Context"] = round(raw_context_projection, 2)
+            row["Projection"] = round(raw_context_projection * context_factor + context_add, 2)
             row["Edge"] = round(row["Projection"] - safe_float(row.get("Line"), np.nan), 2)
         lean = "OVER" if safe_float(row.get("Edge"), 0) > 0 else "UNDER"
         row["Lean"] = lean
@@ -2805,8 +3298,8 @@ def make_projection_board(lines, logs, base):
         row["Official Play Score"] = round(max(0, min(100, official_score)), 1)
         sim_side = side_prob
         row["Tier"] = tier_grade(row["Official Play Score"], safe_float(row.get("Edge"),0), sim_side, safe_float(row.get("Data Score"),0))
-        row["Feature Importance"] = feature_importance_text(row) + " | XGB: " + str(row.get("XGBoost Feature Importance", ""))
-        row["Full Engine Note"] = "Similarity + trained ML + referee + travel + injury ripple + opponent lineup + CLV + EV/Kelly active."
+        row["Feature Importance"] = feature_importance_text(row) + " | Game Context: " + str(row.get("Game Context Note", "")) + " | XGB: " + str(row.get("XGBoost Feature Importance", ""))
+        row["Full Engine Note"] = "Similarity + trained ML + official/team context + opponent defense/pace + home-away/rest + projected rotations + referee + travel + injury ripple + opponent lineup + CLV + EV/Kelly active."
         out.append(row)
     df=pd.DataFrame(out)
     if not df.empty:
@@ -4032,6 +4525,13 @@ def refresh_today_pipeline(mode: str, use_ud_flag: bool = True) -> Dict[str, Any
     status["Games"] = 0 if sched is None or sched.empty else len(sched)
     status["Schedule Loaded"] = "YES" if status["Games"] else "NO/CACHED"
     st.session_state["wnba_schedule_debug"] = sched_dbg
+    try:
+        game_ctx, game_dbg = build_game_context_cache(mode, force_official=True)
+        status["Game Context Rows"] = 0 if game_ctx is None or game_ctx.empty else len(game_ctx)
+        st.session_state["wnba_game_context_debug"] = game_dbg
+    except Exception as _gce:
+        status["Game Context Rows"] = 0
+        st.session_state["wnba_game_context_last_error"] = str(_gce)[:180]
 
     clear_line_pull_caches()
     lines_all, ud_debug, manual_debug = pull_board_lines(use_ud_flag, False, False, "")
@@ -4047,7 +4547,7 @@ def refresh_today_pipeline(mode: str, use_ud_flag: bool = True) -> Dict[str, Any
             master = pd.DataFrame()
     if lines is not None and not lines.empty and not logs.empty and not master.empty:
         try:
-            board = make_projection_board(lines, logs, master)
+            board = make_projection_board(lines, logs, master, mode)
             board["Slate"] = mode
             board["SlateDate"] = str(slate_target_date(mode) or "ALL")
             board = enrich_board_with_matchups(board, mode)
@@ -4069,12 +4569,13 @@ def render_refresh_today_status():
     if not status:
         return
     st.markdown("### 🔄 Refresh Today Status")
-    c = st.columns(5)
+    c = st.columns(6)
     c[0].metric("Schedule", status.get("Schedule Loaded", "NO"))
     c[1].metric("Games", status.get("Games", 0))
-    c[2].metric("Underdog", status.get("Underdog Lines", 0))
-    c[3].metric("Cards", status.get("Cards", 0))
-    c[4].metric("Seconds", status.get("Seconds", "-"))
+    c[2].metric("Context", status.get("Game Context Rows", 0))
+    c[3].metric("Underdog", status.get("Underdog Lines", 0))
+    c[4].metric("Cards", status.get("Cards", 0))
+    c[5].metric("Seconds", status.get("Seconds", "-"))
     st.caption(f"Status: {status.get('Status')}")
 
 
@@ -4442,6 +4943,9 @@ def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
             continue
         opp_ctx = _latest_team_context(opp, None)
         factor, note = _market_matchup_adjustment(r, opp_ctx)
+        if pd.notna(safe_float(r.get("Game Context Factor"), np.nan)) and str(r.get("Game Context Note", "")).strip():
+            factor = 1.0
+            note = str(r.get("Game Context Note"))
         old_proj = safe_float(r.get("Projection"), np.nan)
         line = safe_float(r.get("Line"), np.nan)
         # Apply once only; if already marked, don't double-adjust.
@@ -4720,6 +5224,9 @@ def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
             continue
         opp_ctx = _latest_team_context(opp, None)
         factor, note = _market_matchup_adjustment(r, opp_ctx)
+        if pd.notna(safe_float(r.get("Game Context Factor"), np.nan)) and str(r.get("Game Context Note", "")).strip():
+            factor = 1.0
+            note = str(r.get("Game Context Note"))
         old_proj = safe_float(r.get("Projection"), np.nan)
         line = safe_float(r.get("Line"), np.nan)
         already = str(r.get("Opponent Context Applied", "")).lower() == "yes"
@@ -4952,7 +5459,8 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     else:
         market_filter = st.multiselect("Market", MARKETS, default=MARKETS, key=f"market_{mode}_{market_key}")
     search = st.text_input("Search player", key=f"search_{mode}_{market_key}")
-    proj_df = make_projection_board(lines[lines["Market"].isin(market_filter)], logs_global, master_global)
+    st.session_state["wnba_current_mode"] = mode
+    proj_df = make_projection_board(lines[lines["Market"].isin(market_filter)], logs_global, master_global, mode)
     if search and not proj_df.empty:
         proj_df = proj_df[proj_df["Player"].str.contains(search, case=False, na=False)]
 
