@@ -31,7 +31,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v1.3 — SportsDataverse Import Wizard + PTS/REB/AST/PRA Engine"
+APP_VERSION = "WNBA v1.4 — SportsDataverse Import Engine v2 + Robust CSV/Parquet Mapping"
 
 # ============================================================
 # Storage
@@ -90,6 +90,19 @@ SPORTSDATAVERSE_INDEXES = {
     "game_rosters": f"{SPORTSDATAVERSE_BASE}/wnba_stats/wnba_stats_game_rosters_in_data_repo.csv",
     "lineups": f"{SPORTSDATAVERSE_BASE}/wnba_stats/wnba_stats_lineups_in_data_repo.csv",
     "shots": f"{SPORTSDATAVERSE_BASE}/wnba_stats/wnba_stats_shots_in_data_repo.csv",
+}
+
+# Direct parquet locations used by the SportsDataverse repo. The root index CSVs
+# are only manifests/metadata in many cases, so v2 tries these actual data files first.
+SPORTSDATAVERSE_DIRECT_PATTERNS = {
+    "player_game_logs": ["wnba_stats/player_game_logs/parquet/player_game_logs_{season}.parquet"],
+    "player_season_stats": ["wnba_stats/player_season_stats/parquet/player_season_stats_{season}.parquet"],
+    "team_season_stats": ["wnba_stats/team_season_stats/parquet/team_season_stats_{season}.parquet"],
+    "schedules": ["wnba_stats/schedules/parquet/wnba_stats_schedule_{season}.parquet", "wnba_stats/schedules/parquet/schedules_{season}.parquet"],
+    "rosters": ["wnba_stats/rosters/parquet/rosters_{season}.parquet"],
+    "game_rosters": ["wnba_stats/game_rosters/parquet/game_rosters_{season}.parquet"],
+    "lineups": ["wnba_stats/lineups/parquet/lineups_{season}.parquet"],
+    "shots": ["wnba_stats/shots/parquet/shots_{season}.parquet"],
 }
 
 UNDERDOG_URLS = [
@@ -286,8 +299,17 @@ def classify_filename(name: str) -> Optional[str]:
 
 
 def read_any_file(raw: bytes, name: str) -> pd.DataFrame:
-    lname = name.lower()
+    """Read uploaded CSV/XLSX/Parquet/JSON. RDS is intentionally skipped.
+
+    SportsDataverse publishes both .parquet and .rds. Python/Streamlit should use
+    parquet. Returning an empty frame for RDS prevents one unsupported file from
+    breaking the whole batch import.
+    """
+    lname = str(name or "").lower()
+    if lname.endswith(".rds"):
+        return pd.DataFrame()
     if lname.endswith(".csv"):
+        # SportsDataverse manifest CSVs sometimes have odd newlines; pandas still handles them.
         return pd.read_csv(io.BytesIO(raw), low_memory=False)
     if lname.endswith(".xlsx") or lname.endswith(".xls"):
         return pd.read_excel(io.BytesIO(raw))
@@ -295,10 +317,55 @@ def read_any_file(raw: bytes, name: str) -> pd.DataFrame:
         return pd.read_parquet(io.BytesIO(raw))
     if lname.endswith(".json"):
         return pd.read_json(io.BytesIO(raw))
-    if lname.endswith(".rds"):
-        raise ValueError("RDS files are R-only. Use the .parquet version for Streamlit/Python.")
     raise ValueError(f"Unsupported file type: {name}")
 
+
+def is_manifest_only(df: pd.DataFrame) -> bool:
+    """True for SportsDataverse index/manifest files that do not contain actual stats rows."""
+    if df is None or df.empty:
+        return False
+    cols = {col_norm(c) for c in df.columns}
+    stat_markers = {
+        "player_name", "athlete_display_name", "athlete_name", "team_abbreviation", "points", "pts",
+        "rebounds", "reb", "assists", "ast", "minutes", "min", "game_date", "game_id"
+    }
+    if cols.intersection(stat_markers):
+        return False
+    manifest_markers = {"season", "row_count", "generated_at_utc", "source_endpoint"}
+    return len(cols.intersection(manifest_markers)) >= 2
+
+
+def direct_sportsdataverse_urls(dataset_key: str, seasons: List[int]) -> List[str]:
+    urls = []
+    patterns = SPORTSDATAVERSE_DIRECT_PATTERNS.get(dataset_key, [])
+    for season in seasons or []:
+        for pat in patterns:
+            urls.append(f"{SPORTSDATAVERSE_BASE}/{pat.format(season=int(season))}")
+    return list(dict.fromkeys(urls))
+
+
+def fetch_direct_sportsdataverse(dataset_key: str, seasons: List[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Download actual parquet files directly from SportsDataverse repo paths."""
+    frames, debug = [], []
+    for u in direct_sportsdataverse_urls(dataset_key, seasons):
+        try:
+            b = request_bytes(u, timeout=90)
+            if not b:
+                debug.append({"dataset": dataset_key, "url": u, "status": "direct file not found/blocked", "rows": 0})
+                continue
+            name = u.split("/")[-1]
+            part = read_any_file(b, name)
+            if part is None or part.empty:
+                debug.append({"dataset": dataset_key, "url": u, "status": "direct downloaded but empty", "rows": 0})
+                continue
+            part["_source_file"] = name
+            frames.append(part)
+            debug.append({"dataset": dataset_key, "url": u, "status": "direct ok", "rows": len(part)})
+        except Exception as e:
+            debug.append({"dataset": dataset_key, "url": u, "status": f"direct error: {str(e)[:160]}", "rows": 0})
+    if frames:
+        return pd.concat(frames, ignore_index=True, sort=False), pd.DataFrame(debug)
+    return pd.DataFrame(), pd.DataFrame(debug)
 
 def get_url_columns(df: pd.DataFrame) -> List[str]:
     cols = []
@@ -337,13 +404,25 @@ def filter_index_by_season(df: pd.DataFrame, seasons: List[int]) -> pd.DataFrame
 
 
 def expand_sportsdataverse_index(df: pd.DataFrame, dataset_key: str, seasons: List[int], max_files: int = 250) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """If an uploaded file is an index CSV, download the referenced files and combine them."""
+    """Expand a SportsDataverse manifest into real rows.
+
+    v1 assumed the manifest contained URLs. Some wehoop manifests only contain
+    season/row counts, so v2 first tries direct parquet paths and only then
+    falls back to URL columns inside the manifest.
+    """
     debug_rows = []
-    if df.empty:
-        return df, pd.DataFrame(debug_rows)
+    direct, direct_dbg = fetch_direct_sportsdataverse(dataset_key, seasons)
+    if not direct_dbg.empty:
+        debug_rows.extend(direct_dbg.to_dict("records"))
+    if not direct.empty:
+        return direct, pd.DataFrame(debug_rows)
+
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame(debug_rows + [{"dataset": dataset_key, "status": "empty manifest/upload", "rows": 0}])
     url_cols = get_url_columns(df)
     if not url_cols:
-        return df, pd.DataFrame(debug_rows)
+        status = "manifest only; no URL columns and direct files failed" if is_manifest_only(df) else "no URL columns; using uploaded file as raw data"
+        return (pd.DataFrame() if is_manifest_only(df) else df), pd.DataFrame(debug_rows + [{"dataset": dataset_key, "status": status, "rows": 0 if is_manifest_only(df) else len(df)}])
 
     index = filter_index_by_season(df, seasons)
     url_candidates = []
@@ -355,7 +434,7 @@ def expand_sportsdataverse_index(df: pd.DataFrame, dataset_key: str, seasons: Li
                 break
     url_candidates = list(dict.fromkeys(url_candidates))[:max_files]
     if not url_candidates:
-        return df, pd.DataFrame([{"dataset": dataset_key, "status": "index detected but no usable CSV/parquet URLs", "rows": 0}])
+        return pd.DataFrame(), pd.DataFrame(debug_rows + [{"dataset": dataset_key, "status": "index detected but no usable CSV/parquet URLs", "rows": 0}])
 
     frames = []
     for u in url_candidates:
@@ -373,23 +452,27 @@ def expand_sportsdataverse_index(df: pd.DataFrame, dataset_key: str, seasons: Li
         except Exception as e:
             debug_rows.append({"dataset": dataset_key, "url": u, "status": f"error: {str(e)[:120]}", "rows": 0})
     if frames:
-        return pd.concat(frames, ignore_index=True), pd.DataFrame(debug_rows)
+        return pd.concat(frames, ignore_index=True, sort=False), pd.DataFrame(debug_rows)
     return pd.DataFrame(), pd.DataFrame(debug_rows)
 
-
 def download_sportsdataverse_dataset(dataset_key: str, seasons: List[int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Remote pull: actual parquet first, manifest/index fallback second."""
+    direct, direct_dbg = fetch_direct_sportsdataverse(dataset_key, seasons)
+    if not direct.empty:
+        return direct, direct_dbg
+
     index_url = SPORTSDATAVERSE_INDEXES.get(dataset_key)
     if not index_url:
         return pd.DataFrame(), pd.DataFrame([{"dataset": dataset_key, "status": "no index url"}])
     b = request_bytes(index_url, timeout=30)
     if not b:
-        return pd.DataFrame(), pd.DataFrame([{"dataset": dataset_key, "status": "index download failed", "url": index_url}])
-    idx = pd.read_csv(io.BytesIO(b))
+        return pd.DataFrame(), pd.concat([direct_dbg, pd.DataFrame([{"dataset": dataset_key, "status": "index download failed", "url": index_url}])], ignore_index=True)
+    idx = pd.read_csv(io.BytesIO(b), low_memory=False)
     expanded, dbg = expand_sportsdataverse_index(idx, dataset_key, seasons=seasons)
+    full_dbg = pd.concat([direct_dbg, dbg], ignore_index=True) if not direct_dbg.empty or not dbg.empty else pd.DataFrame()
     if expanded.empty and not idx.empty:
-        # Some index files are already metadata only; keep metadata as debug but do not mark as model-ready.
-        return pd.DataFrame(), pd.concat([pd.DataFrame([{"dataset": dataset_key, "status": "index read but no data files expanded", "rows": len(idx)}]), dbg], ignore_index=True)
-    return expanded, dbg
+        return pd.DataFrame(), pd.concat([full_dbg, pd.DataFrame([{"dataset": dataset_key, "status": "index read but no usable stat rows expanded", "rows": len(idx)}])], ignore_index=True)
+    return expanded, full_dbg
 
 # ============================================================
 # Standardizers
@@ -590,18 +673,24 @@ def standardize_lineups(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     d = df.copy()
-    date_col = find_col(d, ["game_date", "date", "start_date"])
-    game_id_col = find_col(d, ["game_id", "event_id", "competition_id"])
-    team_col = find_col(d, ["team", "team_abbreviation", "team_name"])
+    date_col = find_col(d, ["game_date", "date", "start_date", "GAME_DATE"])
+    game_id_col = find_col(d, ["game_id", "event_id", "competition_id", "GAME_ID"])
+    team_col = find_col(d, ["team", "team_abbreviation", "team_name", "TEAM_ABBREVIATION"])
+    season_col = find_col(d, ["season", "year", "SEASON"])
     player_cols = [c for c in d.columns if re.search(r"player|athlete", col_norm(c))]
     out = pd.DataFrame()
     out["GameDate"] = parse_date_series(d[date_col]) if date_col else pd.NaT
+    out["Season"] = d[season_col] if season_col else (out["GameDate"].dt.year if "GameDate" in out else np.nan)
     out["GameID"] = d[game_id_col] if game_id_col else ""
     out["Team"] = d[team_col] if team_col else ""
-    out["LineupText"] = d[player_cols].astype(str).agg(" | ".join, axis=1) if player_cols else d.astype(str).agg(" | ".join, axis=1)
+    use_cols = player_cols if player_cols else list(d.columns[:12])
+    if use_cols:
+        out["LineupText"] = d[use_cols].fillna("").astype(str).apply(lambda row: " | ".join([x for x in row.tolist() if x and x.lower() != "nan"]), axis=1)
+    else:
+        out["LineupText"] = ""
     out["PlayerCount"] = len(player_cols)
+    out = coerce_numeric(out, ["Season", "PlayerCount"])
     return out
-
 
 def standardize_shots(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -1472,19 +1561,28 @@ with tabs[2]:
                 all_debug.append({"file": f.name, "dataset": "unknown", "status": "skipped: could not classify by filename"})
                 continue
             try:
+                if f.name.lower().endswith(".rds"):
+                    all_debug.append({"file": f.name, "dataset": key, "status": "skipped: RDS unsupported; use parquet", "rows": 0})
+                    continue
                 raw = f.read()
                 df0 = read_any_file(raw, f.name)
                 expanded, dbg = expand_sportsdataverse_index(df0, key, [int(season_last), int(season_now)])
-                df_source = expanded if not expanded.empty else df0
-                std = standardize_dataset(key, df_source)
-                if std.empty:
-                    all_debug.append({"file": f.name, "dataset": key, "status": "standardized empty", "rows": 0})
-                else:
-                    grouped[key].append(std)
-                    all_debug.append({"file": f.name, "dataset": key, "status": "ok", "rows": len(std)})
                 if not dbg.empty:
                     for _, rr in dbg.iterrows():
                         row = rr.to_dict(); row["file"] = f.name; all_debug.append(row)
+                if not expanded.empty:
+                    df_source = expanded
+                elif is_manifest_only(df0):
+                    all_debug.append({"file": f.name, "dataset": key, "status": "manifest/index only; actual data not inside this CSV", "rows": 0})
+                    continue
+                else:
+                    df_source = df0
+                std = standardize_dataset(key, df_source)
+                if std.empty:
+                    all_debug.append({"file": f.name, "dataset": key, "status": "standardized empty: missing required player/team/stat columns", "rows": 0})
+                else:
+                    grouped[key].append(std)
+                    all_debug.append({"file": f.name, "dataset": key, "status": "ok", "rows": len(std)})
             except Exception as e:
                 all_debug.append({"file": f.name, "dataset": key or "unknown", "status": f"error: {str(e)[:180]}", "rows": 0})
 
@@ -1650,20 +1748,13 @@ with tabs[5]:
         st.dataframe(official, use_container_width=True)
         st.download_button("Download official log", official.to_csv(index=False), "wnba_official_log.csv", "text/csv")
     learning = pd.DataFrame(load_json(LEARNING_LOG, []))
-    if learning.empty:
-        st.info("No graded learning data yet.")
-    else:
-        if "Result" not in learning.columns:
-            learning["Result"] = "PENDING"
-        graded_learning = learning[learning["Result"].isin(["WIN", "LOSS"])].copy()
-        if graded_learning.empty:
-            st.info("No graded learning data yet. Saved picks will show here after grading.")
+    if not learning.empty:
+        if "Result" in learning.columns:
+            wins = (learning["Result"] == "WIN").sum(); total = len(learning)
+            st.metric("Learning win rate", f"{wins}/{total} ({wins/total:.1%})" if total else "0/0 (0.0%)")
         else:
-            wins = int((graded_learning["Result"] == "WIN").sum())
-            total = int(len(graded_learning))
-            st.metric("Learning win rate", f"{wins}/{total} ({wins/total:.1%})")
-        st.dataframe(learning, use_container_width=True)
-        st.download_button("Download learning log", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
+            st.info("Learning log exists, but no graded Result column yet.")
+        st.dataframe(learning.tail(200), use_container_width=True)
 
 with tabs[6]:
     st.subheader("Log tools + injury bump table")
