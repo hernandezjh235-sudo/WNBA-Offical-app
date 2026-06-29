@@ -2540,19 +2540,44 @@ def line_movement_report() -> pd.DataFrame:
 
 
 def calibration_report() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Safe model-calibration summary.
+
+    This function must never crash on a fresh Streamlit install or on older
+    learning logs. Older logs may not have Projection, Actual, Edge, CLV,
+    Lean, Source, or Tier yet, so we create safe placeholder columns before
+    grouping/aggregating.
+    """
     learn = pd.DataFrame(load_json(LEARNING_LOG, []))
     if learn.empty:
         return pd.DataFrame(), pd.DataFrame()
-    for c in ["Projection", "Actual", "Line", "Edge"]:
-        if c in learn.columns:
-            learn[c] = pd.to_numeric(learn[c], errors="coerce")
-    if "Result" not in learn.columns:
-        learn["Result"] = ""
-    learn["Abs Error"] = (learn.get("Projection") - learn.get("Actual")).abs() if {"Projection", "Actual"}.issubset(learn.columns) else np.nan
-    learn["Bias"] = learn.get("Projection") - learn.get("Actual") if {"Projection", "Actual"}.issubset(learn.columns) else np.nan
+
+    # Required text/group columns used by the dashboard.
+    for c, default in {
+        "Result": "",
+        "Market": "UNKNOWN",
+        "Lean": "UNKNOWN",
+        "Source": "UNKNOWN",
+        "Tier": "UNKNOWN",
+    }.items():
+        if c not in learn.columns:
+            learn[c] = default
+        learn[c] = learn[c].fillna(default).astype(str)
+
+    # Required numeric columns used by aggregation.
+    for c in ["Projection", "Actual", "Line", "Edge", "CLV"]:
+        if c not in learn.columns:
+            learn[c] = np.nan
+        learn[c] = pd.to_numeric(learn[c], errors="coerce")
+
+    learn["Abs Error"] = (learn["Projection"] - learn["Actual"]).abs()
+    learn["Bias"] = learn["Projection"] - learn["Actual"]
+
     group_cols = [c for c in ["Market", "Lean", "Source", "Tier"] if c in learn.columns]
     if not group_cols:
         group_cols = ["Result"]
+
+    # Use only columns we guarantee exist above. This prevents pandas KeyError
+    # when old/fresh logs are missing labels.
     summary = learn.groupby(group_cols, dropna=False).agg(
         Plays=("Result", "count"),
         Wins=("Result", lambda x: (x == "WIN").sum()),
@@ -2562,12 +2587,13 @@ def calibration_report() -> Tuple[pd.DataFrame, pd.DataFrame]:
         AvgActual=("Actual", "mean"),
         MAE=("Abs Error", "mean"),
         Bias=("Bias", "mean"),
-        AvgEdge=("Edge", "mean") if "Edge" in learn.columns else ("Result", "count"),
-        AvgCLV=("CLV", "mean") if "CLV" in learn.columns else ("Result", "count"),
+        AvgEdge=("Edge", "mean"),
+        AvgCLV=("CLV", "mean"),
     ).reset_index()
-    summary["Win Rate"] = np.where((summary["Wins"] + summary["Losses"]) > 0, summary["Wins"] / (summary["Wins"] + summary["Losses"]), np.nan)
-    return learn, summary
 
+    denom = summary["Wins"] + summary["Losses"]
+    summary["Win Rate"] = np.where(denom > 0, summary["Wins"] / denom, np.nan)
+    return learn, summary
 
 def build_historical_backtest(logs: pd.DataFrame, min_prior_games: int = 5) -> pd.DataFrame:
     """Backtest the projection formula using historical game logs.
