@@ -1889,6 +1889,8 @@ def project_row(row, base, logs):
         "Shot Make Rate": round(safe_float(b.get("ShotMakeRate"), np.nan), 3) if pd.notna(safe_float(b.get("ShotMakeRate"), np.nan)) else np.nan,
         "Shot Profile Boost": round(shot_boost, 3),
         "Shot Profile Note": shot_note,
+        "Team": row.get("Team") or b.get("Team", ""),
+        "Opponent": row.get("Opponent", ""),
         "Position": b.get("Position", ""), "PositionGroup": b.get("PositionGroup", "Unknown"),
         "Projection Note": f"{learn_note}; {ml_note}; advanced nudge {advanced_nudge:+.2f}",
         "Projection Explanation": explanation + f" | Advanced Context: {advanced_nudge:+.2f}",
@@ -2440,43 +2442,183 @@ def inject_css():
       .owp-kpi-value {font-size:2.2rem;}
       .block-container {padding-left:1rem; padding-right:1rem;}
     }
+
+    /* ===== Clean WNBA player cards inspired by the MLB card, purple theme ===== */
+    .owp-card-v2{background:linear-gradient(160deg,rgba(16,13,28,.98),rgba(8,8,14,.98));border:1px solid rgba(168,85,247,.55);border-left:4px solid #a855f7;border-radius:22px;padding:18px 18px 16px;margin:16px 0;box-shadow:0 0 24px rgba(168,85,247,.16);}
+    .owp-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:12px;}
+    .owp-player{font-size:1.35rem;font-weight:1000;color:#fff;line-height:1.1;}
+    .owp-match{color:#c7b7f5;font-weight:700;margin-top:5px;font-size:.95rem;}
+    .owp-pill{display:inline-block;padding:5px 11px;border-radius:999px;font-size:.75rem;font-weight:1000;letter-spacing:.06em;text-transform:uppercase;margin:3px 4px 3px 0;border:1px solid rgba(255,255,255,.16);}
+    .owp-pill-source{background:rgba(21,128,61,.18);border-color:#22c55e;color:#bbf7d0;}
+    .owp-pill-role{background:rgba(234,179,8,.14);border-color:#eab308;color:#fde68a;}
+    .owp-pill-score{background:rgba(168,85,247,.18);border-color:#a855f7;color:#f3e8ff;}
+    .owp-market-pill{color:#fb7185;border-color:#fb7185;background:rgba(244,63,94,.10);}
+    .owp-decision{font-size:1.35rem;font-weight:1000;text-align:right;line-height:1.1;}
+    .owp-decision.over{color:#4ade80}.owp-decision.under{color:#fb7185}.owp-decision.pass{color:#d8b4fe}
+    .owp-confidence{margin-top:6px;font-size:.78rem;color:#d8b4fe;font-weight:900;}
+    .owp-card-grid{display:grid;grid-template-columns:1.25fr 1fr 1fr;gap:12px;margin:14px 0;}
+    .owp-statbox{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);border-radius:15px;padding:12px;}
+    .owp-stat-label{font-size:.72rem;color:#b9a9e8;text-transform:uppercase;font-weight:1000;letter-spacing:.07em;}
+    .owp-stat-value{font-size:2rem;font-weight:1000;color:#fff;line-height:1.1;margin-top:6px;}
+    .owp-stat-sub{font-size:.82rem;color:#c4b5fd;margin-top:4px;}
+    .owp-edge-pos{color:#4ade80}.owp-edge-neg{color:#fb7185}.owp-edge-flat{color:#facc15}
+    .owp-prob-wrap{margin:12px 0 5px 0;}
+    .owp-prob-label{display:flex;justify-content:space-between;color:#a9a2c5;font-size:.78rem;text-transform:uppercase;font-weight:900;letter-spacing:.06em;margin-bottom:6px;}
+    .owp-prob-track{height:10px;border-radius:999px;background:rgba(255,255,255,.10);overflow:hidden;}
+    .owp-prob-fill{height:10px;border-radius:999px;background:linear-gradient(90deg,#fb7185,#a855f7,#22c55e);}
+    .owp-mini-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:10px 0 8px 0;}
+    .owp-mini{background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.18);border-radius:13px;padding:9px;color:#d8b4fe;}
+    .owp-mini b{display:block;color:#fff;font-size:1rem;margin-top:3px;}
+    .owp-why{background:rgba(88,28,135,.18);border:1px solid rgba(168,85,247,.24);border-radius:15px;padding:12px;color:#e9d5ff;font-size:.9rem;line-height:1.45;margin-top:10px;}
+    .owp-muted{color:#a9a2c5;font-size:.82rem;}
+    .owp-expander-note{font-size:.86rem;color:#c4b5fd;}
+    @media(max-width:760px){.owp-card-grid{grid-template-columns:1fr}.owp-mini-grid{grid-template-columns:1fr 1fr}.owp-card-top{display:block}.owp-decision{text-align:left;margin-top:10px}}
+
     </style>
     """, unsafe_allow_html=True)
 
 
 def render_card(r):
-    cls = "hot" if "OVER" in str(r.get("Official")) else "warn" if "UNDER" in str(r.get("Official")) else "pass"
-    line_val = r.get('Line', 'NO LINE')
-    source_val = r.get('Source', 'Baseline')
+    def _val(x, default="—"):
+        try:
+            if x is None:
+                return default
+            if isinstance(x, float) and np.isnan(x):
+                return default
+            s = str(x)
+            return default if s.lower() in ["nan", "none", ""] else s
+        except Exception:
+            return default
+    def _num(x, dec=1, default="—"):
+        try:
+            v = safe_float(x, np.nan)
+            if pd.isna(v):
+                return default
+            return f"{v:.{dec}f}"
+        except Exception:
+            return default
+    def _side_class(lean, official=""):
+        s = f"{lean} {official}".upper()
+        if "OVER" in s:
+            return "over", "🔥 OVER"
+        if "UNDER" in s:
+            return "under", "⚠️ UNDER"
+        return "pass", "TRACK"
+    def _matchup(r):
+        matchup = _val(r.get("Matchup"), "")
+        if matchup:
+            return matchup
+        team = _val(r.get("Team"), "")
+        opp = _val(r.get("Opponent"), "")
+        ha = _val(r.get("HomeAway"), "")
+        if team and opp:
+            if str(ha).upper().startswith("HOME"):
+                return f"{opp} @ {team}"
+            if str(ha).upper().startswith("AWAY"):
+                return f"{team} @ {opp}"
+            return f"{team} vs {opp}"
+        return team or "WNBA"
+
+    market = _val(r.get("Market"), "PROP")
+    line = _val(r.get("Line"), "NO LINE")
+    source = _val(r.get("Source"), "Line Source")
+    proj = _num(r.get("Projection"), 2)
+    edge_raw = safe_float(r.get("Edge"), np.nan)
+    edge = _num(edge_raw, 2)
+    edge_cls = "owp-edge-pos" if pd.notna(edge_raw) and edge_raw > 0 else "owp-edge-neg" if pd.notna(edge_raw) and edge_raw < 0 else "owp-edge-flat"
+    lean = _val(r.get("Lean"), "TRACK")
+    side_cls, side_label = _side_class(lean, r.get("Official"))
+    confidence = _num(r.get("Official Play Score"), 0)
+    overp = safe_float(r.get("Over %"), np.nan)
+    underp = safe_float(r.get("Under %"), np.nan)
+    fill = overp if pd.notna(overp) else (100-underp if pd.notna(underp) else 50)
+    fill = max(0, min(100, fill))
+    matchup = _matchup(r)
+    slate = _val(r.get("Slate"), "")
+    slate_date = _val(r.get("SlateDate"), "")
+    matched = _val(r.get("Matched Player"), r.get("Player"))
+    why = _val(r.get("Projection Explanation"), "Projection explanation unavailable.")
+    pos = _val(r.get("Biggest Positive"), "No major positive isolated.")
+    risk = _val(r.get("Biggest Risk"), "No major risk isolated.")
+    dist = f"{_num(r.get('Floor'),1)}–{_num(r.get('Ceiling'),1)}"
+    med = _num(r.get("Median"), 1)
+    vol = _val(r.get("Volatility"), "NA")
+    l10 = _num(r.get("L10 Hit%"), 0)
+    min_proj = _num(r.get("MIN Proj"), 1)
+    role = _num(r.get("Role Confidence"), 0)
+    data_score = _num(r.get("Data Score"), 0)
+    tier = _val(r.get("Tier"), "Tier —")
+    pass_reason = _val(r.get("PASS Reason"), "")
+
     st.markdown(f"""
-    <div class='card'>
-      <h3>{r.get('Player','')} <span class='badge'>{r.get('Market','')}</span> <span class='badge'>{r.get('PositionGroup','')}</span></h3>
-      <div class='{cls}'>{r.get('Official','PASS')} — {r.get('Lean','')} <span class='badge'>Official Score {r.get('Official Play Score','')}</span></div>
-      <p><b>Line:</b> {line_val} ({source_val}) &nbsp; | &nbsp; <b>Projection:</b> {r.get('Projection','')} &nbsp; | &nbsp; <b>Edge:</b> {r.get('Edge','')}</p>
-      <p><b>UD:</b> {r.get('Underdog Line','')} &nbsp; <b>Sleeper:</b> {r.get('Sleeper Line','')} &nbsp; <b>Best Over:</b> {r.get('Best Over Line','')} &nbsp; <b>Best Under:</b> {r.get('Best Under Line','')}</p>
-      <p><b>Distribution:</b> Floor {r.get('Floor','')} / Median {r.get('Median','')} / Ceiling {r.get('Ceiling','')} &nbsp; | &nbsp; <b>MC:</b> Over {r.get('Over %','')}% / Under {r.get('Under %','')}% &nbsp; | &nbsp; <b>Vol:</b> {r.get('Volatility','')}</p>
-      <p><b>L5/L10/L20 Hit:</b> {r.get('L5 Hit%','')}% / {r.get('L10 Hit%','')}% / {r.get('L20 Hit%','')}% &nbsp; | &nbsp; <b>MIN:</b> {r.get('MIN Proj','')} &nbsp; | &nbsp; <b>Role:</b> {r.get('Role Confidence','')}/100 &nbsp; | &nbsp; <b>Data:</b> {r.get('Data Score','')}/100</p>
-      <div class='explain-box'>
-        <b>Projection Explanation:</b> {r.get('Projection Explanation','')}<br/>
-        <b>Biggest Positive:</b> {r.get('Biggest Positive','')}<br/>
-        <b>Biggest Risk:</b> {r.get('Biggest Risk','')}<br/>
-        <b>Shot Profile:</b> {r.get('Shot Profile Note','')} | Boost {r.get('Shot Profile Boost','')}<br/>
-        <b>Confidence:</b> {r.get('Confidence Breakdown','')}<br/>
-        <b>Model Agreement:</b> {r.get('Model Agreement','')}<br/>
-        <b>Defense/Position:</b> {r.get('Defense vs Position','')}<br/>
-        <b>Similarity:</b> {r.get('Player Similarity Engine','')} | Sim projection {r.get('Similarity Projection','NA')}<br/>
-        <b>Rest/Travel/Blowout:</b> {r.get('Rest Travel Blowout','')}<br/>
-        <b>Bench Rotation:</b> {r.get('Bench Rotation Note','')}<br/>
-        <b>Pace:</b> {r.get('Pace Projection Note','')}<br/>
-        <b>Line Movement:</b> {r.get('Line Movement Note','')}<br/>
-        <b>Referee:</b> {r.get('Referee Note','')}<br/>
-        <b>Home/Away:</b> {r.get('HomeAway Note','')}<br/>
-        <b>Correlation:</b> {r.get('Correlation Note','')}
+    <div class='owp-card-v2'>
+      <div class='owp-card-top'>
+        <div>
+          <div class='owp-player'>{_val(r.get('Player'))}</div>
+          <div class='owp-match'>{matchup} <span class='owp-muted'>| {_val(r.get('PositionGroup'), 'Role')} | {slate} {slate_date}</span></div>
+          <span class='owp-pill owp-pill-source'>{source}</span>
+          <span class='owp-pill owp-pill-role'>Lineup/Role {_val(r.get('Minutes Safety'), 'NA')}</span>
+          <span class='owp-pill owp-pill-score'>Score {confidence}/100</span>
+        </div>
+        <div class='owp-decision {side_cls}'>{side_label}<div class='owp-confidence'>Confidence {confidence}%</div></div>
       </div>
-      <p><b>Tier:</b> {r.get('Tier','')} &nbsp; | &nbsp; <b>PASS:</b> {r.get('PASS Reason','')}</p>
-      <small>{r.get('Projection Note','')}</small>
+
+      <div class='owp-card-grid'>
+        <div class='owp-statbox'>
+          <div class='owp-stat-label'>{market} Projection</div>
+          <div class='owp-stat-value'>{proj}</div>
+          <div class='owp-stat-sub'>Median {med} | Range {dist}</div>
+        </div>
+        <div class='owp-statbox'>
+          <div class='owp-stat-label'>Sportsbook Line</div>
+          <div class='owp-stat-value'>{line}</div>
+          <div class='owp-stat-sub'>{_val(r.get('Best Over Line'),'—')} best over | {_val(r.get('Best Under Line'),'—')} best under</div>
+        </div>
+        <div class='owp-statbox'>
+          <div class='owp-stat-label'>Edge</div>
+          <div class='owp-stat-value {edge_cls}'>{edge}</div>
+          <div class='owp-stat-sub'>{tier}</div>
+        </div>
+      </div>
+
+      <div class='owp-prob-wrap'>
+        <div class='owp-prob-label'><span>Over {_num(overp,0)}%</span><span>Under {_num(underp,0)}%</span></div>
+        <div class='owp-prob-track'><div class='owp-prob-fill' style='width:{fill:.0f}%'></div></div>
+      </div>
+
+      <div class='owp-mini-grid'>
+        <div class='owp-mini'>Minutes<b>{min_proj}</b></div>
+        <div class='owp-mini'>L10 Hit<b>{l10}%</b></div>
+        <div class='owp-mini'>Volatility<b>{vol}</b></div>
+        <div class='owp-mini'>Role<b>{role}/100</b></div>
+        <div class='owp-mini'>Data<b>{data_score}/100</b></div>
+        <div class='owp-mini'>Matched<b>{matched}</b></div>
+      </div>
+
+      <div class='owp-why'>
+        <b>Why:</b> {why}<br/>
+        <b>Positive:</b> {pos}<br/>
+        <b>Risk:</b> {risk}<br/>
+        <b>Matchup:</b> {_val(r.get('Defense vs Position'), 'Position/matchup context unavailable.')}<br/>
+        <b>Shot profile:</b> {_val(r.get('Shot Profile Note'), 'No shot profile note.')}<br/>
+        <span class='owp-expander-note'><b>Notes:</b> {pass_reason}</span>
+      </div>
     </div>
     """, unsafe_allow_html=True)
+
+    with st.expander(f"Advanced details — {_val(r.get('Player'))} {market}", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("XGBoost", _num(r.get("XGBoost Projection"), 2))
+        c2.metric("Similarity", _num(r.get("Similarity Projection"), 2))
+        c3.metric("Bayesian", _num(r.get("Bayesian Confidence"), 0) + "%")
+        detail_cols = [
+            "Projection Note", "Confidence Breakdown", "Model Agreement", "Player Similarity Engine", "Rest Travel Blowout",
+            "Bench Rotation Note", "Pace Projection Note", "Line Movement Note", "Referee Note", "HomeAway Note",
+            "Feature Importance", "Full Engine Note", "Opponent Lineup Note", "Injury Ripple Note", "CLV Note", "Sharp Money Note",
+        ]
+        for col in detail_cols:
+            if col in r and _val(r.get(col), ""):
+                st.markdown(f"**{col}:** {_val(r.get(col))}")
 
 def dataset_status_table():
     rows = []
@@ -2605,15 +2747,15 @@ def clear_line_pull_caches():
 
 
 def pull_board_lines(use_ud_flag: bool, use_sleeper_flag: bool, use_odds_api_flag: bool = False, odds_api_key: str = "") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    manual_df = load_manual_lines()
-    upload_df = st.session_state.get("wnba_uploaded_lines_df", pd.DataFrame())
+    # Production mode: manual lines and CSV line fallbacks are intentionally disabled/hidden.
+    # Only real sources feed the board: Underdog, Sleeper, and optional Odds API.
     lines, ud_debug, sl_debug = aggregate_lines(
         use_ud=use_ud_flag,
         use_sleeper=use_sleeper_flag,
         use_odds_api=use_odds_api_flag,
         odds_api_key=odds_api_key,
-        manual_df=manual_df,
-        line_upload_df=upload_df,
+        manual_df=pd.DataFrame(),
+        line_upload_df=pd.DataFrame(),
     )
     st.session_state["wnba_lines_all"] = lines
     st.session_state["wnba_ud_debug"] = ud_debug
@@ -2655,7 +2797,7 @@ def make_baseline_player_cards(master_global: pd.DataFrame, market: str, limit: 
             "PositionGroup": b.get("PositionGroup", "Unknown"), "MIN Proj": round(safe_float(b.get("MIN_l10"), safe_float(b.get("MIN_avg"), np.nan)), 2),
             "Role Confidence": round(safe_float(b.get("RoleConfidence"), 50), 1), "Data Score": round(safe_float(b.get("DataScore"), 50), 1),
             "L5 Hit%": np.nan, "L10 Hit%": np.nan, "L20 Hit%": np.nan,
-            "Projection Explanation": f"Baseline {m} projection from {proj_col}. Add Underdog/Sleeper/manual line to turn this into an official play.",
+            "Projection Explanation": f"Baseline {m} projection from {proj_col}. Add Underdog/Sleeper/Odds API line to turn this into an official play.",
             "Biggest Positive": f"Strong baseline sample: data score {round(safe_float(b.get('DataScore'), 50),1)}.",
             "Biggest Risk": "No active sportsbook line yet, so edge/official decision is not calculated.",
             "Shot Profile Note": f"3PA rate {round(safe_float(b.get('ThreePARate'), np.nan),3) if pd.notna(safe_float(b.get('ThreePARate'), np.nan)) else 'NA'}; make rate {round(safe_float(b.get('ShotMakeRate'), np.nan),3) if pd.notna(safe_float(b.get('ShotMakeRate'), np.nan)) else 'NA'}",
@@ -2677,6 +2819,66 @@ def make_baseline_player_cards(master_global: pd.DataFrame, market: str, limit: 
         })
     return pd.DataFrame(rows)
 
+def _team_key_for_matchup(x: Any) -> str:
+    try:
+        return team_abbrev(x)
+    except Exception:
+        return str(x or "").strip().upper()[:3]
+
+
+def enrich_board_with_matchups(proj_df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """Attach Opponent/HomeAway/Matchup from cached schedules so every player card can show who they face."""
+    if proj_df is None or proj_df.empty:
+        return proj_df
+    out = proj_df.copy()
+    for c in ["Team", "Opponent", "HomeAway", "Matchup"]:
+        if c not in out.columns:
+            out[c] = ""
+    sched = schedule_for_slate(mode)
+    if sched is None or sched.empty:
+        # Fallback: preserve existing matchup if line source supplied one.
+        out["Matchup"] = out.apply(lambda r: r.get("Matchup") or (f"{r.get('Team','')} vs {r.get('Opponent','')}" if r.get('Team') and r.get('Opponent') else r.get('Team','')), axis=1)
+        return out
+    sched = sched.copy()
+    sched["HomeKey"] = sched.get("Home", "").map(_team_key_for_matchup)
+    sched["AwayKey"] = sched.get("Away", "").map(_team_key_for_matchup)
+    for i, r in out.iterrows():
+        team = _team_key_for_matchup(r.get("Team"))
+        if not team:
+            continue
+        hit = sched[(sched["HomeKey"] == team) | (sched["AwayKey"] == team)]
+        if hit.empty:
+            continue
+        g = hit.iloc[0]
+        home = str(g.get("Home", "")); away = str(g.get("Away", ""))
+        home_key = _team_key_for_matchup(home); away_key = _team_key_for_matchup(away)
+        if team == home_key:
+            out.at[i, "Opponent"] = away_key or away
+            out.at[i, "HomeAway"] = "HOME"
+            out.at[i, "Matchup"] = f"{away_key or away} @ {team}"
+        elif team == away_key:
+            out.at[i, "Opponent"] = home_key or home
+            out.at[i, "HomeAway"] = "AWAY"
+            out.at[i, "Matchup"] = f"{team} @ {home_key or home}"
+    out["Matchup"] = out.apply(lambda r: r.get("Matchup") or (f"{r.get('Team','')} vs {r.get('Opponent','')}" if r.get('Team') and r.get('Opponent') else r.get('Team','')), axis=1)
+    return out
+
+
+def render_source_status_card(lines: pd.DataFrame, ud_debug: pd.DataFrame, sl_debug: pd.DataFrame, use_odds_api_flag: bool, odds_api_key: str):
+    def count_source(src):
+        try:
+            return int((lines.get("Source", pd.Series(dtype=str)).astype(str) == src).sum()) if lines is not None and not lines.empty else 0
+        except Exception:
+            return 0
+    odds_status = "✅ Connected" if use_odds_api_flag and odds_api_key else "⚪ Off / no key"
+    if use_odds_api_flag and not odds_api_key:
+        odds_status = "❌ Missing key"
+    st.markdown(f"""
+    <div class='owp-blue-note'>
+      <b>Source Status</b> — Underdog: {count_source('Underdog')} lines | Sleeper: {count_source('Sleeper')} lines | Odds API: {count_source('Odds API')} lines ({odds_status}) | CSV/Manual: disabled for clean production mode
+    </div>
+    """, unsafe_allow_html=True)
+
 def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame, force_market: Optional[str] = None):
     market_label = f" — {force_market}" if force_market else ""
     st.markdown(f"<div class='section-title'>{mode}{market_label} Board</div>", unsafe_allow_html=True)
@@ -2685,7 +2887,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     with top_cols[0]:
         if st.button(f"🔄 Refresh {mode} Lines", key=f"refresh_{mode}_{market_key}"):
             clear_line_pull_caches()
-            pull_board_lines(use_ud_flag, use_sleeper_flag)
+            pull_board_lines(use_ud_flag, use_sleeper_flag, use_odds_api, odds_api_key)
             st.rerun()
     with top_cols[1]:
         if st.button(f"🧱 Rebuild {mode} Board", key=f"rebuild_{mode}_{market_key}"):
@@ -2702,8 +2904,9 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     with top_cols[4]:
         st.caption("Workflow: Refresh board lines → inspect cards → Save official before games → Grade after results post.")
 
-    lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, use_sleeper_flag)
+    lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, use_sleeper_flag, use_odds_api, odds_api_key)
     lines, slate_note = filter_lines_for_slate(lines_all, mode)
+    render_source_status_card(lines_all, ud_debug, sl_debug, use_odds_api, odds_api_key)
     st.caption(slate_note)
 
     sched = schedule_for_slate(mode)
@@ -2720,10 +2923,10 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     c1.metric("Lines loaded", 0 if lines is None else len(lines))
     c2.metric("Underdog rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Underdog").sum()))
     c3.metric("Sleeper rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Sleeper").sum()))
-    c4.metric("Manual rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Manual").sum()))
+    c4.metric("Odds API rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Odds API").sum()))
 
     if lines is None or lines.empty:
-        st.error("No lines loaded for this slate. Add manual lines or check Debug. If there are no WNBA games, this is expected.")
+        st.error("No real sportsbook lines loaded for this slate. Check Debug/Status. If there are no WNBA games, this is expected.")
         if not master_global.empty:
             st.markdown("<div class='hidden-baseline-note'>Baseline table is hidden. Showing player cards only so you can still review projections while waiting for lines.</div>", unsafe_allow_html=True)
             baseline_cards = make_baseline_player_cards(master_global, force_market or "PRA", limit=30)
@@ -2747,6 +2950,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
 
     proj_df["Slate"] = mode
     proj_df["SlateDate"] = str(slate_target_date(mode) or "ALL")
+    proj_df = enrich_board_with_matchups(proj_df, mode)
     CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
     proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
 
@@ -2775,7 +2979,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
         for _, r in proj_df.head(100).iterrows():
             render_card(r)
     else:
-        show_cols = ["Player", "Market", "Line", "Source", "Projection", "Edge", "Lean", "Official", "Official Play Score", "PASS Reason", "Underdog Line", "Sleeper Line", "Best Over Line", "Best Under Line", "Over %", "Under %", "L5 Hit%", "L10 Hit%", "L20 Hit%", "MIN Proj", "Role Confidence", "Minutes Safety", "Data Score", "Bayesian Confidence", "Team Pace", "Team ORtg", "Team DRtg", "Team Net", "Team Matchup Strength", "Lineup Continuity", "Shot Profile", "Rim Rate", "3PA Rate", "Shot Make Rate", "Slate", "SlateDate"]
+        show_cols = ["Player", "Team", "Opponent", "Matchup", "HomeAway", "Market", "Line", "Source", "Projection", "Edge", "Lean", "Official", "Official Play Score", "PASS Reason", "Underdog Line", "Sleeper Line", "Best Over Line", "Best Under Line", "Over %", "Under %", "L5 Hit%", "L10 Hit%", "L20 Hit%", "MIN Proj", "Role Confidence", "Minutes Safety", "Data Score", "Bayesian Confidence", "Team Pace", "Team ORtg", "Team DRtg", "Team Net", "Team Matchup Strength", "Lineup Continuity", "Shot Profile", "Rim Rate", "3PA Rate", "Shot Make Rate", "Slate", "SlateDate"]
         st.dataframe(proj_df[[c for c in show_cols if c in proj_df.columns]], use_container_width=True)
     return proj_df
 
@@ -2824,7 +3028,7 @@ except Exception:
     hero_board_rows = hero_real_lines = hero_no_line = hero_strong = 0
 hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
 
-tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Manual Lines", "Data Manager", "Research Hub", "Team Ranks", "Official + Grade", "Log Tools", "Debug", "Best Bets", "Slate Copy", "ML Lab", "Backtest", "EV / CLV", "Injuries / Refs"])
+tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Data Manager", "Debug / Status"])
 
 MARKET_TAB_META = {
     "PTS": ("POINTS", "Points board: scoring projection, shot profile, pace, usage, matchup, line edge."),
@@ -2836,8 +3040,8 @@ MARKET_TAB_META = {
 for idx, market in enumerate(MARKETS):
     with tabs[idx]:
         title, caption = MARKET_TAB_META[market]
-        st.markdown(f"<div class='section-title'>{title} / Pure Edge Model</div>", unsafe_allow_html=True)
-        st.caption(caption + " Main flow: Refresh → inspect → save before games → grade after results.")
+        st.markdown(f"<div class='section-title'>{title} / Player Prop Model</div>", unsafe_allow_html=True)
+        st.caption(caption + " Main flow: Refresh → inspect cards → save before games → grade after results.")
         slate_tabs = st.tabs(["Today", "Tomorrow", "All Lines"])
         with slate_tabs[0]:
             render_mlb_style_board("Today", use_ud, use_sleeper, logs_global, master_global, force_market=market)
@@ -2846,10 +3050,79 @@ for idx, market in enumerate(MARKETS):
         with slate_tabs[2]:
             render_mlb_style_board("All Lines", use_ud, use_sleeper, logs_global, master_global, force_market=market)
 
+with tabs[4]:
+    st.subheader("Best Bets / Tier 1–8 Official Board")
+    st.caption("Clean official board using edge, Monte Carlo, Bayesian confidence, data score, role confidence, line source reliability, similarity, pace, rest/travel, blowout, bench rotation, line movement, EV/Kelly, and model disagreement.")
+    board_path = CACHE_FILES["projection_board"]
+    if board_path.exists():
+        try:
+            bb = pd.read_csv(board_path)
+        except Exception:
+            bb = pd.DataFrame()
+    else:
+        bb = pd.DataFrame()
+    if bb.empty:
+        st.warning("No projection board cached yet. Refresh a PTS/REB/AST/PRA board first.")
+    else:
+        tier_options = sorted(bb.get("Tier", pd.Series(dtype=str)).dropna().unique().tolist())
+        tier_filter = st.multiselect("Tier filter", tier_options, default=tier_options[:4] if tier_options else [])
+        show = bb.copy()
+        if tier_filter and "Tier" in show.columns:
+            show = show[show["Tier"].isin(tier_filter)]
+        sort_cols = [c for c in ["Official Play Score", "Edge"] if c in show.columns]
+        if sort_cols:
+            show = show.sort_values(sort_cols, ascending=False)
+        st.metric("Best Bet Rows", len(show))
+        card_view = st.toggle("Show player cards", value=True, key="best_bets_card_view")
+        if card_view:
+            for _, rr in show.head(40).iterrows():
+                render_card(rr)
+        display_cols = [c for c in ["Tier", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Projection", "Edge", "Lean", "Official", "Official Play Score", "Over %", "Under %", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+        st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
+        st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
+
 with tabs[5]:
-    st.subheader("SportsDataverse Import Wizard")
-    st.caption("Upload the SportsDataverse CSV index files and/or actual CSV/Parquet files. Parquet is preferred. RDS is not supported in Python.")
-    st.info("Saving flow: importing files saves the stat database automatically under wnba_engine/data. The 'Save official plays before games' button only saves your betting slate. The 'Grade pending' button later grades those saved plays and updates the learning log.")
+    st.subheader("Official + Grade")
+    st.caption("Save official plays before games. Grade after results are imported to update the learning log. Manual line tools are hidden; real sportsbook lines drive this board.")
+    board = load_dataset("projection_board")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("💾 Save official before games", use_container_width=True):
+            if board.empty:
+                st.warning("No projection board cached yet. Refresh a market board first.")
+            else:
+                n = save_officials(board)
+                st.success(f"Saved {n} official plays.")
+    with c2:
+        if st.button("📊 Grade pending after results", use_container_width=True):
+            n = grade_pending(logs_global)
+            st.success(f"Graded {n} pending plays.")
+    with c3:
+        if board.empty:
+            st.metric("Current board", 0)
+        else:
+            st.metric("Current board", len(board))
+    official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
+    learning = pd.DataFrame(load_json(LEARNING_LOG, []))
+    if not official.empty:
+        st.markdown("### Official snapshot log")
+        st.dataframe(official.tail(300), use_container_width=True)
+        st.download_button("Download official log CSV", official.to_csv(index=False), "wnba_official_pick_log.csv", "text/csv")
+    else:
+        st.info("No official plays saved yet.")
+    if not learning.empty:
+        st.markdown("### Learning log")
+        if "Result" in learning.columns:
+            total = len(learning)
+            wins = (learning["Result"] == "WIN").sum()
+            st.metric("Learning win rate", f"{wins}/{total} ({wins/total:.1%})" if total else "0/0")
+        st.dataframe(learning.tail(300), use_container_width=True)
+        st.download_button("Download learning log CSV", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
+
+with tabs[6]:
+    st.subheader("SportsDataverse Data Manager")
+    st.caption("Upload SportsDataverse CSV index files and/or actual CSV/Parquet files. Parquet is preferred. RDS is ignored. Team ranks, research, injury/referee, ML, and backtest tools are hidden from the main navigation but their backend logic remains available.")
+    st.info("Importing files saves the stat database automatically under wnba_engine/data. Save Before is only for your betting slate; Grade After updates learning.")
 
     cA, cB, cC = st.columns(3)
     with cA:
@@ -2860,7 +3133,7 @@ with tabs[5]:
         st.metric("Team ranks", "✅" if CACHE_FILES["team_ranks"].exists() else "Missing")
 
     uploaded_files = st.file_uploader(
-        "Upload WNBA files together",
+        "Upload WNBA data files together",
         type=["csv", "xlsx", "parquet", "json", "rds"],
         accept_multiple_files=True,
         help="Use player_game_logs, player_season_stats, team_season_stats, schedules, rosters, game_rosters, lineups, shots. Parquet/CSV only."
@@ -2868,9 +3141,7 @@ with tabs[5]:
 
     if uploaded_files:
         st.info(f"Ready to import {len(uploaded_files)} uploaded file(s). The app will auto-classify by filename.")
-        preview_rows = []
-        for f in uploaded_files:
-            preview_rows.append({"File": f.name, "Detected dataset": classify_filename(f.name) or "unknown/manual select"})
+        preview_rows = [{"File": f.name, "Detected dataset": classify_filename(f.name) or "unknown/manual select"} for f in uploaded_files]
         st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
 
     if st.button("Import uploaded files + build database", type="primary"):
@@ -2918,47 +3189,45 @@ with tabs[5]:
             st.error(f"Import saved files, but master build failed: {e}")
         st.dataframe(pd.DataFrame(all_debug), use_container_width=True)
 
-    st.divider()
-    st.subheader("One-click remote pull from SportsDataverse")
-    st.caption("Use this if Streamlit has internet access. It pulls only the needed index files and expands referenced CSV/Parquet data.")
-    dataset_choices = st.multiselect(
-        "Datasets to pull",
-        list(DATASET_LABELS.keys()),
-        default=["player_game_logs", "player_season_stats", "team_season_stats", "schedules", "rosters", "game_rosters"]
-    )
-    include_heavy = st.checkbox("Include heavier add-ons: lineups + shots", value=False)
-    if include_heavy:
-        for k in ["lineups", "shots"]:
-            if k not in dataset_choices:
-                dataset_choices.append(k)
-
-    if st.button("Refresh SportsDataverse Database"):
-        if not use_remote:
-            st.error("Turn on 'Allow SportsDataverse remote downloads' in the sidebar first.")
-        else:
-            debug = []
-            progress = st.progress(0)
-            for i, key in enumerate(dataset_choices):
-                with st.spinner(f"Pulling {key}..."):
-                    df, dbg = download_sportsdataverse_dataset(key, [int(season_last), int(season_now)])
-                    if not df.empty:
-                        std = standardize_dataset(key, df)
-                        if not std.empty:
-                            save_dataset(key, std)
-                            debug.append({"dataset": key, "status": "saved", "rows": len(std)})
+    with st.expander("Optional: one-click remote pull from SportsDataverse", expanded=False):
+        st.caption("Use only if Streamlit has internet access. This pulls needed index files and expands referenced CSV/Parquet data.")
+        dataset_choices = st.multiselect(
+            "Datasets to pull",
+            list(DATASET_LABELS.keys()),
+            default=["player_game_logs", "player_season_stats", "team_season_stats", "schedules", "rosters", "game_rosters"]
+        )
+        include_heavy = st.checkbox("Include heavier add-ons: lineups + shots", value=False)
+        if include_heavy:
+            for k in ["lineups", "shots"]:
+                if k not in dataset_choices:
+                    dataset_choices.append(k)
+        if st.button("Refresh SportsDataverse Database"):
+            if not use_remote:
+                st.error("Turn on 'Allow SportsDataverse remote downloads' in the sidebar first.")
+            else:
+                debug = []
+                progress = st.progress(0)
+                for i, key in enumerate(dataset_choices):
+                    with st.spinner(f"Pulling {key}..."):
+                        df, dbg = download_sportsdataverse_dataset(key, [int(season_last), int(season_now)])
+                        if not df.empty:
+                            std = standardize_dataset(key, df)
+                            if not std.empty:
+                                save_dataset(key, std)
+                                debug.append({"dataset": key, "status": "saved", "rows": len(std)})
+                            else:
+                                debug.append({"dataset": key, "status": "downloaded but standardized empty", "rows": 0})
                         else:
-                            debug.append({"dataset": key, "status": "downloaded but standardized empty", "rows": 0})
-                    else:
-                        debug.append({"dataset": key, "status": "empty/failed", "rows": 0})
-                    if not dbg.empty:
-                        debug.extend(dbg.to_dict("records"))
-                progress.progress((i+1)/max(1, len(dataset_choices)))
-            try:
-                master, team_ranks = build_master_features()
-                st.success(f"Remote refresh complete. Master rows: {len(master):,}. Team-rank rows: {len(team_ranks):,}.")
-            except Exception as e:
-                st.warning(f"Remote files pulled, but master build needs review: {e}")
-            st.dataframe(pd.DataFrame(debug), use_container_width=True)
+                            debug.append({"dataset": key, "status": "empty/failed", "rows": 0})
+                        if not dbg.empty:
+                            debug.extend(dbg.to_dict("records"))
+                    progress.progress((i+1)/max(1, len(dataset_choices)))
+                try:
+                    master, team_ranks = build_master_features()
+                    st.success(f"Remote refresh complete. Master rows: {len(master):,}. Team-rank rows: {len(team_ranks):,}.")
+                except Exception as e:
+                    st.warning(f"Remote files pulled, but master build needs review: {e}")
+                st.dataframe(pd.DataFrame(debug), use_container_width=True)
 
     st.divider()
     st.subheader("Data Status")
@@ -2966,128 +3235,16 @@ with tabs[5]:
     st.dataframe(status, use_container_width=True)
     for k, path in CACHE_FILES.items():
         if path.exists():
-            data = path.read_bytes()
-            st.download_button(f"Download {k}.csv", data, file_name=path.name, mime="text/csv")
-
-with tabs[4]:
-    st.subheader("Manual fallback lines")
-    st.caption("Use this when Underdog/Sleeper miss players. These lines are included with Source=Manual and route into the correct PTS/REB/AST/PRA tab.")
-    st.markdown("### CSV line upload fallback")
-    st.caption("Upload a CSV from any book/source with columns like Player, Market, Line, Team, Start, OverOdds, UnderOdds. It will route into PTS/REB/AST/PRA tabs.")
-    line_csv = st.file_uploader("Upload line CSV", type=["csv"], key="line_csv_upload")
-    if line_csv is not None:
-        try:
-            raw_lines = pd.read_csv(line_csv)
-            norm_lines = normalize_line_upload(raw_lines, source_name="CSV Upload")
-            if norm_lines.empty:
-                st.error("CSV loaded, but no usable Player/Market/Line rows were found.")
-            else:
-                st.session_state["wnba_uploaded_lines_df"] = norm_lines
-                st.success(f"Loaded {len(norm_lines)} uploaded line rows for this session. Refresh board lines to include them.")
-                st.dataframe(norm_lines.head(100), use_container_width=True)
-        except Exception as e:
-            st.error(f"Could not read line CSV: {e}")
-    existing = load_manual_lines()
-    edited = st.data_editor(existing, num_rows="dynamic", use_container_width=True, column_config={"Market": st.column_config.SelectboxColumn(options=MARKETS)})
-    if st.button("Save manual lines"):
-        save_manual_lines(edited)
-        if "wnba_lines_all" in st.session_state:
-            del st.session_state["wnba_lines_all"]
-        st.success("Manual lines saved. Refresh board lines to include them.")
-
-with tabs[6]:
-    st.subheader("Research Hub")
-    if master_global.empty:
-        st.warning("Build master features in Data Manager first.")
-    else:
-        player = st.selectbox("Player", sorted(master_global["Player"].dropna().unique().tolist()))
-        p = master_global[master_global["Player"] == player].tail(1)
-        if not p.empty:
-            p = p.iloc[0]
-            cols = st.columns(4)
-            cols[0].metric("MIN L10", round(safe_float(p.get("MIN_l10"), 0), 2))
-            cols[1].metric("PTS L10", round(safe_float(p.get("PTS_l10"), 0), 2))
-            cols[2].metric("REB L10", round(safe_float(p.get("REB_l10"), 0), 2))
-            cols[3].metric("AST L10", round(safe_float(p.get("AST_l10"), 0), 2))
-            cols2 = st.columns(4)
-            cols2[0].metric("Role Conf", round(safe_float(p.get("RoleConfidence"), 0), 1))
-            cols2[1].metric("Minutes Safety", str(p.get("MinutesSafetyGrade", "NA")))
-            cols2[2].metric("Usage", round(safe_float(p.get("UsageProxy"), 0), 2))
-            cols2[3].metric("Data Score", round(safe_float(p.get("DataScore"), 0), 1))
-            st.markdown("### Recent game log")
-            d = logs_global[logs_global["NameKey"] == normalize_name(player)].sort_values("GameDate", ascending=False).head(20)
-            st.dataframe(d[[c for c in ["GameDate", "Team", "Opponent", "MIN", "PTS", "REB", "AST", "PRA", "FGA", "FG3A", "FTA", "PLUS_MINUS"] if c in d.columns]], use_container_width=True)
-            st.markdown("### Feature row")
-            st.dataframe(pd.DataFrame([p.to_dict()]), use_container_width=True)
+            st.download_button(f"Download {k}.csv", path.read_bytes(), file_name=path.name, mime="text/csv")
 
 with tabs[7]:
-    st.subheader("Team Ranks")
-    team_ranks = load_dataset("team_ranks")
-    if team_ranks.empty:
-        st.warning("No team ranks yet. Build in Data Manager.")
-    else:
-        st.dataframe(team_ranks, use_container_width=True)
-        st.download_button("Download team ranks CSV", team_ranks.to_csv(index=False), "wnba_team_ranks.csv", "text/csv")
-
-with tabs[8]:
-    st.subheader("Official picks + grading")
-    board_path = CACHE_FILES["projection_board"]
-    if board_path.exists() and not logs_global.empty and not master_global.empty:
-        board_cache = pd.read_csv(board_path)
-        if "Projection" in board_cache.columns:
-            proj_df = board_cache
-        else:
-            proj_df = make_projection_board(board_cache, logs_global, master_global)
-        if st.button("Save official plays before games"):
-            n = save_officials(proj_df)
-            st.success(f"Saved {n} official plays.")
-    else:
-        st.warning("Need a board and stats loaded first.")
-    if st.button("Grade pending with latest stat log"):
-        n = grade_pending(logs_global)
-        st.success(f"Graded {n} pending plays.")
-    official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
-    if not official.empty:
-        st.dataframe(official, use_container_width=True)
-        st.download_button("Download official log", official.to_csv(index=False), "wnba_official_log.csv", "text/csv")
-    learning = pd.DataFrame(load_json(LEARNING_LOG, []))
-    if not learning.empty:
-        if "Result" in learning.columns:
-            wins = (learning["Result"] == "WIN").sum(); total = len(learning)
-            st.metric("Learning win rate", f"{wins}/{total} ({wins/total:.1%})" if total else "0/0 (0.0%)")
-        else:
-            st.info("Learning log exists, but no graded Result column yet.")
-        st.dataframe(learning.tail(200), use_container_width=True)
-
-with tabs[9]:
-    st.subheader("Log tools + injury bump table")
-    st.caption("Import prior learning logs, backup all CSVs/logs, or reset logs. Injury bumps are manual for now and do not change code.")
-    up = st.file_uploader("Import previous learning/offical log CSV", type=["csv"], key="learning_import")
-    if up is not None and st.button("Import learning CSV"):
-        df = pd.read_csv(up)
-        existing = load_json(LEARNING_LOG, [])
-        save_json(LEARNING_LOG, existing + df.to_dict("records"))
-        st.success(f"Imported {len(df)} learning rows.")
-    st.download_button("Backup all CSVs + logs now", make_backup_zip(), file_name=f"wnba_engine_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.zip", mime="application/zip")
-    if st.checkbox("I understand reset will clear official/learning/line-history logs"):
-        if st.button("Reset/backup logs button — clear logs"):
-            reset_logs()
-            st.success("Logs reset.")
-    st.markdown("### Injury usage bump table")
-    bumps = pd.DataFrame(load_json(INJURY_BUMPS_FILE, []))
-    if bumps.empty:
-        bumps = pd.DataFrame(columns=["Player", "Team", "Market", "Teammate Out", "Usage Bump %", "Minutes Bump", "Note"])
-    edited_bumps = st.data_editor(bumps, num_rows="dynamic", use_container_width=True, column_config={"Market": st.column_config.SelectboxColumn(options=["ALL"] + MARKETS)})
-    if st.button("Save injury bump table"):
-        save_json(INJURY_BUMPS_FILE, edited_bumps.to_dict("records"))
-        st.success("Injury bump table saved.")
-
-with tabs[10]:
-    st.subheader("Debug")
+    st.subheader("Debug / Status")
+    st.caption("Hidden tools are not removed from the backend. This page is only for diagnostics when a pull or projection looks wrong.")
     st.markdown("### Data status")
     st.dataframe(dataset_status_table(), use_container_width=True)
-    st.markdown("### Aggregated lines")
+    st.markdown("### Aggregated real lines")
     lines, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud, use_sleeper, use_odds_api, odds_api_key)
+    render_source_status_card(lines, ud_debug, sl_debug, use_odds_api, odds_api_key)
     st.dataframe(lines, use_container_width=True)
     st.markdown("### Underdog debug")
     st.dataframe(ud_debug, use_container_width=True)
@@ -3096,135 +3253,3 @@ with tabs[10]:
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
 
-
-# ============================================================
-# Best Bets + Slate Copy tabs (full advanced layers)
-# ============================================================
-with tabs[11]:
-    st.subheader("Best Bets / Tier 1–8 Official Board")
-    st.caption("Uses edge, Monte Carlo %, Bayesian confidence, data score, role confidence, line source reliability, similarity, pace, rest/travel, blowout, bench rotation, and line movement.")
-    board_path = CACHE_FILES["projection_board"]
-    if board_path.exists():
-        try:
-            bb = pd.read_csv(board_path)
-        except Exception:
-            bb = pd.DataFrame()
-    else:
-        bb = pd.DataFrame()
-    if bb.empty:
-        st.warning("No projection board cached yet. Refresh a PTS/REB/AST/PRA board first.")
-    else:
-        tier_filter = st.multiselect("Tier filter", sorted(bb.get("Tier", pd.Series(dtype=str)).dropna().unique().tolist()), default=sorted(bb.get("Tier", pd.Series(dtype=str)).dropna().unique().tolist())[:4])
-        show = bb.copy()
-        if tier_filter and "Tier" in show.columns:
-            show = show[show["Tier"].isin(tier_filter)]
-        sort_cols = [c for c in ["Official Play Score", "Edge"] if c in show.columns]
-        if sort_cols:
-            show = show.sort_values(sort_cols, ascending=False)
-        st.metric("Best Bet Rows", len(show))
-        display_cols = [c for c in ["Tier", "Player", "Team", "Market", "Line", "Projection", "Edge", "Lean", "Official", "Official Play Score", "Over %", "Under %", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
-        st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
-        st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
-        st.markdown("### Player Card View")
-        for _, rr in show.head(25).iterrows():
-            render_card(rr)
-
-with tabs[12]:
-    st.subheader("Slate Copy / Posting Format")
-    board_path = CACHE_FILES["projection_board"]
-    if board_path.exists():
-        try:
-            sc = pd.read_csv(board_path)
-        except Exception:
-            sc = pd.DataFrame()
-    else:
-        sc = pd.DataFrame()
-    if sc.empty:
-        st.warning("No projection board cached yet.")
-    else:
-        only_official = st.checkbox("Only official plays", value=True)
-        copy_df = sc.copy()
-        if only_official and "Official" in copy_df.columns:
-            copy_df = copy_df[copy_df["Official"].astype(str).str.contains("OVER|UNDER", na=False)]
-        lines_txt = []
-        for _, r in copy_df.sort_values([c for c in ["Market", "Official Play Score"] if c in copy_df.columns], ascending=[True, False] if "Official Play Score" in copy_df.columns else True).iterrows():
-            side = "O" if str(r.get("Lean")) == "OVER" else "U" if str(r.get("Lean")) == "UNDER" else "PASS"
-            lines_txt.append(f"• {r.get('Player','')} — {side} {r.get('Line','')} {r.get('Market','')} — {r.get('Projection','')} proj — Edge {r.get('Edge','')} — {r.get('Tier','')}")
-        text = "\n".join(lines_txt) if lines_txt else "No plays match this filter."
-        st.text_area("Copy slate", text, height=300)
-        st.download_button("Download slate copy TXT", text, "wnba_slate_copy.txt", "text/plain")
-
-
-# ============================================================
-# Advanced Engine Tabs
-# ============================================================
-with tabs[13]:
-    st.subheader("ML Lab — XGBoost / Feature Importance")
-    st.caption("Trains real market models from imported player game logs. Falls back to sklearn gradient boosting if xgboost is not installed.")
-    logs = load_dataset("player_game_logs")
-    if logs.empty:
-        st.warning("Import player game logs first.")
-    else:
-        market_ml = st.selectbox("Market to train", MARKETS, key="ml_market_train")
-        sig = str(CACHE_FILES["player_game_logs"].stat().st_mtime) if CACHE_FILES["player_game_logs"].exists() else "none"
-        model, cols, imp, note = train_market_model_cached(market_ml, sig)
-        st.info(note)
-        st.write("Training features:", cols)
-        if imp is not None and not imp.empty:
-            st.dataframe(imp, use_container_width=True)
-            st.download_button("Download feature importance CSV", imp.to_csv(index=False), f"wnba_{market_ml}_feature_importance.csv", "text/csv")
-
-with tabs[14]:
-    st.subheader("Automated Backtest")
-    st.caption("Uses historical player logs to QA the projection logic. When sportsbook historical lines are unavailable, it uses synthetic rolling lines only for model diagnostics.")
-    if st.button("Run automated historical backtest"):
-        bt = auto_backtest_engine()
-        if bt.empty:
-            st.warning("No backtest rows built. Import player game logs first.")
-        else:
-            st.success(f"Backtest built: {len(bt)} rows")
-    bt = pd.read_csv(BACKTEST_FILE) if BACKTEST_FILE.exists() else pd.DataFrame()
-    if not bt.empty:
-        wins = (bt["Result"] == "WIN").sum(); total=len(bt)
-        c1,c2,c3 = st.columns(3)
-        c1.metric("Backtest Rows", total)
-        c2.metric("Win Rate", f"{wins/total:.1%}" if total else "0%")
-        c3.metric("Markets", bt["Market"].nunique() if "Market" in bt.columns else 0)
-        st.dataframe(bt.tail(500), use_container_width=True)
-        st.download_button("Download backtest CSV", bt.to_csv(index=False), "wnba_backtest_results.csv", "text/csv")
-
-with tabs[15]:
-    st.subheader("EV / Kelly / CLV Tracker")
-    board = load_dataset("projection_board")
-    if board.empty:
-        st.warning("No projection board cached yet. Refresh a market board first.")
-    else:
-        cols = [c for c in ["Player","Market","Line","Projection","Edge","Lean","Over %","Under %","Break Even %","EV %","Kelly %","CLV","CLV Note","Sharp Money Note","Official Play Score","Tier"] if c in board.columns]
-        st.dataframe(board[cols].sort_values(["EV %","Official Play Score"], ascending=False) if "EV %" in board.columns else board[cols], use_container_width=True)
-        st.download_button("Download EV/CLV board", board.to_csv(index=False), "wnba_ev_clv_board.csv", "text/csv")
-
-with tabs[16]:
-    st.subheader("Injuries / Referees / Opponent Lineup Inputs")
-    st.markdown("### Injury status table")
-    status = pd.DataFrame(load_json(INJURY_STATUS_FILE, []))
-    if status.empty:
-        status = pd.DataFrame(columns=["Player", "Team", "Status", "Note"])
-    edited_status = st.data_editor(status, num_rows="dynamic", use_container_width=True, column_config={"Status": st.column_config.SelectboxColumn(options=["ACTIVE","QUESTIONABLE","DOUBTFUL","OUT","INACTIVE"])} )
-    if st.button("Save injury status"):
-        save_json(INJURY_STATUS_FILE, edited_status.to_dict("records"))
-        st.success("Injury status saved.")
-    st.markdown("### Referee tendencies CSV")
-    st.caption("Optional columns: Referee, FTA_Index, Foul_Index, Pace_Index, Points_Index. 100 = neutral.")
-    ref_up = st.file_uploader("Upload referee tendency CSV", type=["csv"], key="ref_csv_upload")
-    if ref_up is not None:
-        try:
-            refs = pd.read_csv(ref_up)
-            refs.to_csv(REFEREE_FILE, index=False)
-            st.success(f"Referee file saved: {len(refs)} rows")
-        except Exception as e:
-            st.error(f"Could not read referee CSV: {e}")
-    if REFEREE_FILE.exists():
-        try:
-            st.dataframe(pd.read_csv(REFEREE_FILE), use_container_width=True)
-        except Exception:
-            st.warning("Referee file exists but could not be previewed.")
