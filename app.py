@@ -42,8 +42,6 @@ DATA_DIR = LOCAL_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 BACKUP_DIR = LOCAL_DIR / "backups"
 BACKUP_DIR.mkdir(exist_ok=True)
-DATA_BACKUP_DIR = BACKUP_DIR / "data_cache"
-DATA_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 OFFICIAL_LOG = LOCAL_DIR / "wnba_official_pick_log.json"
 RESULT_LOG = LOCAL_DIR / "wnba_result_log.json"
@@ -889,75 +887,27 @@ def standardize_dataset(dataset_key: str, df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _backup_path_for_dataset(dataset_key: str) -> Path:
-    base = CACHE_FILES.get(dataset_key)
-    if base is None:
-        return DATA_BACKUP_DIR / f"{dataset_key}.csv"
-    return DATA_BACKUP_DIR / base.name
-
-
 def save_dataset(dataset_key: str, df: pd.DataFrame) -> None:
-    """Persist a dataset safely.
-
-    Important production guard:
-    - Never overwrite a good cached dataset with an empty frame.
-    - Save a backup copy every time a non-empty dataset is written.
-    This prevents the app from looking like all data disappeared after a rerun,
-    bad remote pull, search action, or Streamlit restart.
-    """
     if df is None:
         return
     path = CACHE_FILES[dataset_key]
     path.parent.mkdir(parents=True, exist_ok=True)
-    if getattr(df, "empty", True):
-        # Do not wipe a previously-good file with an empty result.
-        return
-    # Backup existing file before overwriting.
-    try:
-        if path.exists():
-            bp = _backup_path_for_dataset(dataset_key)
-            bp.parent.mkdir(parents=True, exist_ok=True)
-            bp.write_bytes(path.read_bytes())
-    except Exception:
-        pass
     df.to_csv(path, index=False)
-    # Also mirror the latest good copy into backups/data_cache.
-    try:
-        bp = _backup_path_for_dataset(dataset_key)
-        bp.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(bp, index=False)
-    except Exception:
-        pass
 
 
 def load_dataset(dataset_key: str) -> pd.DataFrame:
-    """Load cached dataset, with backup fallback if the primary cache vanished."""
     path = CACHE_FILES.get(dataset_key)
-    candidates = []
-    if path:
-        candidates.append(path)
-    candidates.append(_backup_path_for_dataset(dataset_key))
-    for candidate in candidates:
-        if not candidate or not candidate.exists():
-            continue
-        try:
-            df = pd.read_csv(candidate, low_memory=False)
-            if dataset_key in ["player_game_logs", "schedules", "game_rosters", "lineups", "shots", "master_features"]:
-                for c in ["GameDate"]:
-                    if c in df.columns:
-                        df[c] = pd.to_datetime(df[c], errors="coerce")
-            # If this was loaded from backup, restore the primary file.
-            if path and candidate != path and not df.empty:
-                try:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    df.to_csv(path, index=False)
-                except Exception:
-                    pass
-            return df
-        except Exception:
-            continue
-    return pd.DataFrame()
-
+    if not path or not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, low_memory=False)
+        if dataset_key in ["player_game_logs", "schedules", "game_rosters", "lineups", "shots", "master_features"]:
+            for c in ["GameDate"]:
+                if c in df.columns:
+                    df[c] = pd.to_datetime(df[c], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 # ============================================================
 # Feature builders
@@ -3392,25 +3342,15 @@ def render_card(r):
 def dataset_status_table():
     rows = []
     for k, path in CACHE_FILES.items():
-        bp = _backup_path_for_dataset(k)
-        source_path = path if path.exists() else bp if bp.exists() else None
-        if source_path is not None:
+        if path.exists():
             try:
-                df = pd.read_csv(source_path, nrows=5)
-                status = "✅ cached" if path.exists() else "✅ restored backup available"
-                # Restore missing primary from backup for future reads/download buttons.
-                if not path.exists() and bp.exists():
-                    try:
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_bytes(bp.read_bytes())
-                        status = "✅ restored from backup"
-                    except Exception:
-                        pass
-                rows.append({"Dataset": k, "Status": status, "File": str(path), "Backup": str(bp) if bp.exists() else "", "Columns": len(df.columns), "Updated": datetime.fromtimestamp(source_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")})
-            except Exception:
-                rows.append({"Dataset": k, "Status": "⚠️ read issue", "File": str(path), "Backup": str(bp) if bp.exists() else "", "Columns": 0, "Updated": ""})
+                df = pd.read_csv(path, nrows=5)
+                # count fast-ish
+                rows.append({"Dataset": k, "Status": "✅ cached", "File": str(path), "Columns": len(df.columns), "Updated": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")})
+            except Exception as e:
+                rows.append({"Dataset": k, "Status": f"⚠️ read issue", "File": str(path), "Columns": 0, "Updated": ""})
         else:
-            rows.append({"Dataset": k, "Status": "❌ missing", "File": str(path), "Backup": "", "Columns": 0, "Updated": ""})
+            rows.append({"Dataset": k, "Status": "❌ missing", "File": str(path), "Columns": 0, "Updated": ""})
     return pd.DataFrame(rows)
 
 
@@ -4213,37 +4153,26 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     else:
         market_filter = st.multiselect("Market", MARKETS, default=MARKETS, key=f"market_{mode}_{market_key}")
     search = st.text_input("Search player", key=f"search_{mode}_{market_key}")
-    full_proj_df = make_projection_board(lines[lines["Market"].isin(market_filter)], logs_global, master_global)
+    proj_df = make_projection_board(lines[lines["Market"].isin(market_filter)], logs_global, master_global)
+    if search and not proj_df.empty:
+        proj_df = proj_df[proj_df["Player"].str.contains(search, case=False, na=False)]
 
-    if full_proj_df.empty:
+    if proj_df.empty:
         st.warning("Lines loaded, but projection board could not be built. Check player-name matching and Data Manager.")
         return pd.DataFrame()
 
-    full_proj_df["Slate"] = mode
-    full_proj_df["SlateDate"] = str(slate_target_date(mode) or "ALL")
-    full_proj_df = enrich_board_with_matchups(full_proj_df, mode)
-    full_proj_df = apply_matchup_context_to_board(full_proj_df)
-
-    # Save the FULL board before any UI search/filter is applied. This prevents
-    # a search box from accidentally replacing projection_board.csv with a tiny
-    # filtered board or making it appear that cards/data disappeared.
-    save_dataset("projection_board", full_proj_df)
-
-    proj_df = full_proj_df.copy()
-    if search and not proj_df.empty:
-        player_series = proj_df["Player"].astype(str) if "Player" in proj_df.columns else pd.Series("", index=proj_df.index)
-        mask = player_series.str.contains(str(search), case=False, na=False, regex=False)
-        if mask.any():
-            proj_df = proj_df[mask].copy()
-        else:
-            st.warning(f"No player-card matches for '{search}'. Clear the search box to show all {len(full_proj_df):,} rows.")
-            proj_df = proj_df.iloc[0:0].copy()
+    proj_df["Slate"] = mode
+    proj_df["SlateDate"] = str(slate_target_date(mode) or "ALL")
+    proj_df = enrich_board_with_matchups(proj_df, mode)
+    proj_df = apply_matchup_context_to_board(proj_df)
+    CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
+    proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Official plays", int(full_proj_df["Official"].astype(str).str.contains("OVER|UNDER", na=False).sum()))
-    m2.metric("Avg edge", round(float(full_proj_df["Edge"].abs().mean()), 2))
-    m3.metric("Avg data score", round(float(full_proj_df["Data Score"].mean()), 1))
-    m4.metric("Avg official score", round(float(full_proj_df["Official Play Score"].mean()), 1))
+    m1.metric("Official plays", int(proj_df["Official"].astype(str).str.contains("OVER|UNDER", na=False).sum()))
+    m2.metric("Avg edge", round(float(proj_df["Edge"].abs().mean()), 2))
+    m3.metric("Avg data score", round(float(proj_df["Data Score"].mean()), 1))
+    m4.metric("Avg official score", round(float(proj_df["Official Play Score"].mean()), 1))
 
     action_cols = st.columns([1.2, 1.2, 1.2, 2.0])
     with action_cols[0]:
@@ -4658,4 +4587,3 @@ with tabs[8]:
         with st.expander("Backtest rows", expanded=False):
             st.dataframe(bt.tail(1000), use_container_width=True)
             st.download_button("Download full backtest rows CSV", bt.to_csv(index=False), "wnba_backtest_rows.csv", "text/csv")
-
