@@ -2691,7 +2691,7 @@ TEAM_ALIAS_MAP = {
 REQUIRED_MASTER_FIELDS = [
     "Team_Pace", "Team_DRtg", "Team_NetRtg", "Team_ORtg",
     "ShotAttempts", "ThreePARate", "RimRate", "ShotProfileScore", "PointsPerShot",
-    "StarterRate", "RosterGames", "USG%", "TS%", "eFG%_Season",
+    "StarterRate", "RosterGames", "USG%", "TS%", "TS%_Season", "eFG%_Season",
 ]
 
 def normalize_team_code(x) -> str:
@@ -2833,12 +2833,111 @@ def merge_team_context_robust(base: pd.DataFrame, team_ranks: pd.DataFrame, logs
     return base
 
 
+
+def derive_real_team_context_from_logs_schedule(logs: pd.DataFrame, schedules: pd.DataFrame) -> pd.DataFrame:
+    """Build real team pace/ORtg/DRtg/NetRtg from cached player logs + schedule scores.
+
+    This avoids using flat fallback values like Pace=78, DRtg=82, NetRtg=0 when
+    SportsDataverse team_season_stats does not expose ratings in the expected schema.
+    """
+    logs_std = standardize_player_logs(logs) if logs is not None and not logs.empty else pd.DataFrame()
+    if logs_std.empty:
+        return pd.DataFrame()
+    d = logs_std.copy()
+    d["TeamKey"] = d.get("Team", "").apply(normalize_team_code)
+    for c in ["PTS", "FGA", "FTA", "TOV", "OREB", "REB", "AST"]:
+        if c not in d.columns:
+            d[c] = 0
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+    if "GameDate" not in d.columns:
+        d["GameDate"] = pd.NaT
+    if "Season" not in d.columns:
+        d["Season"] = pd.to_datetime(d["GameDate"], errors="coerce").dt.year
+    g = d.groupby(["Season", "TeamKey"], dropna=False).agg(
+        Games=("GameDate", "nunique"),
+        PTS=("PTS", "sum"), FGA=("FGA", "sum"), FTA=("FTA", "sum"),
+        TOV=("TOV", "sum"), OREB=("OREB", "sum"), REB=("REB", "sum"), AST=("AST", "sum")
+    ).reset_index().rename(columns={"TeamKey": "Team"})
+    g["Team"] = g["Team"].apply(normalize_team_code)
+    g = g[g["Team"].astype(str).str.len() > 0].copy()
+    poss = g["FGA"] + 0.44 * g["FTA"] + g["TOV"] - g["OREB"]
+    g["Pace"] = np.where(g["Games"] > 0, poss / g["Games"], np.nan)
+    g["ORtg"] = np.where(poss > 0, 100 * g["PTS"] / poss, np.nan)
+
+    # Defensive side from schedule score results, converted onto the same per-100 scale.
+    sched_std = standardize_schedules(schedules) if schedules is not None and not schedules.empty else pd.DataFrame()
+    if not sched_std.empty and {"Home", "Away", "HomeScore", "AwayScore"}.issubset(sched_std.columns):
+        rows = []
+        complete = sched_std.dropna(subset=["HomeScore", "AwayScore"]).copy()
+        for _, r in complete.iterrows():
+            home = normalize_team_code(r.get("Home")); away = normalize_team_code(r.get("Away"))
+            season = r.get("Season")
+            if home:
+                rows.append({"Season": season, "Team": home, "PtsFor_sched": r.get("HomeScore"), "PtsAllowed": r.get("AwayScore")})
+            if away:
+                rows.append({"Season": season, "Team": away, "PtsFor_sched": r.get("AwayScore"), "PtsAllowed": r.get("HomeScore")})
+        if rows:
+            s = pd.DataFrame(rows)
+            for c in ["PtsFor_sched", "PtsAllowed"]:
+                s[c] = pd.to_numeric(s[c], errors="coerce")
+            sagg = s.groupby(["Season", "Team"], dropna=False).agg(
+                SchedGames=("PtsAllowed", "count"),
+                PPG_sched=("PtsFor_sched", "mean"),
+                PointsAllowed=("PtsAllowed", "mean")
+            ).reset_index()
+            g = g.merge(sagg, on=["Season", "Team"], how="left")
+    if "PointsAllowed" not in g.columns:
+        g["PointsAllowed"] = np.nan
+    # Convert points allowed per game to DRtg using estimated team possessions/game.
+    g["DRtg"] = np.where(g["Pace"] > 0, 100 * g["PointsAllowed"] / g["Pace"], np.nan)
+    # If schedule data absent, center DRtg around ORtg median but keep team variation using ORtg.
+    if g["DRtg"].isna().all():
+        med_o = g["ORtg"].dropna().median()
+        g["DRtg"] = med_o if pd.notna(med_o) else 100.0
+    else:
+        med_d = g["DRtg"].dropna().median()
+        g["DRtg"] = g["DRtg"].fillna(med_d if pd.notna(med_d) else 100.0)
+    g["NetRtg"] = g["ORtg"] - g["DRtg"]
+    return g[["Season", "Team", "Pace", "ORtg", "DRtg", "NetRtg", "PointsAllowed"]].copy()
+
+
+def apply_real_team_context_over_fallbacks(base: pd.DataFrame, logs: pd.DataFrame, schedules: pd.DataFrame) -> pd.DataFrame:
+    """Overwrite flat fallback team metrics with real team-specific metrics when available."""
+    if base is None or base.empty:
+        return base
+    ctx = derive_real_team_context_from_logs_schedule(logs, schedules)
+    if ctx.empty:
+        return base
+    b = base.copy()
+    if "TeamKey" not in b.columns:
+        b["TeamKey"] = b.get("Team", "").apply(normalize_team_code)
+    ctx = ctx.sort_values("Season").groupby("Team", as_index=False).tail(1)
+    maps = {
+        "Team_Pace": dict(zip(ctx["Team"], ctx["Pace"])),
+        "Team_ORtg": dict(zip(ctx["Team"], ctx["ORtg"])),
+        "Team_DRtg": dict(zip(ctx["Team"], ctx["DRtg"])),
+        "Team_NetRtg": dict(zip(ctx["Team"], ctx["NetRtg"])),
+        "Team_PointsAllowed": dict(zip(ctx["Team"], ctx["PointsAllowed"])),
+    }
+    for c, mp in maps.items():
+        calc = b["TeamKey"].map(mp)
+        if c not in b.columns:
+            b[c] = np.nan
+        b[c] = pd.to_numeric(b[c], errors="coerce")
+        # Replace if missing OR if current column is a flat fallback with almost no team variation.
+        unique_ct = b[c].dropna().round(4).nunique()
+        fallback_like = unique_ct <= 1 and c in ["Team_Pace", "Team_DRtg", "Team_NetRtg"]
+        b[c] = np.where(calc.notna() & (b[c].isna() | fallback_like), calc, b[c])
+    return b
+
 def add_missing_feature_fallbacks(base: pd.DataFrame, logs: pd.DataFrame, season_stats: pd.DataFrame, shots: pd.DataFrame, game_rosters: pd.DataFrame) -> pd.DataFrame:
     """Fill projection-critical columns so the model does not silently weaken."""
     if base is None or base.empty:
         return base
     base = base.copy()
-    for c, default in {"Team_Pace": 78.0, "Team_DRtg": 82.0, "Team_ORtg": 82.0, "Team_NetRtg": 0.0}.items():
+    # First try to repair team-specific pace/rating values from actual logs + schedule scores.
+    base = apply_real_team_context_over_fallbacks(base, logs, load_dataset("schedules"))
+    for c, default in {"Team_Pace": 78.0, "Team_DRtg": 100.0, "Team_ORtg": 100.0, "Team_NetRtg": 0.0}.items():
         if c not in base.columns:
             base[c] = np.nan
         base[c] = pd.to_numeric(base[c], errors="coerce")
@@ -2885,9 +2984,14 @@ def add_missing_feature_fallbacks(base: pd.DataFrame, logs: pd.DataFrame, season
         if c not in base.columns:
             base[c] = np.nan
         base[c] = pd.to_numeric(base[c], errors="coerce")
+    if "TS%_Season" not in base.columns:
+        base["TS%_Season"] = np.nan
     if "eFG%_Season" not in base.columns:
         base["eFG%_Season"] = np.nan
+    # TS%_Season was the last empty field. Fill it from season TS% when available,
+    # then from calculated TS%, then a conservative league-average fallback.
     base["TS%"] = base["TS%"].fillna(0.52)
+    base["TS%_Season"] = pd.to_numeric(base["TS%_Season"], errors="coerce").fillna(base["TS%"]).fillna(0.52)
     base["eFG%"] = base["eFG%"].fillna(0.46)
     base["eFG%_Season"] = pd.to_numeric(base["eFG%_Season"], errors="coerce").fillna(base["eFG%"])
 
