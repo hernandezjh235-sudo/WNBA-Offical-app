@@ -3421,6 +3421,216 @@ def filter_projection_view(proj_df: pd.DataFrame, view_name: str) -> pd.DataFram
         return df[~official.str.contains("OVER|UNDER", case=False, na=False)]
     return df
 
+
+# ============================================================
+# Final opponent/matchup resolver v3
+# ============================================================
+def _infer_team_for_player_from_cache(player: Any) -> str:
+    """Infer a player's current team from the master features/player logs cache.
+    This fixes Odds API rows that include event teams but leave the prop-row Team blank.
+    """
+    nk = normalize_name(player)
+    if not nk:
+        return ""
+    # 1) Master features current team.
+    for dataset_key in ["master_features", "player_game_logs", "player_season_stats", "rosters", "game_rosters"]:
+        try:
+            df = load_dataset(dataset_key)
+        except Exception:
+            df = pd.DataFrame()
+        if df is None or df.empty:
+            continue
+        d = df.copy()
+        if "NameKey" not in d.columns:
+            player_col = find_col(d, ["Player", "PLAYER_NAME", "player_name", "athlete_display_name", "name"])
+            if player_col:
+                d["NameKey"] = d[player_col].map(normalize_name)
+        if "Team" not in d.columns:
+            team_col = find_col(d, ["Team", "TEAM", "team", "team_abbreviation", "team_name", "team_short_display_name"])
+            if team_col:
+                d["Team"] = d[team_col]
+        if "NameKey" not in d.columns or "Team" not in d.columns:
+            continue
+        hit = d[d["NameKey"] == nk].copy()
+        if hit.empty:
+            # Fuzzy fallback only if exact name key fails.
+            names = d[["NameKey", "Team"]].dropna().drop_duplicates("NameKey")
+            if not names.empty:
+                names["_score"] = names["NameKey"].map(lambda x: difflib.SequenceMatcher(None, nk, str(x)).ratio())
+                top = names.sort_values("_score", ascending=False).head(1)
+                if not top.empty and float(top.iloc[0]["_score"]) >= 0.88:
+                    team = _team_key_for_matchup(top.iloc[0].get("Team"))
+                    if team:
+                        return team
+            continue
+        if "Season" in hit.columns:
+            hit["_season_num"] = pd.to_numeric(hit["Season"], errors="coerce")
+            hit = hit.sort_values("_season_num")
+        elif "GameDate" in hit.columns:
+            hit["_date_sort"] = pd.to_datetime(hit["GameDate"], errors="coerce")
+            hit = hit.sort_values("_date_sort")
+        teams = [ _team_key_for_matchup(x) for x in hit["Team"].dropna().astype(str).tolist() ]
+        teams = [t for t in teams if t]
+        if teams:
+            return teams[-1]
+    return ""
+
+
+def _event_teams_from_row_anywhere(row: pd.Series) -> Tuple[str, str, str]:
+    """Return away, home, source from Odds API event columns, raw text, or existing matchup text.
+    Priority: explicit EventAway/EventHome > Away/Home > Raw event text > Matchup text.
+    """
+    for away_col, home_col, label in [
+        ("EventAway", "EventHome", "odds api event columns"),
+        ("Away", "Home", "event columns"),
+        ("AwayTeam", "HomeTeam", "event columns"),
+        ("away_team", "home_team", "event columns"),
+    ]:
+        away = _team_key_for_matchup(row.get(away_col)) if away_col in row.index else ""
+        home = _team_key_for_matchup(row.get(home_col)) if home_col in row.index else ""
+        if away and home:
+            return away, home, label
+    for col, label in [("Raw", "sportsbook raw event"), ("Event", "sportsbook event"), ("Matchup", "existing matchup")]:
+        if col in row.index:
+            away, home = _parse_event_teams_from_text(row.get(col))
+            if away and home:
+                return away, home, label
+    return "", "", ""
+
+
+def _resolve_matchup_for_board_row(row: pd.Series, mode: str) -> Dict[str, str]:
+    """Resolve Team/Opponent/HomeAway/Matchup for one projected row.
+    This intentionally uses several fallbacks because line providers may omit team while
+    SportsDataverse can use different abbreviations.
+    """
+    team = _team_key_for_matchup(row.get("Team"))
+    if not team:
+        team = _infer_team_for_player_from_cache(row.get("Player"))
+
+    away, home, event_source = _event_teams_from_row_anywhere(row)
+    if away and home:
+        if team == away:
+            return {"Team": team, "Opponent": home, "HomeAway": "AWAY", "Matchup": f"{away} @ {home}", "Matchup Source": event_source}
+        if team == home:
+            return {"Team": team, "Opponent": away, "HomeAway": "HOME", "Matchup": f"{away} @ {home}", "Matchup Source": event_source}
+        # If team did not match but is missing/unknown, keep event text but don't guess opponent.
+        return {"Team": team, "Opponent": "", "HomeAway": "", "Matchup": f"{away} @ {home}", "Matchup Source": f"{event_source} - player team not matched"}
+
+    # Schedule fallback by start/slate date.
+    if team:
+        sched = _schedule_candidates_for_row(mode, row)
+        if sched is not None and not sched.empty:
+            s = sched.copy()
+            s["HomeKey"] = s.get("Home", "").map(_team_key_for_matchup)
+            s["AwayKey"] = s.get("Away", "").map(_team_key_for_matchup)
+            hit = s[(s["HomeKey"] == team) | (s["AwayKey"] == team)].copy()
+            if not hit.empty:
+                st_dt = pd.to_datetime(row.get("Start"), errors="coerce", utc=True)
+                if pd.notna(st_dt) and "GameDate" in hit.columns:
+                    dd = pd.to_datetime(hit["GameDate"], errors="coerce", utc=True)
+                    hit = hit.assign(_date_diff=(dd - st_dt).abs()).sort_values("_date_diff")
+                g = hit.iloc[0]
+                home_key = _team_key_for_matchup(g.get("Home"))
+                away_key = _team_key_for_matchup(g.get("Away"))
+                if team == away_key:
+                    return {"Team": team, "Opponent": home_key, "HomeAway": "AWAY", "Matchup": f"{away_key} @ {home_key}", "Matchup Source": "cached schedule"}
+                if team == home_key:
+                    return {"Team": team, "Opponent": away_key, "HomeAway": "HOME", "Matchup": f"{away_key} @ {home_key}", "Matchup Source": "cached schedule"}
+
+    # Existing opponent fallback.
+    opp = _team_key_for_matchup(row.get("Opponent"))
+    if team and opp and team != opp:
+        return {"Team": team, "Opponent": opp, "HomeAway": str(row.get("HomeAway") or ""), "Matchup": str(row.get("Matchup") or f"{team} vs {opp}"), "Matchup Source": "existing columns"}
+    return {"Team": team, "Opponent": "", "HomeAway": "", "Matchup": team or "", "Matchup Source": "unresolved"}
+
+
+def enrich_board_with_matchups(proj_df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """Attach real opponent context to every board row.
+
+    Fixes the prior issue where cards showed only `WAS`/team with `opponent unavailable` even when
+    the Odds API row carried the game event. This function now reads EventAway/EventHome, Raw event text,
+    cached schedule, and player-team cache before giving up.
+    """
+    if proj_df is None or proj_df.empty:
+        return proj_df
+    out = proj_df.copy()
+    for c in ["Team", "Opponent", "HomeAway", "Matchup", "Matchup Source"]:
+        if c not in out.columns:
+            out[c] = ""
+    for idx, row in out.iterrows():
+        resolved = _resolve_matchup_for_board_row(row, mode)
+        for k, v in resolved.items():
+            out.at[idx, k] = v
+    # Canonicalize final display columns.
+    out["Team"] = out["Team"].map(lambda x: _team_key_for_matchup(x) or str(x or ""))
+    out["Opponent"] = out["Opponent"].map(lambda x: _team_key_for_matchup(x) if str(x or "").strip() else "")
+    def _display_matchup(r):
+        m = str(r.get("Matchup") or "").strip()
+        if "@" in m:
+            return m
+        t = _team_key_for_matchup(r.get("Team"))
+        o = _team_key_for_matchup(r.get("Opponent"))
+        if t and o:
+            ha = str(r.get("HomeAway") or "").upper()
+            return f"{t} vs {o}" if ha == "HOME" else f"{t} @ {o}" if ha == "AWAY" else f"{t} vs {o}"
+        return t or m
+    out["Matchup"] = out.apply(_display_matchup, axis=1)
+    return out
+
+
+def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
+    """Use the resolved opponent to adjust projections and visibly confirm the matchup used."""
+    if proj_df is None or proj_df.empty:
+        return proj_df
+    out = proj_df.copy()
+    for c in ["Opponent", "Matchup", "HomeAway", "Projection Matchup Used", "Opponent Context Note", "Matchup Projection Factor", "Opponent Context Applied"]:
+        if c not in out.columns:
+            out[c] = "" if c != "Matchup Projection Factor" else 1.0
+    for idx, r in out.iterrows():
+        team = _team_key_for_matchup(r.get("Team"))
+        opp = _team_key_for_matchup(r.get("Opponent"))
+        matchup = str(r.get("Matchup") or "").strip()
+        if not opp and matchup and "@" in matchup:
+            away, home = _parse_event_teams_from_text(matchup)
+            if team == away:
+                opp = home
+                out.at[idx, "Opponent"] = opp
+                out.at[idx, "HomeAway"] = "AWAY"
+            elif team == home:
+                opp = away
+                out.at[idx, "Opponent"] = opp
+                out.at[idx, "HomeAway"] = "HOME"
+        if not opp:
+            out.at[idx, "Projection Matchup Used"] = f"{team or ''} — opponent unavailable"
+            out.at[idx, "Opponent Context Note"] = "No opponent matched from Odds API event text or cached schedule; projection remains player/market based."
+            out.at[idx, "Matchup Projection Factor"] = 1.0
+            out.at[idx, "Opponent Context Applied"] = "NO"
+            continue
+        opp_ctx = _latest_team_context(opp, None)
+        factor, note = _market_matchup_adjustment(r, opp_ctx)
+        old_proj = safe_float(r.get("Projection"), np.nan)
+        line = safe_float(r.get("Line"), np.nan)
+        already = str(r.get("Opponent Context Applied", "")).lower() == "yes"
+        if pd.notna(old_proj) and not already:
+            new_proj = round(float(old_proj) * factor, 2)
+            out.at[idx, "Raw Projection Before Matchup"] = round(float(old_proj), 2)
+            out.at[idx, "Projection"] = new_proj
+            if pd.notna(line):
+                out.at[idx, "Edge"] = round(new_proj - float(line), 2)
+                out.at[idx, "Lean"] = "OVER" if new_proj > float(line) else "UNDER"
+                if "Official" in out.columns:
+                    out.at[idx, "Official"] = "🔥 OVER" if new_proj > float(line) else "⚠️ UNDER"
+        out.at[idx, "Opponent Context Applied"] = "YES"
+        out.at[idx, "Matchup Projection Factor"] = round(float(factor), 4)
+        used = matchup if matchup else f"{team} vs {opp}"
+        out.at[idx, "Projection Matchup Used"] = used
+        out.at[idx, "Opponent Context Note"] = note
+        base_exp = str(r.get("Projection Explanation", "") or "")
+        add = f" Matchup used: {used} ({note})."
+        if "Matchup used:" not in base_exp:
+            out.at[idx, "Projection Explanation"] = (base_exp + add).strip()
+    return out
+
 def render_source_status_card(lines: pd.DataFrame, ud_debug: pd.DataFrame, sl_debug: pd.DataFrame, use_odds_api_flag: bool, odds_api_key: str):
     def count_source(src):
         try:
