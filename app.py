@@ -2349,32 +2349,105 @@ def save_officials(df):
     return len(plays)
 
 
+def latest_closing_line_for_pick(player: str, market: str, saved_at: str = "", source: str = "") -> float:
+    """Return the latest line seen after a pick was saved, if available."""
+    hist = pd.DataFrame(load_json(LINE_HISTORY_FILE, []))
+    if hist.empty or "Player" not in hist.columns or "Market" not in hist.columns or "Line" not in hist.columns:
+        return np.nan
+    h = hist.copy()
+    h["NameKey"] = h["Player"].map(normalize_name)
+    h = h[(h["NameKey"] == normalize_name(player)) & (h["Market"].astype(str).str.upper() == str(market).upper())].copy()
+    if source and "Source" in h.columns:
+        hs = h[h["Source"].astype(str) == str(source)]
+        if not hs.empty:
+            h = hs
+    if h.empty:
+        return np.nan
+    time_col = "PulledAt" if "PulledAt" in h.columns else "SavedAt" if "SavedAt" in h.columns else None
+    if time_col:
+        h[time_col] = pd.to_datetime(h[time_col], errors="coerce")
+        if saved_at:
+            sat = pd.to_datetime(saved_at, errors="coerce")
+            if pd.notna(sat):
+                h2 = h[h[time_col] >= sat].copy()
+                if not h2.empty:
+                    h = h2
+        h = h.sort_values(time_col)
+    return safe_float(h.iloc[-1].get("Line"), np.nan)
+
+
 def grade_pending(logs):
+    """Auto-grade pending official plays using imported player logs.
+
+    This version is safer than the original:
+    - it grades the first matching game after SavedAt / Start, not always the latest game;
+    - it stores ClosingLine and CLV when a later line snapshot exists;
+    - it never crashes if logs or columns are missing.
+    """
     official = load_json(OFFICIAL_LOG, [])
     if not official or logs is None or logs.empty:
         return 0
+    logs = standardize_player_logs(logs) if "NameKey" not in logs.columns else logs.copy()
+    if logs.empty or "GameDate" not in logs.columns:
+        return 0
+    logs["GameDate"] = pd.to_datetime(logs["GameDate"], errors="coerce")
     updated = 0
     learn = load_json(LEARNING_LOG, [])
+    existing_ids = set()
+    for r in learn:
+        existing_ids.add(str(r.get("SavedAt", "")) + "|" + normalize_name(r.get("Player")) + "|" + str(r.get("Market")))
     for row in official:
         if row.get("Result") != "PENDING":
             continue
-        key = normalize_name(row.get("Matched Player") or row.get("Player"))
-        market = row.get("Market")
+        player_name = row.get("Matched Player") or row.get("Player")
+        key = normalize_name(player_name)
+        market = str(row.get("Market", "")).upper()
         if market not in logs.columns:
+            row["GradeNote"] = f"Cannot grade: {market} not in player logs."
             continue
         d = logs[logs["NameKey"] == key].copy()
         if d.empty:
+            row["GradeNote"] = "Cannot grade: player not found in logs."
             continue
-        actual = safe_float(d.sort_values("GameDate").iloc[-1].get(market), np.nan)
+        # Choose first game after the play was saved/start time when possible.
+        cutoff = pd.NaT
+        for tc in [row.get("Start"), row.get("GameDate"), row.get("SavedAt")]:
+            tmp = pd.to_datetime(tc, errors="coerce")
+            if pd.notna(tmp):
+                cutoff = tmp.tz_convert(None) if getattr(tmp, 'tzinfo', None) else tmp
+                break
+        d = d.sort_values("GameDate")
+        if pd.notna(cutoff):
+            d_after = d[d["GameDate"] >= cutoff - pd.Timedelta(hours=12)].copy()
+            if not d_after.empty:
+                d = d_after
+        actual = safe_float(d.iloc[0].get(market), np.nan)
+        game_date = d.iloc[0].get("GameDate")
         if pd.isna(actual):
+            row["GradeNote"] = "Cannot grade: actual value missing."
             continue
-        lean = str(row.get("Lean", ""))
+        lean = str(row.get("Lean", "")).upper()
         line = safe_float(row.get("Line"), np.nan)
         if pd.isna(line):
+            row["GradeNote"] = "Cannot grade: line missing."
             continue
+        push = abs(actual - line) < 1e-9
         win = (actual > line and lean == "OVER") or (actual < line and lean == "UNDER")
-        row["Actual"] = actual; row["Result"] = "WIN" if win else "LOSS"; row["GradedAt"] = now_iso()
-        learn.append(row.copy())
+        row["Actual"] = round(float(actual), 2)
+        row["ActualGameDate"] = str(game_date)
+        row["Result"] = "PUSH" if push else "WIN" if win else "LOSS"
+        row["GradedAt"] = now_iso()
+        close_line = latest_closing_line_for_pick(row.get("Player"), market, row.get("SavedAt", ""), row.get("Source", ""))
+        row["ClosingLine"] = close_line if pd.notna(close_line) else None
+        if pd.notna(close_line):
+            row["CLV"] = round((close_line - line) if lean == "OVER" else (line - close_line), 2)
+        else:
+            row["CLV"] = None
+        row["GradeNote"] = "Auto-graded from imported player logs."
+        learn_id = str(row.get("SavedAt", "")) + "|" + normalize_name(row.get("Player")) + "|" + str(row.get("Market"))
+        if learn_id not in existing_ids:
+            learn.append(row.copy())
+            existing_ids.add(learn_id)
         updated += 1
     save_json(OFFICIAL_LOG, official)
     save_json(LEARNING_LOG, learn)
@@ -2395,6 +2468,173 @@ def reset_logs():
     for p in [OFFICIAL_LOG, RESULT_LOG, LEARNING_LOG, LINE_HISTORY_FILE, NO_LINE_FILE]:
         if p.exists():
             p.unlink()
+
+
+# ============================================================
+# Auto-grader / CLV / Calibration / Historical backtest reports
+# ============================================================
+def log_line_snapshot(lines: pd.DataFrame, slate_label: str = "") -> int:
+    """Save every pulled sportsbook line snapshot for line movement and CLV tracking."""
+    if lines is None or lines.empty:
+        return 0
+    hist = load_json(LINE_HISTORY_FILE, [])
+    stamp = now_iso()
+    add = 0
+    for _, r in lines.iterrows():
+        line = safe_float(r.get("Line"), np.nan)
+        if pd.isna(line):
+            continue
+        hist.append({
+            "PulledAt": stamp,
+            "Slate": slate_label,
+            "Player": r.get("Player"),
+            "NameKey": normalize_name(r.get("Player")),
+            "Team": r.get("Team", ""),
+            "Market": str(r.get("Market", "")).upper(),
+            "Line": float(line),
+            "Source": r.get("Source", ""),
+            "Start": r.get("Start", ""),
+            "Projection": r.get("Projection", None),
+        })
+        add += 1
+    save_json(LINE_HISTORY_FILE, hist)
+    return add
+
+
+def line_movement_report() -> pd.DataFrame:
+    hist = pd.DataFrame(load_json(LINE_HISTORY_FILE, []))
+    if hist.empty:
+        return pd.DataFrame()
+    for c in ["Player", "Market", "Source", "Line"]:
+        if c not in hist.columns:
+            return pd.DataFrame()
+    h = hist.copy()
+    h["Line"] = pd.to_numeric(h["Line"], errors="coerce")
+    h["PulledAt"] = pd.to_datetime(h.get("PulledAt", h.get("SavedAt", "")), errors="coerce")
+    h["NameKey"] = h.get("NameKey", h["Player"].map(normalize_name))
+    h = h.dropna(subset=["Line"])
+    if h.empty:
+        return pd.DataFrame()
+    rows = []
+    for (nk, market, src), g in h.sort_values("PulledAt").groupby(["NameKey", "Market", "Source"], dropna=False):
+        if g.empty:
+            continue
+        first = safe_float(g.iloc[0].get("Line"), np.nan)
+        last = safe_float(g.iloc[-1].get("Line"), np.nan)
+        if pd.isna(first) or pd.isna(last):
+            continue
+        move = round(last - first, 2)
+        rows.append({
+            "Player": g.iloc[-1].get("Player"),
+            "Market": market,
+            "Source": src,
+            "Opening Line": first,
+            "Current Line": last,
+            "Line Move": move,
+            "Snapshots": len(g),
+            "First Seen": g.iloc[0].get("PulledAt"),
+            "Last Seen": g.iloc[-1].get("PulledAt"),
+            "Sharp Note": "Steam up" if move >= 1 else "Steam down" if move <= -1 else "Stable",
+        })
+    return pd.DataFrame(rows).sort_values(["Snapshots", "Line Move"], ascending=[False, False]) if rows else pd.DataFrame()
+
+
+def calibration_report() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    learn = pd.DataFrame(load_json(LEARNING_LOG, []))
+    if learn.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    for c in ["Projection", "Actual", "Line", "Edge"]:
+        if c in learn.columns:
+            learn[c] = pd.to_numeric(learn[c], errors="coerce")
+    if "Result" not in learn.columns:
+        learn["Result"] = ""
+    learn["Abs Error"] = (learn.get("Projection") - learn.get("Actual")).abs() if {"Projection", "Actual"}.issubset(learn.columns) else np.nan
+    learn["Bias"] = learn.get("Projection") - learn.get("Actual") if {"Projection", "Actual"}.issubset(learn.columns) else np.nan
+    group_cols = [c for c in ["Market", "Lean", "Source", "Tier"] if c in learn.columns]
+    if not group_cols:
+        group_cols = ["Result"]
+    summary = learn.groupby(group_cols, dropna=False).agg(
+        Plays=("Result", "count"),
+        Wins=("Result", lambda x: (x == "WIN").sum()),
+        Losses=("Result", lambda x: (x == "LOSS").sum()),
+        Pushes=("Result", lambda x: (x == "PUSH").sum()),
+        AvgProjection=("Projection", "mean"),
+        AvgActual=("Actual", "mean"),
+        MAE=("Abs Error", "mean"),
+        Bias=("Bias", "mean"),
+        AvgEdge=("Edge", "mean") if "Edge" in learn.columns else ("Result", "count"),
+        AvgCLV=("CLV", "mean") if "CLV" in learn.columns else ("Result", "count"),
+    ).reset_index()
+    summary["Win Rate"] = np.where((summary["Wins"] + summary["Losses"]) > 0, summary["Wins"] / (summary["Wins"] + summary["Losses"]), np.nan)
+    return learn, summary
+
+
+def build_historical_backtest(logs: pd.DataFrame, min_prior_games: int = 5) -> pd.DataFrame:
+    """Backtest the projection formula using historical game logs.
+
+    This is a model-calibration backtest, not a sportsbook-line backtest.
+    It creates a fair historical line proxy from prior games only and measures whether
+    the model correctly chose over/under that proxy.
+    """
+    if logs is None or logs.empty:
+        return pd.DataFrame()
+    d = standardize_player_logs(logs) if "NameKey" not in logs.columns else logs.copy()
+    if d.empty:
+        return pd.DataFrame()
+    d["GameDate"] = pd.to_datetime(d["GameDate"], errors="coerce")
+    d = d.sort_values(["NameKey", "GameDate"])
+    rows = []
+    for market in MARKETS:
+        if market not in d.columns:
+            continue
+        for nk, g in d.groupby("NameKey"):
+            g = g.dropna(subset=[market]).sort_values("GameDate")
+            if len(g) <= min_prior_games:
+                continue
+            vals = pd.to_numeric(g[market], errors="coerce").reset_index(drop=True)
+            mins = pd.to_numeric(g.get("MIN", pd.Series([np.nan]*len(g))), errors="coerce").reset_index(drop=True)
+            for i in range(min_prior_games, len(g)):
+                prior = vals.iloc[:i]
+                if prior.dropna().shape[0] < min_prior_games:
+                    continue
+                l3 = prior.tail(3).mean(); l5 = prior.tail(5).mean(); l10 = prior.tail(10).mean(); season = prior.mean()
+                proj = 0.15*season + 0.20*l10 + 0.35*l5 + 0.30*l3
+                # Synthetic closing line proxy using only prior data.
+                line_proxy = 0.55*season + 0.30*l10 + 0.15*l5
+                actual = safe_float(vals.iloc[i], np.nan)
+                if pd.isna(actual) or pd.isna(proj) or pd.isna(line_proxy):
+                    continue
+                lean = "OVER" if proj > line_proxy else "UNDER"
+                win = (actual > line_proxy and lean == "OVER") or (actual < line_proxy and lean == "UNDER")
+                rows.append({
+                    "GameDate": g.iloc[i].get("GameDate"),
+                    "Player": g.iloc[i].get("Player"),
+                    "Team": g.iloc[i].get("Team"),
+                    "Market": market,
+                    "Projection": round(float(proj), 2),
+                    "Line Proxy": round(float(line_proxy), 2),
+                    "Actual": round(float(actual), 2),
+                    "Lean": lean,
+                    "Result": "WIN" if win else "LOSS",
+                    "Edge": round(float(proj - line_proxy), 2),
+                    "Prior Games": i,
+                    "Prior MIN L5": round(float(mins.iloc[:i].tail(5).mean()), 2) if mins.notna().any() else np.nan,
+                })
+    return pd.DataFrame(rows)
+
+
+def summarize_backtest(bt: pd.DataFrame) -> pd.DataFrame:
+    if bt is None or bt.empty:
+        return pd.DataFrame()
+    s = bt.groupby(["Market", "Lean"], dropna=False).agg(
+        Plays=("Result", "count"),
+        Wins=("Result", lambda x: (x == "WIN").sum()),
+        AvgEdge=("Edge", "mean"),
+        AvgProjection=("Projection", "mean"),
+        AvgActual=("Actual", "mean"),
+    ).reset_index()
+    s["Win Rate"] = s["Wins"] / s["Plays"].replace(0, np.nan)
+    return s.sort_values("Win Rate", ascending=False)
 
 # ============================================================
 # UI
@@ -2599,6 +2839,8 @@ def render_card(r):
         <b>Why:</b> {why}<br/>
         <b>Positive:</b> {pos}<br/>
         <b>Risk:</b> {risk}<br/>
+        <b>Projection matchup used:</b> {_val(r.get('Projection Matchup Used'), matchup)}<br/>
+        <b>Opponent context:</b> {_val(r.get('Opponent Context Note'), 'Neutral opponent factor.')}<br/>
         <b>Matchup:</b> {_val(r.get('Defense vs Position'), 'Position/matchup context unavailable.')}<br/>
         <b>Shot profile:</b> {_val(r.get('Shot Profile Note'), 'No shot profile note.')}<br/>
         <span class='owp-expander-note'><b>Notes:</b> {pass_reason}</span>
@@ -2761,6 +3003,10 @@ def pull_board_lines(use_ud_flag: bool, use_sleeper_flag: bool, use_odds_api_fla
     st.session_state["wnba_ud_debug"] = ud_debug
     st.session_state["wnba_sl_debug"] = sl_debug
     st.session_state["wnba_last_refresh"] = now_iso()
+    try:
+        st.session_state["wnba_line_snapshots_added"] = log_line_snapshot(lines, "refresh")
+    except Exception as _e:
+        st.session_state["wnba_line_snapshots_added"] = 0
     return lines, ud_debug, sl_debug
 
 
@@ -2864,6 +3110,150 @@ def enrich_board_with_matchups(proj_df: pd.DataFrame, mode: str) -> pd.DataFrame
     return out
 
 
+
+def _latest_team_context(team: str, season: Any = None) -> Dict[str, Any]:
+    """Return cached team-rank context for matchup-aware projections."""
+    tr = load_dataset("team_ranks")
+    if tr is None or tr.empty:
+        return {}
+    d = tr.copy()
+    team_key = _team_key_for_matchup(team)
+    if "Team" not in d.columns:
+        return {}
+    d["_TeamKey"] = d["Team"].map(_team_key_for_matchup)
+    d = d[d["_TeamKey"] == team_key]
+    if d.empty:
+        return {}
+    if season is not None and "Season" in d.columns:
+        ss = pd.to_numeric(d["Season"], errors="coerce")
+        try:
+            wanted = float(season)
+            dd = d[ss == wanted]
+            if not dd.empty:
+                d = dd
+        except Exception:
+            pass
+    if "Season" in d.columns:
+        d = d.sort_values("Season")
+    return d.iloc[-1].to_dict()
+
+
+def _market_matchup_adjustment(row: pd.Series, opp_ctx: Dict[str, Any]) -> Tuple[float, str]:
+    """Small transparent projection adjustment using the actual opponent on the card."""
+    if not opp_ctx:
+        return 1.0, "Opponent context unavailable; neutral matchup factor used."
+    market = str(row.get("Market", "")).upper()
+    factors = []
+    notes = []
+    pace = safe_float(opp_ctx.get("Pace"), np.nan)
+    drtg = safe_float(opp_ctx.get("DRtg"), np.nan)
+    pts_allowed = safe_float(opp_ctx.get("PointsAllowed"), np.nan)
+    def_rank = safe_float(opp_ctx.get("DefensiveRank"), np.nan)
+    pace_rank = safe_float(opp_ctx.get("PaceRank"), np.nan)
+    # Conservative factors so matchup context improves the projection without overwhelming player baseline.
+    if pd.notna(pace):
+        pace_factor = max(0.96, min(1.04, 1 + (pace - 78.0) / 700.0))
+        factors.append(pace_factor)
+        notes.append(f"opp pace factor {pace_factor:.3f}")
+    if pd.notna(drtg):
+        # Higher DRtg / points allowed = easier defense.
+        def_factor = max(0.96, min(1.04, 1 + (drtg - 100.0) / 900.0))
+        factors.append(def_factor)
+        notes.append(f"opp defense factor {def_factor:.3f}")
+    elif pd.notna(pts_allowed):
+        pa_factor = max(0.96, min(1.04, 1 + (pts_allowed - 80.0) / 600.0))
+        factors.append(pa_factor)
+        notes.append(f"points allowed factor {pa_factor:.3f}")
+    if pd.notna(def_rank):
+        # WNBA league size is small; larger defensive rank generally means weaker defense if rank was built ascending.
+        rank_factor = max(0.97, min(1.03, 1 + (def_rank - 6.5) / 250.0))
+        factors.append(rank_factor)
+        notes.append(f"def rank factor {rank_factor:.3f}")
+    if market == "REB":
+        reb_rank = safe_float(opp_ctx.get("ReboundRank"), np.nan)
+        if pd.notna(reb_rank):
+            f = max(0.97, min(1.03, 1 + (6.5 - reb_rank) / 280.0))
+            factors.append(f); notes.append(f"rebound env {f:.3f}")
+    if market == "AST":
+        ast_rank = safe_float(opp_ctx.get("AssistRank"), np.nan)
+        if pd.notna(ast_rank):
+            f = max(0.97, min(1.03, 1 + (ast_rank - 6.5) / 280.0))
+            factors.append(f); notes.append(f"assist env {f:.3f}")
+    if not factors:
+        return 1.0, "Opponent found, but no usable pace/defense fields; neutral matchup factor used."
+    factor = float(np.prod(factors))
+    factor = max(0.92, min(1.08, factor))
+    return factor, "; ".join(notes)
+
+
+def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
+    """Use Opponent/HomeAway/Matchup to adjust projections and visibly confirm matchup used."""
+    if proj_df is None or proj_df.empty:
+        return proj_df
+    out = proj_df.copy()
+    for c in ["Opponent", "Matchup", "HomeAway", "Projection Matchup Used", "Opponent Context Note", "Matchup Projection Factor"]:
+        if c not in out.columns:
+            out[c] = "" if c != "Matchup Projection Factor" else 1.0
+    for idx, r in out.iterrows():
+        opp = r.get("Opponent")
+        team = r.get("Team")
+        if not opp or str(opp).strip() in ["", "nan", "None"]:
+            out.at[idx, "Projection Matchup Used"] = f"{team or ''} — opponent unavailable"
+            out.at[idx, "Opponent Context Note"] = "No opponent matched from schedule; projection remains player/market based."
+            out.at[idx, "Matchup Projection Factor"] = 1.0
+            continue
+        opp_ctx = _latest_team_context(opp, None)
+        factor, note = _market_matchup_adjustment(r, opp_ctx)
+        old_proj = safe_float(r.get("Projection"), np.nan)
+        line = safe_float(r.get("Line"), np.nan)
+        # Apply once only; if already marked, don't double-adjust.
+        already = str(r.get("Opponent Context Applied", "")).lower() == "yes"
+        if pd.notna(old_proj) and not already:
+            new_proj = round(float(old_proj) * factor, 2)
+            out.at[idx, "Raw Projection Before Matchup"] = round(float(old_proj), 2)
+            out.at[idx, "Projection"] = new_proj
+            if pd.notna(line):
+                out.at[idx, "Edge"] = round(new_proj - float(line), 2)
+                out.at[idx, "Lean"] = "OVER" if new_proj > float(line) else "UNDER"
+                if "Official" in out.columns:
+                    out.at[idx, "Official"] = "🔥 OVER" if new_proj > float(line) else "⚠️ UNDER"
+        out.at[idx, "Opponent Context Applied"] = "YES"
+        out.at[idx, "Matchup Projection Factor"] = round(factor, 4)
+        out.at[idx, "Projection Matchup Used"] = str(r.get("Matchup") or f"{team} vs {opp}")
+        out.at[idx, "Opponent Context Note"] = note
+        # Make the explanation card explicitly say the opponent was used.
+        base_exp = str(r.get("Projection Explanation", "") or "")
+        add = f" Matchup used: {out.at[idx, 'Projection Matchup Used']} ({note})."
+        if "Matchup used:" not in base_exp:
+            out.at[idx, "Projection Explanation"] = (base_exp + add).strip()
+    return out
+
+
+def filter_projection_view(proj_df: pd.DataFrame, view_name: str) -> pd.DataFrame:
+    """Toggle between official/top plays and all pulled board rows."""
+    if proj_df is None or proj_df.empty:
+        return pd.DataFrame()
+    df = proj_df.copy()
+    view_name = str(view_name)
+    if view_name.startswith("Official"):
+        mask = df.get("Official", pd.Series("", index=df.index)).astype(str).str.contains("OVER|UNDER", case=False, na=False)
+        df = df[mask].copy()
+        sort_cols = [c for c in ["Official Play Score", "Edge"] if c in df.columns]
+        if sort_cols:
+            df = df.sort_values(sort_cols, ascending=False)
+        return df
+    if view_name.startswith("Strong"):
+        mask = pd.to_numeric(df.get("Official Play Score", 0), errors="coerce").fillna(0) >= 70
+        return df[mask].sort_values([c for c in ["Official Play Score", "Edge"] if c in df.columns], ascending=False)
+    if view_name.startswith("Overs"):
+        return df[df.get("Lean", pd.Series("", index=df.index)).astype(str).str.contains("OVER", case=False, na=False)]
+    if view_name.startswith("Unders"):
+        return df[df.get("Lean", pd.Series("", index=df.index)).astype(str).str.contains("UNDER", case=False, na=False)]
+    if view_name.startswith("Pass"):
+        official = df.get("Official", pd.Series("", index=df.index)).astype(str)
+        return df[~official.str.contains("OVER|UNDER", case=False, na=False)]
+    return df
+
 def render_source_status_card(lines: pd.DataFrame, ud_debug: pd.DataFrame, sl_debug: pd.DataFrame, use_odds_api_flag: bool, odds_api_key: str):
     def count_source(src):
         try:
@@ -2936,7 +3326,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
 
     if force_market:
         market_filter = [force_market]
-        st.caption(f"Market locked to {force_market}; lines from Underdog/Sleeper/Manual route directly here.")
+        st.caption(f"Market locked to {force_market}; real sportsbook lines route directly here.")
     else:
         market_filter = st.multiselect("Market", MARKETS, default=MARKETS, key=f"market_{mode}_{market_key}")
     search = st.text_input("Search player", key=f"search_{mode}_{market_key}")
@@ -2951,6 +3341,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     proj_df["Slate"] = mode
     proj_df["SlateDate"] = str(slate_target_date(mode) or "ALL")
     proj_df = enrich_board_with_matchups(proj_df, mode)
+    proj_df = apply_matchup_context_to_board(proj_df)
     CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
     proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
 
@@ -2974,13 +3365,31 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     with action_cols[3]:
         st.caption("Save before does not change projections. Grade after uses the latest imported stat logs and updates learning history.")
 
+    board_filter = st.radio(
+        "Board filter",
+        ["Official Plays", "All Board", "Strong Leans", "Overs", "Unders", "Pass / Track"],
+        horizontal=True,
+        key=f"board_filter_{mode}_{market_key}",
+        help="Official Plays shows qualified/top plays. All Board shows every sportsbook line pulled for this market/slate."
+    )
+    display_df = filter_projection_view(proj_df, board_filter)
+    st.caption(f"Showing {len(display_df):,} of {len(proj_df):,} projected rows for {board_filter}.")
+
     display_mode = st.radio("View", ["Player cards", "Table"], horizontal=True, key=f"view_{mode}_{market_key}")
     if display_mode == "Player cards":
-        for _, r in proj_df.head(100).iterrows():
+        limit = 40 if board_filter != "All Board" else 155
+        for _, r in display_df.head(limit).iterrows():
             render_card(r)
+        if len(display_df) > limit:
+            st.info(f"Showing first {limit} cards. Switch to Table view or download CSV to see all {len(display_df):,} rows.")
     else:
-        show_cols = ["Player", "Team", "Opponent", "Matchup", "HomeAway", "Market", "Line", "Source", "Projection", "Edge", "Lean", "Official", "Official Play Score", "PASS Reason", "Underdog Line", "Sleeper Line", "Best Over Line", "Best Under Line", "Over %", "Under %", "L5 Hit%", "L10 Hit%", "L20 Hit%", "MIN Proj", "Role Confidence", "Minutes Safety", "Data Score", "Bayesian Confidence", "Team Pace", "Team ORtg", "Team DRtg", "Team Net", "Team Matchup Strength", "Lineup Continuity", "Shot Profile", "Rim Rate", "3PA Rate", "Shot Make Rate", "Slate", "SlateDate"]
-        st.dataframe(proj_df[[c for c in show_cols if c in proj_df.columns]], use_container_width=True)
+        show_cols = [
+            "Player", "Team", "Opponent", "Matchup", "HomeAway", "Projection Matchup Used",
+            "Market", "Line", "Source", "Projection", "Raw Projection Before Matchup", "Matchup Projection Factor",
+            "Edge", "Lean", "Official", "Official Play Score", "PASS Reason", "Opponent Context Note",
+            "Underdog Line", "Sleeper Line", "Best Over Line", "Best Under Line", "Over %", "Under %"
+        ]
+        st.dataframe(display_df[[c for c in show_cols if c in display_df.columns]], use_container_width=True)
     return proj_df
 
 
@@ -3028,7 +3437,7 @@ except Exception:
     hero_board_rows = hero_real_lines = hero_no_line = hero_strong = 0
 hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
 
-tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Data Manager", "Debug / Status"])
+tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
 
 MARKET_TAB_META = {
     "PTS": ("POINTS", "Points board: scoring projection, shot profile, pace, usage, matchup, line edge."),
@@ -3096,7 +3505,7 @@ with tabs[5]:
     with c2:
         if st.button("📊 Grade pending after results", use_container_width=True):
             n = grade_pending(logs_global)
-            st.success(f"Graded {n} pending plays.")
+            st.success(f"AutoGrader updated {n} pending plays from imported player logs.")
     with c3:
         if board.empty:
             st.metric("Current board", 0)
@@ -3252,4 +3661,78 @@ with tabs[7]:
     st.dataframe(sl_debug, use_container_width=True)
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
+
+with tabs[8]:
+    st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
+    st.caption("This page keeps the main UI clean while giving you the same deeper review tools: line movement, closing-line value, projection calibration, and historical model testing.")
+
+    r1, r2, r3, r4 = st.columns(4)
+    official_df = pd.DataFrame(load_json(OFFICIAL_LOG, []))
+    learning_df = pd.DataFrame(load_json(LEARNING_LOG, []))
+    lm_df = line_movement_report()
+    with r1:
+        pending = int((official_df.get("Result", pd.Series(dtype=str)) == "PENDING").sum()) if not official_df.empty and "Result" in official_df.columns else 0
+        st.metric("Pending grades", pending)
+    with r2:
+        graded = int(len(learning_df)) if not learning_df.empty else 0
+        st.metric("Graded plays", graded)
+    with r3:
+        st.metric("Line snapshots", int(len(pd.DataFrame(load_json(LINE_HISTORY_FILE, [])))))
+    with r4:
+        if not learning_df.empty and "Result" in learning_df.columns:
+            wr = (learning_df["Result"] == "WIN").sum() / max(1, (learning_df["Result"].isin(["WIN", "LOSS"])).sum())
+            st.metric("Tracked win rate", f"{wr:.1%}")
+        else:
+            st.metric("Tracked win rate", "N/A")
+
+    st.markdown("### 1) Result AutoGrader")
+    st.write("Uses imported SportsDataverse player logs to grade saved official plays. It matches the first player game after the pick's saved/start time, then writes WIN/LOSS/PUSH, actual value, closing line, and CLV.")
+    if st.button("Run AutoGrader now", type="primary", use_container_width=True):
+        n = grade_pending(logs_global)
+        st.success(f"AutoGrader updated {n} pending plays.")
+    refreshed_official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
+    if not refreshed_official.empty:
+        cols = [c for c in ["SavedAt", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Projection", "Lean", "Actual", "Result", "ClosingLine", "CLV", "GradeNote"] if c in refreshed_official.columns]
+        st.dataframe(refreshed_official.tail(250)[cols] if cols else refreshed_official.tail(250), use_container_width=True)
+
+    st.markdown("### 2) Line Movement + CLV Dashboard")
+    lm_df = line_movement_report()
+    if lm_df.empty:
+        st.info("No line movement snapshots yet. Refresh board lines a few times and/or save official plays to build this database.")
+    else:
+        st.dataframe(lm_df.head(300), use_container_width=True)
+        st.download_button("Download line movement CSV", lm_df.to_csv(index=False), "wnba_line_movement.csv", "text/csv")
+    if not learning_df.empty and "CLV" in learning_df.columns:
+        clv = learning_df.copy()
+        clv["CLV"] = pd.to_numeric(clv["CLV"], errors="coerce")
+        st.markdown("#### CLV by Market")
+        clv_sum = clv.groupby("Market", dropna=False).agg(Plays=("CLV", "count"), AvgCLV=("CLV", "mean"), PositiveCLV=("CLV", lambda x: (pd.to_numeric(x, errors='coerce') > 0).mean())).reset_index()
+        st.dataframe(clv_sum, use_container_width=True)
+
+    st.markdown("### 3) Model Calibration Report")
+    learn_raw, cal = calibration_report()
+    if cal.empty:
+        st.info("No graded learning data yet. Save official plays, import final player logs, then run AutoGrader.")
+    else:
+        st.dataframe(cal, use_container_width=True)
+        st.download_button("Download calibration CSV", cal.to_csv(index=False), "wnba_model_calibration.csv", "text/csv")
+        with st.expander("Raw graded learning data", expanded=False):
+            st.dataframe(learn_raw.tail(500), use_container_width=True)
+
+    st.markdown("### 4) Automated Historical Backtest")
+    st.caption("Backtests the projection formula on historical logs using a prior-games-only line proxy. This validates model direction/calibration without claiming it had real sportsbook historical lines.")
+    min_prior = st.slider("Minimum prior games before testing", 3, 15, 5)
+    if st.button("Run historical backtest", use_container_width=True):
+        bt = build_historical_backtest(logs_global, min_prior_games=min_prior)
+        st.session_state["wnba_backtest_df"] = bt
+    bt = st.session_state.get("wnba_backtest_df", pd.DataFrame())
+    if bt is None or bt.empty:
+        st.info("Run the backtest after player logs are imported.")
+    else:
+        bts = summarize_backtest(bt)
+        st.dataframe(bts, use_container_width=True)
+        st.download_button("Download backtest summary CSV", bts.to_csv(index=False), "wnba_backtest_summary.csv", "text/csv")
+        with st.expander("Backtest rows", expanded=False):
+            st.dataframe(bt.tail(1000), use_container_width=True)
+            st.download_button("Download full backtest rows CSV", bt.to_csv(index=False), "wnba_backtest_rows.csv", "text/csv")
 
