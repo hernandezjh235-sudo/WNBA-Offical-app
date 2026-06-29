@@ -4,12 +4,12 @@ ONE WAY PICKZ — WNBA Prop Engine
 Full single-file Streamlit app.
 
 Markets: PTS / REB / AST / PRA
-Main fix in this version:
-- Replaces the broken WNBA Stats API baseline button with a SportsDataverse Import Wizard.
-- Reads CSV + Parquet uploads.
-- Handles SportsDataverse index CSVs by downloading/combining the referenced files when possible.
-- Builds clean local caches and one master feature table.
-- Keeps MLB-style dark UI, player cards, official save/grade, manual lines, learning logs.
+Line-source build:
+- Keeps Underdog as the only live automated prop source.
+- Removes/turns off Sleeper, Odds API, and SportsGameOdds from the active board flow.
+- Adds an in-app Manual Line Entry board by slate and market, using cached WNBA schedules
+  so you can enter PTS/REB/AST/PRA lines directly against the correct matchup.
+- Projection engine still runs from the SportsDataverse database even when lines are manual.
 """
 
 import os
@@ -31,7 +31,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v1.4 — SportsDataverse Import Engine v2 + Robust CSV/Parquet Mapping"
+APP_VERSION = "WNBA v1.5 — Underdog + Manual Line Entry Board"
 
 # ============================================================
 # Storage
@@ -132,20 +132,6 @@ ODDS_API_MARKETS = {
 }
 DEFAULT_ODDS_API_BOOKMAKERS = "draftkings,fanduel,betmgm,caesars,espnbet"
 
-# SportsGameOdds fallback provider.
-# Add SPORTSGAMEODDS_API_KEY in Streamlit Secrets. SportsGameOdds accepts
-# either X-Api-Key header or apiKey query parameter; this app uses both for resilience.
-SPORTSGAMEODDS_BASE = "https://api.sportsgameodds.com/v2"
-SPORTSGAMEODDS_LEAGUE_ID = "WNBA"
-DEFAULT_SGO_BOOKMAKERS = "fanduel,draftkings,betmgm,espnbet,caesars,underdog,prizepicks,fanatics,fliff,hardrockbet,bet365,bovada,betrivers,betparx"
-SGO_STAT_TO_MARKET = {
-    "points": "PTS",
-    "rebounds": "REB",
-    "assists": "AST",
-    "points+rebounds+assists": "PRA",
-    "points_rebounds_assists": "PRA",
-}
-
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
     "Accept": "application/json,text/plain,*/*",
@@ -236,24 +222,6 @@ def request_json_with_status(url, params=None, timeout=20):
         return r.json(), status, "ok"
     except Exception as e:
         return None, 0, str(e)[:300]
-
-
-def request_json_with_custom_headers(url, params=None, extra_headers=None, timeout=20):
-    """Same as request_json_with_status, but lets provider-specific APIs set auth headers."""
-    try:
-        headers = dict(DEFAULT_HEADERS)
-        if extra_headers:
-            headers.update(extra_headers)
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
-        status = int(getattr(r, "status_code", 0) or 0)
-        if status >= 400:
-            return None, status, (r.text or "")[:500]
-        try:
-            return r.json(), status, "ok"
-        except Exception:
-            return None, status, (r.text or "")[:500]
-    except Exception as e:
-        return None, 0, str(e)[:500]
 
 
 def get_streamlit_secret(name: str, default: str = "") -> str:
@@ -1299,27 +1267,19 @@ def fetch_underdog_board():
 
 @st.cache_data(ttl=240, show_spinner=False)
 def fetch_sleeper_board():
-    """Best-effort Sleeper pull.
-
-    Sleeper's stable public API is mainly fantasy league/roster data, not a documented
-    daily prop-board endpoint. This function keeps the pull non-breaking, loosens the
-    parser, and returns detailed diagnostics so the Debug tab can show whether the
-    endpoint is blocked, private, empty, or simply using an unexpected schema.
-    """
     rows, debug = [], []
     for url in SLEEPER_URLS:
-        data, status_code, status_msg = request_json_with_status(url, timeout=15)
+        data = request_json(url, timeout=15)
         if not data:
-            debug.append({"source": "Sleeper", "url": url, "status_code": status_code, "status": f"no json/blocked: {status_msg}", "rows": 0})
+            debug.append({"source": "Sleeper", "url": url, "status": "no json/blocked"})
             continue
         objects = flatten_json(data)
-        debug.append({"source": "Sleeper", "url": url, "status_code": status_code, "status": "json received", "objects": len(objects), "top_type": type(data).__name__})
         for o in objects:
             blob = json.dumps(o, default=str)
             low = blob.lower()
-            # Skip clearly wrong sports, but don't require a WNBA token because some prop payloads
-            # only carry player/market fields.
-            if any(x in low for x in ["mlb", "baseball", "nfl", "football", "nhl", "hockey", "soccer", "tennis", "golf"]):
+            if any(x in low for x in ["mlb", "baseball", "nfl", "football", "nhl"]):
+                continue
+            if not any(x in low for x in ["wnba", "women", "basketball"]):
                 continue
             market = infer_market(low)
             if market not in MARKETS:
@@ -1328,37 +1288,17 @@ def fetch_sleeper_board():
             if pd.isna(line):
                 continue
             player = player_from_obj(o)
-            a = attrs(o)
             if not player:
-                for k in ["player", "athlete", "participant", "competitor", "projection", "subject"]:
+                a = attrs(o)
+                for k in ["player", "athlete", "participant"]:
                     if isinstance(a.get(k), dict):
                         player = player_from_obj(a.get(k))
-                        if player:
-                            break
-            if not player:
-                # common nested keys in private prop payloads
-                for v in a.values():
-                    if isinstance(v, dict):
-                        player = player_from_obj(v)
-                        if player:
-                            break
-            if not player or len(normalize_name(player).split()) < 2:
-                continue
-            rows.append({
-                "Player": player,
-                "Team": a.get("team") or a.get("team_abbr") or a.get("team_abbreviation") or "",
-                "Market": market,
-                "Line": float(line),
-                "Source": "Sleeper",
-                "Start": a.get("start_time") or a.get("start") or a.get("game_time") or "",
-                "Raw": blob[:240],
-                "OverOdds": np.nan,
-                "UnderOdds": np.nan,
-            })
+                if not player:
+                    continue
+            rows.append({"Player": player, "Team": attrs(o).get("team") or "", "Market": market, "Line": float(line), "Source": "Sleeper", "Start": attrs(o).get("start_time") or "", "Raw": blob[:180]})
         if rows:
-            debug.append({"source": "Sleeper", "url": url, "status": "parsed rows", "rows": len(rows)})
             break
-    df = pd.DataFrame(rows).drop_duplicates(subset=["Player", "Market", "Line", "Source"]) if rows else pd.DataFrame(columns=["Player", "Team", "Market", "Line", "Source", "Start", "Raw", "OverOdds", "UnderOdds"])
+    df = pd.DataFrame(rows).drop_duplicates(subset=["Player", "Market", "Line", "Source"]) if rows else pd.DataFrame(columns=["Player", "Team", "Market", "Line", "Source", "Start", "Raw"])
     return df, pd.DataFrame(debug)
 
 
@@ -1404,7 +1344,7 @@ def normalize_line_upload(df: pd.DataFrame, source_name: str = "CSV Upload") -> 
 @st.cache_data(ttl=240, show_spinner=False)
 def fetch_odds_api_board(api_key: str, regions: str = "us", bookmakers: str = DEFAULT_ODDS_API_BOOKMAKERS, odds_format: str = "american"):
     """Pull WNBA player props from The Odds API when an API key is supplied.
-    This is a fallback/secondary source, not a replacement for Underdog/Sleeper.
+    This is a fallback/secondary source, not a replacement for Underdog/Manual.
     """
     rows, debug = [], []
     api_key = str(api_key or "").strip()
@@ -1484,225 +1424,6 @@ def fetch_odds_api_board(api_key: str, regions: str = "us", bookmakers: str = DE
     return df, pd.DataFrame(debug)
 
 
-
-def _sgo_team_name(event: dict, side: str) -> str:
-    try:
-        team = ((event.get("teams") or {}).get(side) or {})
-        names = team.get("names") or {}
-        return names.get("short") or names.get("medium") or names.get("long") or team.get("teamID") or ""
-    except Exception:
-        return ""
-
-
-def _sgo_player_name(event: dict, player_id: str) -> str:
-    players = event.get("players") or {}
-    p = players.get(player_id) if isinstance(players, dict) else None
-    if isinstance(p, dict):
-        return p.get("name") or " ".join([str(p.get("firstName","")).strip(), str(p.get("lastName","")).strip()]).strip() or player_id
-    # ID fallback is often FIRST_LAST_1_WNBA. Make it human-readable enough for fuzzy matching.
-    raw = str(player_id or "")
-    toks = raw.split("_")
-    if len(toks) >= 2:
-        name_toks = []
-        for t in toks:
-            if t.isdigit() or t.upper() in ["WNBA", "NBA", "NCAAB"]:
-                break
-            name_toks.append(t)
-        if len(name_toks) >= 2:
-            return " ".join(x.title() for x in name_toks)
-    return raw
-
-
-def _sgo_player_team(event: dict, player_id: str, away_key: str, home_key: str) -> str:
-    players = event.get("players") or {}
-    p = players.get(player_id) if isinstance(players, dict) else None
-    team_id = str((p or {}).get("teamID") or "")
-    home_id = str((((event.get("teams") or {}).get("home") or {}).get("teamID")) or "")
-    away_id = str((((event.get("teams") or {}).get("away") or {}).get("teamID")) or "")
-    if team_id and home_id and team_id == home_id:
-        return home_key
-    if team_id and away_id and team_id == away_id:
-        return away_key
-    return ""
-
-
-def _sgo_market_from_stat(stat_id: str) -> Optional[str]:
-    s = str(stat_id or "").strip().lower().replace("_", "+").replace(" ", "")
-    if s in SGO_STAT_TO_MARKET:
-        return SGO_STAT_TO_MARKET[s]
-    if s == "pointsreboundsassists" or "points+rebounds+assists" in s:
-        return "PRA"
-    if s == "points":
-        return "PTS"
-    if s == "rebounds":
-        return "REB"
-    if s == "assists":
-        return "AST"
-    return None
-
-
-def _sgo_price_to_float(x):
-    if isinstance(x, str):
-        x = x.replace("+", "")
-    return safe_float(x, np.nan)
-
-
-@st.cache_data(ttl=240, show_spinner=False)
-def fetch_sportsgameodds_board(api_key: str, bookmakers: str = DEFAULT_SGO_BOOKMAKERS):
-    """Pull WNBA player props from SportsGameOdds.
-
-    This parser is intentionally schema-tolerant. It reads the v2 /events payload,
-    looks for player-prop oddIDs like points-PLAYER_ID-game-ou-over/under, pairs
-    over/under prices by player + market + line + bookmaker, and returns the same
-    normalized schema as Underdog/Sleeper/OddsAPI.
-    """
-    rows, debug = [], []
-    api_key = str(api_key or "").strip()
-    empty_cols = ["Player", "Team", "Market", "Line", "Source", "Start", "Raw", "OverOdds", "UnderOdds", "EventAway", "EventHome", "Matchup"]
-    if not api_key:
-        return pd.DataFrame(columns=empty_cols), pd.DataFrame([{"source": "SportsGameOdds", "step": "auth", "status": "skipped: no SPORTSGAMEODDS_API_KEY supplied"}])
-
-    url = f"{SPORTSGAMEODDS_BASE}/events/"
-    starts_after = (datetime.utcnow() - timedelta(hours=12)).replace(microsecond=0).isoformat() + "Z"
-    starts_before = (datetime.utcnow() + timedelta(days=4)).replace(microsecond=0).isoformat() + "Z"
-    params = {
-        "apiKey": api_key,
-        "leagueID": SPORTSGAMEODDS_LEAGUE_ID,
-        "oddsAvailable": "true",
-        "oddsPresent": "true",
-        "includeOpposingOdds": "true",
-        "includeAltLines": "false",
-        "includeOpenCloseOdds": "true",
-        "startsAfter": starts_after,
-        "startsBefore": starts_before,
-        "limit": 100,
-    }
-    if bookmakers:
-        params["bookmakerID"] = bookmakers
-
-    data, status, msg = request_json_with_custom_headers(url, params=params, extra_headers={"X-Api-Key": api_key}, timeout=35)
-    events = []
-    if isinstance(data, dict):
-        events = data.get("data") or data.get("events") or []
-    elif isinstance(data, list):
-        events = data
-    debug.append({"source": "SportsGameOdds", "step": "events", "status_code": status, "status": msg, "rows": len(events) if isinstance(events, list) else 0})
-    if not isinstance(events, list) or not events:
-        return pd.DataFrame(columns=empty_cols), pd.DataFrame(debug)
-
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        if str(ev.get("leagueID") or "").upper() not in ["WNBA", ""]:
-            continue
-        away_key = _team_key_for_matchup(_sgo_team_name(ev, "away")) if "_team_key_for_matchup" in globals() else _sgo_team_name(ev, "away")
-        home_key = _team_key_for_matchup(_sgo_team_name(ev, "home")) if "_team_key_for_matchup" in globals() else _sgo_team_name(ev, "home")
-        event_raw = f"{away_key} @ {home_key}" if away_key and home_key else str(ev.get("eventID") or "")
-        start = ((ev.get("status") or {}).get("startsAt") or ev.get("startsAt") or ev.get("startTime") or "")
-
-        odds_obj = ev.get("odds") or ev.get("markets") or {}
-        if isinstance(odds_obj, list):
-            odds_iter = []
-            for x in odds_obj:
-                if isinstance(x, dict):
-                    odds_iter.append((x.get("oddID") or x.get("id") or "", x))
-        elif isinstance(odds_obj, dict):
-            odds_iter = list(odds_obj.items())
-        else:
-            odds_iter = []
-
-        paired = {}
-        for odd_id, odd in odds_iter:
-            if not isinstance(odd, dict):
-                continue
-            odd_id = str(odd.get("oddID") or odd_id or "")
-            stat_id = str(odd.get("statID") or "").lower()
-            market = _sgo_market_from_stat(stat_id)
-            if market not in MARKETS:
-                # fallback from oddID prefix
-                oid_low = odd_id.lower()
-                if oid_low.startswith("points+rebounds+assists-"):
-                    market = "PRA"
-                elif oid_low.startswith("points-"):
-                    market = "PTS"
-                elif oid_low.startswith("rebounds-"):
-                    market = "REB"
-                elif oid_low.startswith("assists-"):
-                    market = "AST"
-            if market not in MARKETS:
-                continue
-            if str(odd.get("betTypeID") or "").lower() != "ou":
-                continue
-            if str(odd.get("periodID") or "game").lower() not in ["game", "full", ""]:
-                continue
-            side = str(odd.get("sideID") or "").lower()
-            if side not in ["over", "under"]:
-                continue
-
-            player_id = str(odd.get("playerID") or odd.get("statEntityID") or "")
-            if not player_id or player_id.lower() in ["all", "home", "away"]:
-                # Parse from oddID: points-AJA_WILSON_1_WNBA-game-ou-over
-                parts = odd_id.split("-")
-                if len(parts) >= 4:
-                    player_id = parts[1]
-            player = _sgo_player_name(ev, player_id)
-            if not player or normalize_name(player) in ["over", "under", "all", "home", "away"]:
-                continue
-            team_key = _sgo_player_team(ev, player_id, away_key, home_key)
-
-            by_book = odd.get("byBookmaker") or {}
-            if not isinstance(by_book, dict) or not by_book:
-                # Fair/book consensus fallback when no bookmaker split is provided.
-                by_book = {"consensus": {
-                    "odds": odd.get("bookOdds") or odd.get("fairOdds"),
-                    "overUnder": odd.get("bookOverUnder") or odd.get("fairOverUnder"),
-                    "available": odd.get("bookOddsAvailable") or odd.get("fairOddsAvailable") or True,
-                    "lastUpdatedAt": odd.get("lastUpdatedAt") or "",
-                }}
-            for book, book_data in by_book.items():
-                if not isinstance(book_data, dict):
-                    continue
-                # Keep disabled books out unless this is the only data in the record.
-                if book_data.get("available") is False and not book_data.get("overUnder") and not odd.get("bookOverUnder"):
-                    continue
-                line = safe_float(book_data.get("overUnder"), np.nan)
-                if pd.isna(line):
-                    line = safe_float(odd.get("bookOverUnder"), np.nan)
-                if pd.isna(line):
-                    line = safe_float(odd.get("fairOverUnder"), np.nan)
-                if pd.isna(line) or not (0.5 <= float(line) <= 80):
-                    continue
-                key = (normalize_name(player), player, market, float(line), str(book), start)
-                rec = paired.setdefault(key, {
-                    "Player": player,
-                    "Team": team_key,
-                    "Market": market,
-                    "Line": float(line),
-                    "Source": f"SportsGameOdds:{book}",
-                    "Start": start,
-                    "Raw": event_raw,
-                    "EventAway": away_key,
-                    "EventHome": home_key,
-                    "Matchup": event_raw,
-                    "OverOdds": np.nan,
-                    "UnderOdds": np.nan,
-                })
-                price = _sgo_price_to_float(book_data.get("odds") or odd.get("bookOdds") or odd.get("fairOdds"))
-                if side == "over":
-                    rec["OverOdds"] = price
-                elif side == "under":
-                    rec["UnderOdds"] = price
-        rows.extend(list(paired.values()))
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        df = pd.DataFrame(columns=empty_cols)
-    else:
-        df = df.drop_duplicates(subset=["Player", "Market", "Line", "Source", "Start"])
-    debug.append({"source": "SportsGameOdds", "step": "final", "status": "parsed rows", "rows": len(df)})
-    return df, pd.DataFrame(debug)
-
-
 def load_manual_lines():
     data = load_json(MANUAL_LINES_FILE, [])
     return pd.DataFrame(data) if data else pd.DataFrame(columns=["Player", "Team", "Market", "Line", "Source"])
@@ -1712,55 +1433,58 @@ def save_manual_lines(df):
     save_json(MANUAL_LINES_FILE, df.to_dict("records"))
 
 
-def aggregate_lines(use_ud=True, use_sleeper=True, manual_df=None, use_sgo=False, sgo_key: str = "", use_odds_api=False, odds_api_key: str = "", line_upload_df=None):
+def aggregate_lines(use_ud=True, use_sleeper=False, manual_df=None, use_odds_api=False, odds_api_key: str = "", line_upload_df=None):
+    """Aggregate active line sources.
+
+    Current production setup is intentionally simple and stable:
+      1) Underdog if it returns WNBA rows
+      2) Manual in-app lines saved by the user
+      3) Optional uploaded line CSVs
+
+    Sleeper, Odds API, and SportsGameOdds are not called here. Their old functions may remain
+    in the file as dormant utilities, but they are disabled from the live board so quota/tier
+    errors cannot break the app or clutter the debug screen.
+    """
     frames = []
-    ud_debug = pd.DataFrame(); sl_debug = pd.DataFrame(); extra_debug = []
+    ud_debug = pd.DataFrame(); manual_debug = []
     if use_ud:
-        ud, ud_debug = fetch_underdog_board(); frames.append(ud)
-    if use_sleeper:
-        sl, sl_debug = fetch_sleeper_board(); frames.append(sl)
-    if use_sgo:
-        sgo, sgo_debug = fetch_sportsgameodds_board(sgo_key)
-        frames.append(sgo)
-        if sgo_debug is not None and not sgo_debug.empty:
-            extra_debug.extend(sgo_debug.to_dict("records"))
-    if use_odds_api:
-        oa, oa_debug = fetch_odds_api_board(odds_api_key)
-        frames.append(oa)
-        if oa_debug is not None and not oa_debug.empty:
-            extra_debug.extend(oa_debug.to_dict("records"))
+        ud, ud_debug = fetch_underdog_board()
+        if ud is not None and not ud.empty:
+            frames.append(ud)
     if manual_df is not None and len(manual_df):
-        m = manual_df.copy(); m["Source"] = m.get("Source", "Manual").fillna("Manual"); frames.append(m)
+        m = manual_df.copy()
+        if "Source" not in m.columns:
+            m["Source"] = "Manual"
+        m["Source"] = m["Source"].fillna("Manual").replace("", "Manual")
+        frames.append(m)
+        manual_debug.append({"source": "Manual", "status": "loaded saved manual lines", "rows": len(m)})
     if line_upload_df is not None and len(line_upload_df):
-        frames.append(line_upload_df)
+        u = line_upload_df.copy()
+        if "Source" not in u.columns:
+            u["Source"] = "CSV Upload"
+        frames.append(u)
+        manual_debug.append({"source": "CSV Upload", "status": "loaded uploaded CSV lines", "rows": len(u)})
     if not frames:
-        combined_debug = pd.concat([sl_debug, pd.DataFrame(extra_debug)], ignore_index=True) if extra_debug else sl_debug
-        return pd.DataFrame(), ud_debug, combined_debug
-    board = pd.concat(frames, ignore_index=True)
+        return pd.DataFrame(columns=["Player","Team","Opponent","Market","Line","Source","Start","Raw","OverOdds","UnderOdds","NameKey","Priority"]), ud_debug, pd.DataFrame(manual_debug)
+    board = pd.concat(frames, ignore_index=True, sort=False)
     if board.empty:
-        combined_debug = pd.concat([sl_debug, pd.DataFrame(extra_debug)], ignore_index=True) if extra_debug else sl_debug
-        return board, ud_debug, combined_debug
+        return board, ud_debug, pd.DataFrame(manual_debug)
     board["Market"] = board["Market"].astype(str).str.upper().map(lambda x: "PRA" if "PRA" in x else x)
     board = board[board["Market"].isin(MARKETS)].copy()
     board["Line"] = pd.to_numeric(board["Line"], errors="coerce")
     board = board.dropna(subset=["Player", "Market", "Line"])
-    for c in ["Team", "Source", "Start", "Raw", "OverOdds", "UnderOdds"]:
+    for c in ["Team", "Opponent", "HomeAway", "Matchup", "Source", "Start", "Raw", "OverOdds", "UnderOdds"]:
         if c not in board.columns:
             board[c] = "" if c not in ["OverOdds", "UnderOdds"] else np.nan
     board["NameKey"] = board["Player"].map(normalize_name)
     def source_priority(s):
         s = str(s)
         if s == "Underdog": return 1
-        if s == "Sleeper": return 2
-        if s.startswith("SportsGameOdds"): return 3
-        if s.startswith("OddsAPI"): return 4
-        if s in ["Manual", "CSV Upload"]: return 5
+        if s in ["Manual", "CSV Upload"]: return 2
         return 9
     board["Priority"] = board["Source"].map(source_priority)
-    # Store all source alternatives but keep the top source first. Projection board can still show line shopping columns.
     board = board.sort_values(["NameKey", "Market", "Priority", "Line"]).drop_duplicates(subset=["NameKey", "Market", "Source", "Line"], keep="first")
-    combined_debug = pd.concat([sl_debug, pd.DataFrame(extra_debug)], ignore_index=True) if extra_debug else sl_debug
-    return board.sort_values(["NameKey", "Market", "Priority"]), ud_debug, combined_debug
+    return board.sort_values(["NameKey", "Market", "Priority"]), ud_debug, pd.DataFrame(manual_debug)
 
 # ============================================================
 # Projection engine
@@ -2229,11 +1953,11 @@ def make_projection_board(lines, logs, base):
         grp = grp.sort_values("Priority")
         primary = grp.iloc[0].copy()
         primary["Underdog Line"] = safe_float(grp[grp["Source"] == "Underdog"]["Line"].iloc[0], np.nan) if len(grp[grp["Source"] == "Underdog"]) else np.nan
-        primary["Sleeper Line"] = safe_float(grp[grp["Source"] == "Sleeper"]["Line"].iloc[0], np.nan) if len(grp[grp["Source"] == "Sleeper"]) else np.nan
+        primary["Sleeper Line"] = np.nan
         primary["Manual Line"] = safe_float(grp[grp["Source"] == "Manual"]["Line"].iloc[0], np.nan) if len(grp[grp["Source"] == "Manual"]) else np.nan
         primary["Best Over Line"] = grp["Line"].min()
         primary["Best Under Line"] = grp["Line"].max()
-        primary["Line Source Reliability"] = {"Underdog": 95, "Sleeper": 85, "Manual": 60}.get(str(primary.get("Source")), 50)
+        primary["Line Source Reliability"] = {"Underdog": 95, "Manual": 70, "CSV Upload": 68}.get(str(primary.get("Source")), 50)
         active.append(primary)
     board = pd.DataFrame(active)
     rows = []
@@ -3661,7 +3385,7 @@ def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, stron
     with c1:
         if st.button("🔄 REFRESH LIVE BOARD — Do Not Save Yet", use_container_width=True, key="hero_refresh_live_board"):
             clear_line_pull_caches()
-            pull_board_lines(use_ud, use_sleeper, use_sgo, sgo_key, use_odds_api, odds_api_key)
+            pull_board_lines(use_ud, False, False, "")
             st.rerun()
     with c2:
         if st.button("💾 SAVE OFFICIAL BEFORE-GAME SNAPSHOT", use_container_width=True, key="hero_save_official_before"):
@@ -3682,7 +3406,7 @@ def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, stron
         </div>
         <div class='owp-kpi-grid'>
           <div class='owp-kpi-card'><div class='owp-kpi-label'>Board Rows</div><div class='owp-kpi-value'>{board_rows}</div><div class='owp-kpi-sub'>Current screen</div></div>
-          <div class='owp-kpi-card'><div class='owp-kpi-label'>Real Lines</div><div class='owp-kpi-value'>{real_lines}</div><div class='owp-kpi-sub'>UD/Sleeper/SGO/Odds</div></div>
+          <div class='owp-kpi-card'><div class='owp-kpi-label'>Real Lines</div><div class='owp-kpi-value'>{real_lines}</div><div class='owp-kpi-sub'>Underdog/Manual</div></div>
           <div class='owp-kpi-card'><div class='owp-kpi-label'>No Line</div><div class='owp-kpi-value'>{no_line}</div><div class='owp-kpi-sub'>Tracked only</div></div>
           <div class='owp-kpi-card'><div class='owp-kpi-label'>Strong Signals</div><div class='owp-kpi-value'>{strong}</div><div class='owp-kpi-sub'>Official gate passed</div></div>
         </div>
@@ -3743,40 +3467,42 @@ def schedule_for_slate(mode: str) -> pd.DataFrame:
 
 
 def clear_line_pull_caches():
-    for fn in [fetch_underdog_board, fetch_sleeper_board, fetch_sportsgameodds_board, fetch_odds_api_board]:
+    for fn in [fetch_underdog_board]:
         try:
             fn.clear()
         except Exception:
             pass
 
 
-def pull_board_lines(use_ud_flag: bool, use_sleeper_flag: bool, use_sgo_flag: bool = False, sgo_key: str = "", use_odds_api_flag: bool = False, odds_api_key: str = "") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    # Production mode: manual lines and CSV line fallbacks are intentionally disabled/hidden.
-    # Only real sources feed the board: Underdog, Sleeper, and optional Odds API.
-    lines, ud_debug, sl_debug = aggregate_lines(
+def pull_board_lines(use_ud_flag: bool, use_sleeper_flag: bool = False, use_odds_api_flag: bool = False, odds_api_key: str = "") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Refresh active line sources.
+
+    Active sources: Underdog + saved manual lines. Sleeper/Odds/SportsGameOdds are disabled
+    from production flow because they were either blocked, quota-limited, or unavailable for WNBA.
+    """
+    manual_df = load_manual_lines()
+    lines, ud_debug, manual_debug = aggregate_lines(
         use_ud=use_ud_flag,
-        use_sleeper=use_sleeper_flag,
-        use_sgo=use_sgo_flag,
-        sgo_key=sgo_key,
-        use_odds_api=use_odds_api_flag,
-        odds_api_key=odds_api_key,
-        manual_df=pd.DataFrame(),
+        use_sleeper=False,
+        use_odds_api=False,
+        odds_api_key="",
+        manual_df=manual_df,
         line_upload_df=pd.DataFrame(),
     )
     st.session_state["wnba_lines_all"] = lines
     st.session_state["wnba_ud_debug"] = ud_debug
-    st.session_state["wnba_sl_debug"] = sl_debug
+    st.session_state["wnba_sl_debug"] = manual_debug
     st.session_state["wnba_last_refresh"] = now_iso()
     try:
         st.session_state["wnba_line_snapshots_added"] = log_line_snapshot(lines, "refresh")
     except Exception as _e:
         st.session_state["wnba_line_snapshots_added"] = 0
-    return lines, ud_debug, sl_debug
+    return lines, ud_debug, manual_debug
 
 
-def get_lines_from_state_or_pull(use_ud_flag: bool, use_sleeper_flag: bool, use_sgo_flag: bool = False, sgo_key: str = "", use_odds_api_flag: bool = False, odds_api_key: str = "") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def get_lines_from_state_or_pull(use_ud_flag: bool, use_sleeper_flag: bool, use_odds_api_flag: bool = False, odds_api_key: str = "") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if "wnba_lines_all" not in st.session_state:
-        return pull_board_lines(use_ud_flag, use_sleeper_flag, use_sgo_flag, sgo_key, use_odds_api_flag, odds_api_key)
+        return pull_board_lines(use_ud_flag, use_sleeper_flag, use_odds_api_flag, odds_api_key)
     return (
         st.session_state.get("wnba_lines_all", pd.DataFrame()),
         st.session_state.get("wnba_ud_debug", pd.DataFrame()),
@@ -3807,7 +3533,7 @@ def make_baseline_player_cards(master_global: pd.DataFrame, market: str, limit: 
             "PositionGroup": b.get("PositionGroup", "Unknown"), "MIN Proj": round(safe_float(b.get("MIN_l10"), safe_float(b.get("MIN_avg"), np.nan)), 2),
             "Role Confidence": round(safe_float(b.get("RoleConfidence"), 50), 1), "Data Score": round(safe_float(b.get("DataScore"), 50), 1),
             "L5 Hit%": np.nan, "L10 Hit%": np.nan, "L20 Hit%": np.nan,
-            "Projection Explanation": f"Baseline {m} projection from {proj_col}. Add Underdog/Sleeper/SportsGameOdds/Odds API line to turn this into an official play.",
+            "Projection Explanation": f"Baseline {m} projection from {proj_col}. Add Underdog/Manual/Odds API line to turn this into an official play.",
             "Biggest Positive": f"Strong baseline sample: data score {round(safe_float(b.get('DataScore'), 50),1)}.",
             "Biggest Risk": "No active sportsbook line yet, so edge/official decision is not calculated.",
             "Shot Profile Note": f"3PA rate {round(safe_float(b.get('ThreePARate'), np.nan),3) if pd.notna(safe_float(b.get('ThreePARate'), np.nan)) else 'NA'}; make rate {round(safe_float(b.get('ShotMakeRate'), np.nan),3) if pd.notna(safe_float(b.get('ShotMakeRate'), np.nan)) else 'NA'}",
@@ -4364,29 +4090,142 @@ def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
             out.at[idx, "Projection Explanation"] = (base_exp + add).strip()
     return out
 
-def render_source_status_card(lines: pd.DataFrame, ud_debug: pd.DataFrame, sl_debug: pd.DataFrame, use_sgo_flag: bool, sgo_key: str, use_odds_api_flag: bool, odds_api_key: str):
+
+
+def _slate_matchup_lookup(mode: str) -> Dict[str, Dict[str, str]]:
+    """Return {team: {Opponent, HomeAway, Matchup}} for the selected slate."""
+    out = {}
+    sched = schedule_for_slate(mode)
+    if sched is None or sched.empty:
+        return out
+    for _, g in standardize_schedules(sched).iterrows():
+        home = _team_key_for_matchup(g.get("Home"))
+        away = _team_key_for_matchup(g.get("Away"))
+        if not home or not away:
+            continue
+        matchup = f"{away} @ {home}"
+        out[home] = {"Opponent": away, "HomeAway": "HOME", "Matchup": matchup}
+        out[away] = {"Opponent": home, "HomeAway": "AWAY", "Matchup": matchup}
+    return out
+
+
+def manual_line_template(mode: str, market: str, master_global: pd.DataFrame, limit: int = 250) -> pd.DataFrame:
+    """Build editable manual-line template from today's/tomorrow's teams and cached player database."""
+    if master_global is None or master_global.empty:
+        return pd.DataFrame(columns=["Player","Team","Opponent","Matchup","HomeAway","Market","Line","OverOdds","UnderOdds","Source","Start"])
+    base = master_global.copy()
+    if "Team" not in base.columns:
+        base["Team"] = ""
+    base["TeamKey"] = base["Team"].map(_team_key_for_matchup)
+    matchups = _slate_matchup_lookup(mode)
+    if mode in ["Today", "Tomorrow"] and matchups:
+        base = base[base["TeamKey"].isin(matchups.keys())].copy()
+    # Sort likely active/high-minute players first.
+    sort_cols = [c for c in ["MIN_l10", "MIN_avg", "DataScore", "RoleConfidence"] if c in base.columns]
+    if sort_cols:
+        base = base.sort_values(sort_cols, ascending=False)
+    base = base.drop_duplicates("NameKey", keep="first").head(limit).copy()
+    existing = load_manual_lines()
+    existing_map = {}
+    if existing is not None and not existing.empty:
+        ex = existing.copy()
+        ex["NameKey"] = ex["Player"].map(normalize_name)
+        ex = ex[ex["Market"].astype(str).str.upper().eq(str(market).upper())]
+        for _, r in ex.iterrows():
+            key = (r.get("NameKey"), str(r.get("Market")).upper(), str(r.get("Start", "")))
+            existing_map[key] = r
+    target = slate_target_date(mode)
+    start_txt = str(target or "")
+    rows = []
+    for _, r in base.iterrows():
+        team = _team_key_for_matchup(r.get("TeamKey") or r.get("Team"))
+        ctx = matchups.get(team, {})
+        nk = r.get("NameKey") or normalize_name(r.get("Player"))
+        old = existing_map.get((nk, str(market).upper(), start_txt))
+        # Fallback to any old manual line for that player/market if no slate date match.
+        if old is None:
+            for k, v in existing_map.items():
+                if k[0] == nk and k[1] == str(market).upper():
+                    old = v; break
+        rows.append({
+            "Player": r.get("Player", ""),
+            "Team": team or r.get("Team", ""),
+            "Opponent": ctx.get("Opponent", ""),
+            "Matchup": ctx.get("Matchup", team),
+            "HomeAway": ctx.get("HomeAway", ""),
+            "Market": market,
+            "Line": safe_float(old.get("Line"), np.nan) if isinstance(old, pd.Series) else np.nan,
+            "OverOdds": safe_float(old.get("OverOdds"), np.nan) if isinstance(old, pd.Series) else np.nan,
+            "UnderOdds": safe_float(old.get("UnderOdds"), np.nan) if isinstance(old, pd.Series) else np.nan,
+            "Source": "Manual",
+            "Start": start_txt,
+            "Raw": "manual in-app entry",
+        })
+    return pd.DataFrame(rows)
+
+
+def render_manual_line_entry(mode: str, market: str, master_global: pd.DataFrame) -> None:
+    """Visible but compact manual line editor inside each market board."""
+    with st.expander(f"✍️ Manual {market} lines for {mode} matchups", expanded=False):
+        st.caption("Enter only the lines you want. Saved manual lines feed the same projection engine as Underdog lines.")
+        template = manual_line_template(mode, market, master_global)
+        if template.empty:
+            st.info("Build/import the player database first, or there are no cached players for this slate.")
+            return
+        edited = st.data_editor(
+            template[["Player","Team","Opponent","Matchup","HomeAway","Market","Line","OverOdds","UnderOdds","Source","Start","Raw"]],
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=["Player","Team","Opponent","Matchup","HomeAway","Market","Source","Start","Raw"],
+            column_config={
+                "Line": st.column_config.NumberColumn("Line", min_value=0.0, step=0.5, format="%.1f"),
+                "OverOdds": st.column_config.NumberColumn("OverOdds", step=1.0, format="%.0f"),
+                "UnderOdds": st.column_config.NumberColumn("UnderOdds", step=1.0, format="%.0f"),
+            },
+            key=f"manual_editor_{mode}_{market}",
+        )
+        csave, cclear = st.columns([1,1])
+        with csave:
+            if st.button(f"💾 Save {market} manual lines", key=f"save_manual_{mode}_{market}", use_container_width=True):
+                clean = edited.copy()
+                clean["Line"] = pd.to_numeric(clean["Line"], errors="coerce")
+                clean = clean.dropna(subset=["Player", "Line"])
+                clean = clean[clean["Line"] > 0]
+                prev = load_manual_lines()
+                if prev is None or prev.empty:
+                    combined = clean
+                else:
+                    prev = prev.copy()
+                    prev["NameKey"] = prev["Player"].map(normalize_name)
+                    clean["NameKey"] = clean["Player"].map(normalize_name)
+                    slate_start = str(slate_target_date(mode) or "")
+                    mask = ~((prev["Market"].astype(str).str.upper() == market) & (prev.get("Start", "").astype(str) == slate_start))
+                    combined = pd.concat([prev[mask].drop(columns=["NameKey"], errors="ignore"), clean.drop(columns=["NameKey"], errors="ignore")], ignore_index=True)
+                save_manual_lines(combined)
+                st.session_state.pop("wnba_lines_all", None)
+                st.success(f"Saved {len(clean):,} {market} manual lines for {mode}.")
+                st.rerun()
+        with cclear:
+            if st.button(f"🧹 Clear {market} manual slate", key=f"clear_manual_{mode}_{market}", use_container_width=True):
+                prev = load_manual_lines()
+                if prev is not None and not prev.empty:
+                    slate_start = str(slate_target_date(mode) or "")
+                    keep = ~((prev["Market"].astype(str).str.upper() == market) & (prev.get("Start", "").astype(str) == slate_start))
+                    save_manual_lines(prev[keep])
+                st.session_state.pop("wnba_lines_all", None)
+                st.success("Manual slate lines cleared.")
+                st.rerun()
+def render_source_status_card(lines: pd.DataFrame, ud_debug: pd.DataFrame, sl_debug: pd.DataFrame, use_odds_api_flag: bool = False, odds_api_key: str = ""):
     def count_source(src):
         try:
             return int((lines.get("Source", pd.Series(dtype=str)).astype(str) == src).sum()) if lines is not None and not lines.empty else 0
         except Exception:
             return 0
-    def count_prefix(prefix):
-        try:
-            s = lines.get("Source", pd.Series(dtype=str)).astype(str) if lines is not None and not lines.empty else pd.Series(dtype=str)
-            return int(s.str.startswith(prefix, na=False).sum())
-        except Exception:
-            return 0
-    sgo_status = "✅ Key loaded" if use_sgo_flag and sgo_key else "⚪ Off / no key"
-    if use_sgo_flag and not sgo_key:
-        sgo_status = "❌ Missing key"
-    odds_status = "✅ Key loaded" if use_odds_api_flag and odds_api_key else "⚪ Off / no key"
-    if use_odds_api_flag and not odds_api_key:
-        odds_status = "❌ Missing key"
     st.markdown(f"""
     <div class='owp-blue-note'>
-      <b>Source Status</b> — Underdog: {count_source('Underdog')} lines | Sleeper: {count_source('Sleeper')} lines |
-      SportsGameOdds: {count_prefix('SportsGameOdds')} lines ({sgo_status}) | Odds API: {count_prefix('OddsAPI')} lines ({odds_status}) |
-      CSV/Manual: disabled for clean production mode
+      <b>Source Status</b> — Underdog: {count_source('Underdog')} lines | Manual: {count_source('Manual')} lines | CSV Upload: {count_source('CSV Upload')} lines<br>
+      Sleeper / Odds API / SportsGameOdds are disabled. Projection engine still runs from Underdog or manual lines.
     </div>
     """, unsafe_allow_html=True)
 
@@ -4398,7 +4237,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     with top_cols[0]:
         if st.button(f"🔄 Refresh {mode} Lines", key=f"refresh_{mode}_{market_key}"):
             clear_line_pull_caches()
-            pull_board_lines(use_ud_flag, use_sleeper_flag, use_sgo, sgo_key, use_odds_api, odds_api_key)
+            pull_board_lines(use_ud_flag, False, False, "")
             st.rerun()
     with top_cols[1]:
         if st.button(f"🧱 Rebuild {mode} Board", key=f"rebuild_{mode}_{market_key}"):
@@ -4415,9 +4254,9 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     with top_cols[4]:
         st.caption("Workflow: Refresh board lines → inspect cards → Save official before games → Grade after results post.")
 
-    lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, use_sleeper_flag, use_sgo, sgo_key, use_odds_api, odds_api_key)
+    lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, False, False, "")
     lines, slate_note = filter_lines_for_slate(lines_all, mode)
-    render_source_status_card(lines_all, ud_debug, sl_debug, use_sgo, sgo_key, use_odds_api, odds_api_key)
+    render_source_status_card(lines_all, ud_debug, sl_debug, False, "")
     st.caption(slate_note)
 
     sched = schedule_for_slate(mode)
@@ -4427,17 +4266,20 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     elif mode in ["Today", "Tomorrow"]:
         st.info(f"No cached schedule rows found for {mode.lower()}. If WNBA is off that day, lines may correctly return 0.")
 
+    if force_market:
+        render_manual_line_entry(mode, force_market, master_global)
+
     if logs_global.empty or master_global.empty:
         st.warning("Import/build SportsDataverse player logs first in Data Manager. Lines can load, but projections need player baselines.")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Lines loaded", 0 if lines is None else len(lines))
     c2.metric("Underdog rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Underdog").sum()))
-    c3.metric("Sleeper rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Sleeper").sum()))
-    c4.metric("SGO / Odds rows", 0 if lines_all is None or lines_all.empty else int(lines_all.get("Source", pd.Series(dtype=str)).astype(str).str.startswith(("SportsGameOdds","OddsAPI")).sum()))
+    c3.metric("Manual rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Manual").sum()))
+    c4.metric("CSV rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "CSV Upload").sum()))
 
     if lines is None or lines.empty:
-        st.error("No real sportsbook lines loaded for this slate. Check Debug/Status. If there are no WNBA games, this is expected.")
+        st.error("No Underdog or manual lines loaded for this slate. Use the manual line editor above, then save and refresh.")
         if not master_global.empty:
             st.markdown("<div class='hidden-baseline-note'>Baseline table is hidden. Showing player cards only so you can still review projections while waiting for lines.</div>", unsafe_allow_html=True)
             baseline_cards = make_baseline_player_cards(master_global, force_market or "PRA", limit=30)
@@ -4519,18 +4361,17 @@ with st.sidebar:
     season_now = st.number_input("Current season", min_value=2020, max_value=2032, value=datetime.now().year, step=1)
     season_last = st.number_input("Last season baseline", min_value=2020, max_value=2032, value=datetime.now().year - 1, step=1)
     use_ud = st.toggle("Pull Underdog", value=True)
-    use_sleeper = st.toggle("Pull Sleeper", value=True, help="Sleeper does not expose a stable public props endpoint; this app keeps diagnostics on so you can see if it is blocked/empty.")
-    use_sgo = st.toggle("Pull SportsGameOdds fallback", value=True, help="Recommended fallback for WNBA player props. Requires SPORTSGAMEODDS_API_KEY in Streamlit Secrets.")
-    sgo_key = st.text_input("SPORTSGAMEODDS_API_KEY", value=get_streamlit_secret("SPORTSGAMEODDS_API_KEY", get_streamlit_secret("SPORTS_ODDS_API_KEY_HEADER", "")), type="password", help="SportsGameOdds key. Secrets format: SPORTSGAMEODDS_API_KEY = \"your_key\"")
-    use_odds_api = st.toggle("Pull Odds API fallback", value=False, help="Optional: requires ODDS_API_KEY. Use only as backup to avoid burning quota.")
-    odds_api_key = st.text_input("ODDS_API_KEY", value=get_streamlit_secret("ODDS_API_KEY", ""), type="password", help="Optional fallback for sportsbook WNBA player props.")
+    use_sleeper = False
+    use_odds_api = False
+    odds_api_key = ""
+    st.caption("Active line sources: Underdog + saved manual lines. Sleeper, Odds API, and SportsGameOdds are disabled.")
     use_remote = st.toggle("Allow SportsDataverse remote downloads", value=True)
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
     st.markdown("**Model:** Monte Carlo + Bayesian confidence + XGBoost-style blend")
     st.divider()
     if st.button("🔄 Refresh board lines", use_container_width=True):
         clear_line_pull_caches()
-        pull_board_lines(use_ud, use_sleeper, use_sgo, sgo_key, use_odds_api, odds_api_key)
+        pull_board_lines(use_ud, False, False, "")
         st.rerun()
     if st.button("🧱 Rebuild database", use_container_width=True):
         try:
@@ -4615,7 +4456,7 @@ with tabs[4]:
 
 with tabs[5]:
     st.subheader("Official + Grade")
-    st.caption("Save official plays before games. Grade after results are imported to update the learning log. Manual line tools are hidden; real sportsbook lines drive this board.")
+    st.caption("Save official plays before games. Grade after results are imported to update the learning log. Manual line tools are built into each market board. Underdog lines are used when available.")
     board = load_dataset("projection_board")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -4804,12 +4645,12 @@ with tabs[7]:
     st.markdown("### Data status")
     st.dataframe(dataset_status_table(), use_container_width=True)
     st.markdown("### Aggregated real lines")
-    lines, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud, use_sleeper, use_sgo, sgo_key, use_odds_api, odds_api_key)
-    render_source_status_card(lines, ud_debug, sl_debug, use_sgo, sgo_key, use_odds_api, odds_api_key)
+    lines, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud, False, False, "")
+    render_source_status_card(lines, ud_debug, sl_debug, False, "")
     st.dataframe(lines, use_container_width=True)
     st.markdown("### Underdog debug")
     st.dataframe(ud_debug, use_container_width=True)
-    st.markdown("### Sleeper / Odds API debug")
+    st.markdown("### Manual line debug")
     st.dataframe(sl_debug, use_container_width=True)
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
