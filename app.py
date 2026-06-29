@@ -1640,7 +1640,177 @@ def dataset_status_table():
 st.set_page_config(page_title="ONE WAY PICKZ WNBA", page_icon="🏀", layout="wide")
 inject_css()
 st.markdown("<div class='owp-header'>🏀 ONE WAY PICKZ — WNBA Prop Engine</div>", unsafe_allow_html=True)
-st.caption(APP_VERSION)
+st.caption(APP_VERSION + " — MLB-style Today/Tomorrow refresh → save before → grade after workflow")
+
+# ----------------------------
+# Slate/refresh helpers
+# ----------------------------
+def slate_target_date(mode: str) -> Optional[date]:
+    today = datetime.now().date()
+    if mode == "Today":
+        return today
+    if mode == "Tomorrow":
+        return today + timedelta(days=1)
+    return None
+
+
+def line_start_date_series(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty or "Start" not in df.columns:
+        return pd.Series([pd.NaT] * (0 if df is None else len(df)))
+    return pd.to_datetime(df["Start"], errors="coerce", utc=True).dt.tz_convert(None).dt.date
+
+
+def filter_lines_for_slate(lines: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame, str]:
+    if lines is None or lines.empty or mode == "All Lines":
+        return lines if lines is not None else pd.DataFrame(), "All loaded lines shown."
+    target = slate_target_date(mode)
+    if target is None:
+        return lines, "All loaded lines shown."
+    d = lines.copy()
+    start_dates = line_start_date_series(d)
+    has_dates = start_dates.notna()
+    if has_dates.any():
+        filtered = d[(start_dates == target) | (~has_dates & d.get("Source", "").astype(str).eq("Manual"))].copy()
+        return filtered, f"Filtered to {mode.lower()} ({target}). Manual lines without a start date are included."
+    return d, f"Sportsbook rows did not include reliable start times, so all loaded lines are shown for {mode.lower()}."
+
+
+def schedule_for_slate(mode: str) -> pd.DataFrame:
+    sched = load_dataset("schedules")
+    if sched.empty:
+        return pd.DataFrame()
+    sched = standardize_schedules(sched)
+    target = slate_target_date(mode)
+    if target is not None and "GameDate" in sched.columns:
+        sched = sched[pd.to_datetime(sched["GameDate"], errors="coerce").dt.date == target].copy()
+    keep = [c for c in ["GameDate", "Away", "Home", "AwayScore", "HomeScore", "Margin", "Season", "GameID"] if c in sched.columns]
+    return sched[keep].sort_values("GameDate") if keep else sched
+
+
+def clear_line_pull_caches():
+    for fn in [fetch_underdog_board, fetch_sleeper_board]:
+        try:
+            fn.clear()
+        except Exception:
+            pass
+
+
+def pull_board_lines(use_ud_flag: bool, use_sleeper_flag: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    manual_df = load_manual_lines()
+    lines, ud_debug, sl_debug = aggregate_lines(use_ud=use_ud_flag, use_sleeper=use_sleeper_flag, manual_df=manual_df)
+    st.session_state["wnba_lines_all"] = lines
+    st.session_state["wnba_ud_debug"] = ud_debug
+    st.session_state["wnba_sl_debug"] = sl_debug
+    st.session_state["wnba_last_refresh"] = now_iso()
+    return lines, ud_debug, sl_debug
+
+
+def get_lines_from_state_or_pull(use_ud_flag: bool, use_sleeper_flag: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if "wnba_lines_all" not in st.session_state:
+        return pull_board_lines(use_ud_flag, use_sleeper_flag)
+    return (
+        st.session_state.get("wnba_lines_all", pd.DataFrame()),
+        st.session_state.get("wnba_ud_debug", pd.DataFrame()),
+        st.session_state.get("wnba_sl_debug", pd.DataFrame()),
+    )
+
+
+def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame):
+    st.markdown(f"### {mode} Board")
+    top_cols = st.columns([1.1, 1.1, 1.2, 1.2, 2.0])
+    with top_cols[0]:
+        if st.button(f"🔄 Refresh {mode} Lines", key=f"refresh_{mode}"):
+            clear_line_pull_caches()
+            pull_board_lines(use_ud_flag, use_sleeper_flag)
+            st.rerun()
+    with top_cols[1]:
+        if st.button(f"🧱 Rebuild {mode} Board", key=f"rebuild_{mode}"):
+            try:
+                master, team_ranks = build_master_features()
+                st.session_state["wnba_rebuilt_at"] = now_iso()
+                st.success(f"Rebuilt master features: {len(master):,} rows. Team ranks: {len(team_ranks):,} rows.")
+            except Exception as e:
+                st.error(f"Rebuild failed: {e}")
+    with top_cols[2]:
+        st.metric("Last refresh", st.session_state.get("wnba_last_refresh", "not yet"))
+    with top_cols[3]:
+        st.metric("Database players", 0 if master_global is None or master_global.empty else len(master_global))
+    with top_cols[4]:
+        st.caption("Workflow: Refresh board lines → inspect cards → Save official before games → Grade after results post.")
+
+    lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, use_sleeper_flag)
+    lines, slate_note = filter_lines_for_slate(lines_all, mode)
+    st.caption(slate_note)
+
+    sched = schedule_for_slate(mode)
+    if not sched.empty:
+        with st.expander(f"{mode} schedule context", expanded=False):
+            st.dataframe(sched, use_container_width=True)
+    elif mode in ["Today", "Tomorrow"]:
+        st.info(f"No cached schedule rows found for {mode.lower()}. If WNBA is off that day, lines may correctly return 0.")
+
+    if logs_global.empty or master_global.empty:
+        st.warning("Import/build SportsDataverse player logs first in Data Manager. Lines can load, but projections need player baselines.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Lines loaded", 0 if lines is None else len(lines))
+    c2.metric("Underdog rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Underdog").sum()))
+    c3.metric("Sleeper rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Sleeper").sum()))
+    c4.metric("Manual rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Manual").sum()))
+
+    if lines is None or lines.empty:
+        st.error("No lines loaded for this slate. Add manual lines or check Debug. If there are no WNBA games, this is expected.")
+        if not master_global.empty:
+            nl_cols = [c for c in ["Player", "Team", "PositionGroup", "MIN_l10", "PTS_l10", "REB_l10", "AST_l10", "PRA_l10", "RoleConfidence", "DataScore"] if c in master_global.columns]
+            nl = master_global[nl_cols].head(200)
+            st.caption("Baseline players available even without matched sportsbook lines:")
+            st.dataframe(nl, use_container_width=True)
+        return pd.DataFrame()
+
+    market_filter = st.multiselect("Market", MARKETS, default=MARKETS, key=f"market_{mode}")
+    search = st.text_input("Search player", key=f"search_{mode}")
+    proj_df = make_projection_board(lines[lines["Market"].isin(market_filter)], logs_global, master_global)
+    if search and not proj_df.empty:
+        proj_df = proj_df[proj_df["Player"].str.contains(search, case=False, na=False)]
+
+    if proj_df.empty:
+        st.warning("Lines loaded, but projection board could not be built. Check player-name matching and Data Manager.")
+        return pd.DataFrame()
+
+    proj_df["Slate"] = mode
+    proj_df["SlateDate"] = str(slate_target_date(mode) or "ALL")
+    CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
+    proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Official plays", int(proj_df["Official"].astype(str).str.contains("OVER|UNDER", na=False).sum()))
+    m2.metric("Avg edge", round(float(proj_df["Edge"].abs().mean()), 2))
+    m3.metric("Avg data score", round(float(proj_df["Data Score"].mean()), 1))
+    m4.metric("Avg official score", round(float(proj_df["Official Play Score"].mean()), 1))
+
+    action_cols = st.columns([1.2, 1.2, 1.2, 2.0])
+    with action_cols[0]:
+        if st.button(f"✅ Save {mode} Official Before", key=f"save_before_{mode}"):
+            n = save_officials(proj_df)
+            st.success(f"Saved {n} official plays for {mode}.")
+    with action_cols[1]:
+        if st.button(f"📊 Grade After Results", key=f"grade_after_{mode}"):
+            n = grade_pending(logs_global)
+            st.success(f"Graded {n} pending plays.")
+    with action_cols[2]:
+        st.download_button(f"Download {mode} Board CSV", proj_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ', '_')}_projection_board.csv", "text/csv", key=f"dl_{mode}")
+    with action_cols[3]:
+        st.caption("Save before does not change projections. Grade after uses the latest imported stat logs and updates learning history.")
+
+    display_mode = st.radio("View", ["Player cards", "Table"], horizontal=True, key=f"view_{mode}")
+    if display_mode == "Player cards":
+        for _, r in proj_df.head(100).iterrows():
+            render_card(r)
+    else:
+        show_cols = ["Player", "Market", "Line", "Source", "Projection", "Edge", "Lean", "Official", "Official Play Score", "PASS Reason", "Underdog Line", "Sleeper Line", "Best Over Line", "Best Under Line", "Over %", "Under %", "L5 Hit%", "L10 Hit%", "L20 Hit%", "MIN Proj", "Role Confidence", "Minutes Safety", "Data Score", "Bayesian Confidence", "Team Pace", "Team ORtg", "Team DRtg", "Team Net", "Team Matchup Strength", "Lineup Continuity", "Shot Profile", "Rim Rate", "3PA Rate", "Shot Make Rate", "Slate", "SlateDate"]
+        st.dataframe(proj_df[[c for c in show_cols if c in proj_df.columns]], use_container_width=True)
+    return proj_df
+
 
 with st.sidebar:
     st.header("Setup")
@@ -1651,6 +1821,18 @@ with st.sidebar:
     use_remote = st.toggle("Allow SportsDataverse remote downloads", value=True)
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
     st.markdown("**Model:** Monte Carlo + Bayesian confidence + XGBoost-style blend")
+    st.divider()
+    if st.button("🔄 Refresh board lines", use_container_width=True):
+        clear_line_pull_caches()
+        pull_board_lines(use_ud, use_sleeper)
+        st.rerun()
+    if st.button("🧱 Rebuild database", use_container_width=True):
+        try:
+            build_master_features()
+            st.success("Database rebuilt.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Rebuild failed: {e}")
 
 logs_global = load_dataset("player_game_logs")
 master_global = load_dataset("master_features")
@@ -1661,6 +1843,17 @@ if master_global.empty and not logs_global.empty:
         master_global = pd.DataFrame()
 
 tabs = st.tabs(["Board", "Manual Lines", "Data Manager", "Research Hub", "Team Ranks", "Official + Grade", "Log Tools", "Debug"])
+
+with tabs[0]:
+    st.subheader("Projection Board")
+    st.caption("MLB-style flow: Today/Tomorrow tabs, refresh board lines, save official before games, then grade after results.")
+    slate_tabs = st.tabs(["Today", "Tomorrow", "All Lines"])
+    with slate_tabs[0]:
+        render_mlb_style_board("Today", use_ud, use_sleeper, logs_global, master_global)
+    with slate_tabs[1]:
+        render_mlb_style_board("Tomorrow", use_ud, use_sleeper, logs_global, master_global)
+    with slate_tabs[2]:
+        render_mlb_style_board("All Lines", use_ud, use_sleeper, logs_global, master_global)
 
 with tabs[2]:
     st.subheader("SportsDataverse Import Wizard")
@@ -1792,45 +1985,9 @@ with tabs[1]:
     edited = st.data_editor(existing, num_rows="dynamic", use_container_width=True, column_config={"Market": st.column_config.SelectboxColumn(options=MARKETS)})
     if st.button("Save manual lines"):
         save_manual_lines(edited)
-        st.success("Manual lines saved.")
-
-with tabs[0]:
-    st.subheader("Projection Board")
-    manual_df = load_manual_lines()
-    lines, ud_debug, sl_debug = aggregate_lines(use_ud=use_ud, use_sleeper=use_sleeper, manual_df=manual_df)
-    if not lines.empty:
-        CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
-        lines.to_csv(CACHE_FILES["projection_board"], index=False)
-    if logs_global.empty or master_global.empty:
-        st.warning("Import SportsDataverse player logs first in Data Manager. Lines can load, but projections need player baselines.")
-    st.metric("Lines loaded", len(lines))
-    if lines.empty:
-        st.error("No lines loaded. Try manual lines, or check Debug.")
-        # Track no-line players from master.
-        if not master_global.empty:
-            nl = master_global[["Player", "Team", "PositionGroup", "MIN_l10", "PTS_l10", "REB_l10", "AST_l10", "PRA_l10"]].head(200)
-            st.caption("Top baseline players available with no matched line yet:")
-            st.dataframe(nl, use_container_width=True)
-    else:
-        market_filter = st.multiselect("Market", MARKETS, default=MARKETS)
-        search = st.text_input("Search player")
-        proj_df = make_projection_board(lines[lines["Market"].isin(market_filter)], logs_global, master_global)
-        if search and not proj_df.empty:
-            proj_df = proj_df[proj_df["Player"].str.contains(search, case=False, na=False)]
-        if not proj_df.empty:
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: st.metric("Official plays", int(proj_df["Official"].astype(str).str.contains("OVER|UNDER", na=False).sum()))
-            with c2: st.metric("Avg edge", round(float(proj_df["Edge"].abs().mean()), 2))
-            with c3: st.metric("Avg data score", round(float(proj_df["Data Score"].mean()), 1))
-            with c4: st.metric("Avg official score", round(float(proj_df["Official Play Score"].mean()), 1))
-            for _, r in proj_df.head(80).iterrows():
-                render_card(r)
-            with st.expander("Table view"):
-                show_cols = ["Player", "Market", "Line", "Source", "Projection", "Edge", "Lean", "Official", "Official Play Score", "PASS Reason", "Underdog Line", "Sleeper Line", "Best Over Line", "Best Under Line", "Over %", "Under %", "L5 Hit%", "L10 Hit%", "L20 Hit%", "MIN Proj", "Role Confidence", "Minutes Safety", "Data Score", "Bayesian Confidence", "Team Pace", "Team ORtg", "Team DRtg", "Team Net", "Team Matchup Strength", "Lineup Continuity", "Shot Profile", "Rim Rate", "3PA Rate", "Shot Make Rate"]
-                st.dataframe(proj_df[[c for c in show_cols if c in proj_df.columns]], use_container_width=True)
-                st.download_button("Download projection board CSV", proj_df.to_csv(index=False), "wnba_projection_board.csv", "text/csv")
-        else:
-            st.warning("Lines loaded, but projection board could not be built. Check player-name matching and Data Manager.")
+        if "wnba_lines_all" in st.session_state:
+            del st.session_state["wnba_lines_all"]
+        st.success("Manual lines saved. Refresh board lines to include them.")
 
 with tabs[3]:
     st.subheader("Research Hub")
@@ -1871,7 +2028,10 @@ with tabs[5]:
     board_path = CACHE_FILES["projection_board"]
     if board_path.exists() and not logs_global.empty and not master_global.empty:
         board_cache = pd.read_csv(board_path)
-        proj_df = make_projection_board(board_cache, logs_global, master_global)
+        if "Projection" in board_cache.columns:
+            proj_df = board_cache
+        else:
+            proj_df = make_projection_board(board_cache, logs_global, master_global)
         if st.button("Save official plays before games"):
             n = save_officials(proj_df)
             st.success(f"Saved {n} official plays.")
@@ -1921,7 +2081,7 @@ with tabs[7]:
     st.markdown("### Data status")
     st.dataframe(dataset_status_table(), use_container_width=True)
     st.markdown("### Aggregated lines")
-    lines, ud_debug, sl_debug = aggregate_lines(use_ud=use_ud, use_sleeper=use_sleeper, manual_df=load_manual_lines())
+    lines, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud, use_sleeper)
     st.dataframe(lines, use_container_width=True)
     st.markdown("### Underdog debug")
     st.dataframe(ud_debug, use_container_width=True)
