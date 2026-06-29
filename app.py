@@ -31,7 +31,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v1.7 — Underdog Decode Mode + Strict Live Line Matching"
+APP_VERSION = "WNBA v1.8 — Refresh Today Matchup Resolver + Underdog Mainline Lock"
 
 # ============================================================
 # Storage
@@ -2582,24 +2582,57 @@ def injury_ripple_engine(row: Dict[str, Any], base_row: pd.Series) -> Dict[str, 
 
 
 def opponent_lineup_adjustment(row: Dict[str, Any], base_row: pd.Series) -> Dict[str, Any]:
-    gr = load_dataset("game_rosters")
-    market = str(row.get("Market", "")); opp = str(row.get("Opponent", ""))
-    if gr.empty or not opp:
-        return {"Opponent Lineup Adj": 0.0, "Opponent Lineup Note": "Opponent lineup unavailable."}
-    d = gr.copy()
-    if "Team" not in d.columns:
-        return {"Opponent Lineup Adj": 0.0, "Opponent Lineup Note": "Opponent lineup unavailable."}
-    od = d[d["Team"].astype(str).str.upper().map(team_abbrev) == team_abbrev(opp)].copy()
+    """Opponent active/projected lineup proxy.
+
+    The engine should never imply matchup context is totally missing when the
+    schedule has already resolved an opponent. If game_rosters is unavailable,
+    fall back to rosters/master_features for a projected opponent rotation mix.
+    """
+    market = str(row.get("Market", ""))
+    opp = _team_key_for_matchup(row.get("Opponent")) or team_abbrev(str(row.get("Opponent", "")))
+    if not opp:
+        return {"Opponent Lineup Adj": 0.0, "Opponent Lineup Note": "Opponent unavailable; team-defense matchup only."}
+
+    source = "game roster"
+    d = load_dataset("game_rosters")
+    if d.empty or "Team" not in d.columns:
+        d = load_dataset("lineups")
+        source = "projected lineup"
+    if d.empty or "Team" not in d.columns:
+        d = load_dataset("rosters")
+        source = "roster fallback"
+    if d.empty or "Team" not in d.columns:
+        d = load_dataset("master_features")
+        source = "master player fallback"
+
+    if d is None or d.empty or "Team" not in d.columns:
+        return {"Opponent Lineup Adj": 0.0, "Opponent Lineup Note": f"Opponent {opp} matched from schedule; no roster table loaded, using team pace/defense only."}
+
+    od = d[d["Team"].astype(str).map(_team_key_for_matchup) == opp].copy()
     if od.empty:
-        return {"Opponent Lineup Adj": 0.0, "Opponent Lineup Note": "No matched opponent active roster."}
-    # Defensive size/position proxy from active opponent roster.
-    bigs = od.get("PositionGroup", pd.Series(dtype=str)).astype(str).str.contains("Big", na=False).mean() if "PositionGroup" in od.columns else np.nan
-    guards = od.get("PositionGroup", pd.Series(dtype=str)).astype(str).str.contains("Guard", na=False).mean() if "PositionGroup" in od.columns else np.nan
+        return {"Opponent Lineup Adj": 0.0, "Opponent Lineup Note": f"Opponent {opp} matched from schedule; no active roster rows, using team pace/defense only."}
+
+    # Prefer higher-minute/role players when using broad roster/master fallback.
+    if source in ["roster fallback", "master player fallback"]:
+        sort_cols = [c for c in ["MIN_l10", "MIN_avg", "RoleConfidence", "DataScore"] if c in od.columns]
+        if sort_cols:
+            od = od.sort_values(sort_cols, ascending=False).head(8).copy()
+
+    pos = od.get("PositionGroup", pd.Series(dtype=str)).astype(str) if "PositionGroup" in od.columns else pd.Series(dtype=str)
+    if pos.empty and "Position" in od.columns:
+        pos = od["Position"].map(position_group).astype(str)
+    bigs = pos.str.contains("Big", na=False).mean() if len(pos) else np.nan
+    guards = pos.str.contains("Guard", na=False).mean() if len(pos) else np.nan
+
     adj = 0.0
     if market == "REB" and pd.notna(bigs): adj += max(-0.20, min(0.20, (0.30 - bigs) * 0.7))
     if market == "AST" and pd.notna(guards): adj += max(-0.15, min(0.15, (guards - 0.35) * 0.35))
     if market == "PTS" and pd.notna(bigs): adj += max(-0.12, min(0.12, (0.28 - bigs) * 0.4))
-    return {"Opponent Lineup Adj": round(float(adj), 3), "Opponent Lineup Note": f"Opponent roster mix: Big {bigs:.0%} / Guard {guards:.0%}" if pd.notna(bigs) or pd.notna(guards) else "Opponent position mix unavailable."}
+    if pd.notna(bigs) or pd.notna(guards):
+        note = f"Opponent {opp} {source} loaded: Big {bigs:.0%} / Guard {guards:.0%}"
+    else:
+        note = f"Opponent {opp} matched from schedule; roster loaded but position mix unavailable."
+    return {"Opponent Lineup Adj": round(float(adj), 3), "Opponent Lineup Note": note}
 
 
 def build_training_frame_from_logs(logs: pd.DataFrame, market: str) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
@@ -3938,6 +3971,156 @@ def schedule_for_slate(mode: str) -> pd.DataFrame:
     return sched[keep].sort_values("GameDate") if keep else sched
 
 
+
+
+def _espn_team_abbrev_from_competitor(comp: Dict[str, Any]) -> str:
+    team = comp.get("team", {}) if isinstance(comp, dict) else {}
+    for k in ["abbreviation", "shortDisplayName", "displayName", "name", "location"]:
+        val = team.get(k)
+        key = _team_key_for_matchup(val)
+        if key:
+            return key
+    return ""
+
+
+def fetch_espn_wnba_schedule_for_date(target_date: date) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Pull WNBA schedule from ESPN scoreboard for one date.
+
+    Returns standardized schedule rows plus a debug table. This is intentionally
+    lightweight and only updates the schedule cache; it does not touch lines.
+    """
+    if target_date is None:
+        return pd.DataFrame(), pd.DataFrame([{"step":"espn_schedule", "status":"skipped", "message":"no target date"}])
+    ymd = target_date.strftime("%Y%m%d")
+    url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard?dates={ymd}"
+    dbg = []
+    try:
+        r = requests.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0"})
+        dbg.append({"step":"espn_schedule", "status":f"HTTP {r.status_code}", "message":url})
+        if r.status_code != 200:
+            return pd.DataFrame(), pd.DataFrame(dbg)
+        js = r.json()
+    except Exception as e:
+        dbg.append({"step":"espn_schedule", "status":"error", "message":str(e)[:220]})
+        return pd.DataFrame(), pd.DataFrame(dbg)
+
+    rows = []
+    for ev in js.get("events", []) or []:
+        comp = (ev.get("competitions") or [{}])[0]
+        competitors = comp.get("competitors", []) or []
+        home = away = ""
+        hs = as_ = np.nan
+        for c in competitors:
+            side = str(c.get("homeAway", "")).lower()
+            ab = _espn_team_abbrev_from_competitor(c)
+            score = safe_float(c.get("score"), np.nan)
+            if side == "home":
+                home, hs = ab, score
+            elif side == "away":
+                away, as_ = ab, score
+        if home or away:
+            rows.append({
+                "GameDate": pd.to_datetime(ev.get("date") or comp.get("date") or str(target_date), errors="coerce"),
+                "Season": target_date.year,
+                "GameID": ev.get("id") or comp.get("id") or "",
+                "Home": home,
+                "Away": away,
+                "HomeScore": hs,
+                "AwayScore": as_,
+                "Source": "ESPN",
+            })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["Margin"] = pd.to_numeric(out["HomeScore"], errors="coerce") - pd.to_numeric(out["AwayScore"], errors="coerce")
+    dbg.append({"step":"espn_schedule", "status":"parsed", "message":f"{len(out)} game(s) for {target_date}"})
+    return out, pd.DataFrame(dbg)
+
+
+def update_schedule_cache_with_espn(mode: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    target = slate_target_date(mode)
+    if target is None:
+        return schedule_for_slate(mode), pd.DataFrame([{"step":"schedule_cache", "status":"skipped", "message":"All Lines mode"}])
+    espn, dbg = fetch_espn_wnba_schedule_for_date(target)
+    if espn is None or espn.empty:
+        return schedule_for_slate(mode), dbg
+    old = load_dataset("schedules")
+    keep_old = old.copy() if old is not None and not old.empty else pd.DataFrame()
+    if not keep_old.empty and "GameDate" in keep_old.columns:
+        old_dates = pd.to_datetime(keep_old["GameDate"], errors="coerce").dt.date
+        keep_old = keep_old[old_dates != target].copy()
+    combined = pd.concat([keep_old, espn], ignore_index=True, sort=False) if not keep_old.empty else espn.copy()
+    save_dataset("schedules", standardize_schedules(combined))
+    return schedule_for_slate(mode), dbg
+
+
+def refresh_today_pipeline(mode: str, use_ud_flag: bool = True) -> Dict[str, Any]:
+    """One-click slate refresh: schedule → matchup map → Underdog → projections.
+
+    This deliberately calls the existing working Underdog parser instead of
+    rewriting it, so the main-line pull stays intact.
+    """
+    started = time.time()
+    status = {
+        "Mode": mode,
+        "Schedule Loaded": "NO",
+        "Today's Games": 0,
+        "Matchups Assigned": 0,
+        "Underdog Lines": 0,
+        "Manual Lines": 0,
+        "Projection Cards Built": 0,
+        "Status": "started",
+    }
+    sched, sched_dbg = update_schedule_cache_with_espn(mode)
+    status["Today's Games"] = 0 if sched is None or sched.empty else len(sched)
+    status["Schedule Loaded"] = "YES" if status["Today's Games"] else "NO/CACHED"
+    matchup_lookup = _slate_matchup_lookup(mode)
+    status["Matchups Assigned"] = len(matchup_lookup)
+
+    clear_line_pull_caches()
+    lines_all, ud_debug, manual_debug = pull_board_lines(use_ud_flag, False, False, "")
+    lines, _ = filter_lines_for_slate(lines_all, mode)
+    status["Underdog Lines"] = int((lines.get("Source", pd.Series(dtype=str)).astype(str) == "Underdog").sum()) if lines is not None and not lines.empty else 0
+    status["Manual Lines"] = int((lines.get("Source", pd.Series(dtype=str)).astype(str) == "Manual").sum()) if lines is not None and not lines.empty else 0
+
+    logs = load_dataset("player_game_logs")
+    master = load_dataset("master_features")
+    if master.empty and not logs.empty:
+        try:
+            master, _ = build_master_features()
+        except Exception:
+            master = pd.DataFrame()
+    if lines is not None and not lines.empty and not logs.empty and not master.empty:
+        try:
+            board = make_projection_board(lines, logs, master)
+            board = enrich_board_with_matchups(board, mode)
+            board = apply_matchup_context_to_board(board)
+            save_dataset("projection_board", board)
+            status["Projection Cards Built"] = 0 if board is None or board.empty else len(board)
+            status["Status"] = "complete"
+        except Exception as e:
+            status["Status"] = f"projection error: {str(e)[:140]}"
+    else:
+        status["Status"] = "lines/database missing; baseline cards still available"
+    status["Refresh Seconds"] = round(time.time() - started, 2)
+    st.session_state["wnba_refresh_today_status"] = status
+    st.session_state["wnba_schedule_debug"] = sched_dbg
+    return status
+
+
+def render_refresh_today_status():
+    status = st.session_state.get("wnba_refresh_today_status")
+    if not status:
+        return
+    st.markdown("### Today's Refresh Status")
+    cols = st.columns(6)
+    cols[0].metric("Schedule", status.get("Schedule Loaded", "NO"))
+    cols[1].metric("Games", status.get("Today's Games", 0))
+    cols[2].metric("Matchup Teams", status.get("Matchups Assigned", 0))
+    cols[3].metric("Underdog", status.get("Underdog Lines", 0))
+    cols[4].metric("Manual", status.get("Manual Lines", 0))
+    cols[5].metric("Cards", status.get("Projection Cards Built", 0))
+    st.caption(f"Status: {status.get('Status')} | Refresh seconds: {status.get('Refresh Seconds', '-')}")
+
 def clear_line_pull_caches():
     for fn in [fetch_underdog_board]:
         try:
@@ -4707,9 +4890,14 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     market_key = force_market or "ALL"
     top_cols = st.columns([1.1, 1.1, 1.2, 1.2, 2.0])
     with top_cols[0]:
-        if st.button(f"🔄 Refresh {mode} Lines", key=f"refresh_{mode}_{market_key}"):
-            clear_line_pull_caches()
-            pull_board_lines(use_ud_flag, False, False, "")
+        btn_label = "🔄 Refresh Today" if mode == "Today" else f"🔄 Refresh {mode} Lines"
+        if st.button(btn_label, key=f"refresh_{mode}_{market_key}"):
+            if mode == "Today":
+                with st.spinner("Refreshing today's schedule, matchups, Underdog lines, and projections..."):
+                    refresh_today_pipeline("Today", use_ud_flag)
+            else:
+                clear_line_pull_caches()
+                pull_board_lines(use_ud_flag, False, False, "")
             st.rerun()
     with top_cols[1]:
         if st.button(f"🧱 Rebuild {mode} Board", key=f"rebuild_{mode}_{market_key}"):
@@ -4841,6 +5029,10 @@ with st.sidebar:
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
     st.markdown("**Model:** Monte Carlo + Bayesian confidence + XGBoost-style blend")
     st.divider()
+    if st.button("🔄 Refresh Today", use_container_width=True, type="primary"):
+        with st.spinner("Refreshing schedule → matchup → Underdog lines → projections..."):
+            refresh_today_pipeline("Today", use_ud)
+        st.rerun()
     if st.button("🔄 Refresh board lines", use_container_width=True):
         clear_line_pull_caches()
         pull_board_lines(use_ud, False, False, "")
@@ -4872,6 +5064,7 @@ try:
 except Exception:
     hero_board_rows = hero_real_lines = hero_no_line = hero_strong = 0
 hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
+render_refresh_today_status()
 
 tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
 
