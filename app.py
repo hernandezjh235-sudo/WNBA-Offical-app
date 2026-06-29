@@ -1390,12 +1390,117 @@ def fetch_underdog_board():
                     return str(a.get(k))
         return ""
 
+    def known_player_records():
+        """Known WNBA players from the local feature/stat caches.
+
+        Underdog sometimes returns abbreviated display text or internal ids in the
+        fields we first inspect. Matching the full raw prop JSON against our known
+        player list prevents fake names like `ju4nn` or `none sh1n` from entering
+        the projection board.
+        """
+        frames = []
+        for key in ["master_features", "player_game_logs", "player_season_stats", "rosters"]:
+            try:
+                d = load_dataset(key)
+                if d is not None and not d.empty and "Player" in d.columns:
+                    cols = [c for c in ["Player", "Team", "Position", "PositionGroup"] if c in d.columns]
+                    frames.append(d[cols].copy())
+            except Exception:
+                pass
+        if not frames:
+            return []
+        kp = pd.concat(frames, ignore_index=True, sort=False)
+        kp["Player"] = kp["Player"].fillna("").astype(str)
+        kp["NameKey"] = kp["Player"].map(normalize_name)
+        kp = kp[kp["NameKey"].str.len() > 0].copy()
+        kp["Team"] = kp.get("Team", "").fillna("").astype(str).str.upper()
+        kp = kp.drop_duplicates("NameKey", keep="last")
+        last_counts = kp["NameKey"].map(lambda x: x.split()[-1] if x.split() else "").value_counts().to_dict()
+        records = []
+        for _, r in kp.iterrows():
+            toks = str(r.get("NameKey", "")).split()
+            if len(toks) < 2:
+                continue
+            records.append({
+                "Player": str(r.get("Player", "")),
+                "NameKey": str(r.get("NameKey", "")),
+                "Team": str(r.get("Team", "")),
+                "FirstInitial": toks[0][0] if toks[0] else "",
+                "Last": toks[-1],
+                "LastUnique": last_counts.get(toks[-1], 0) == 1,
+            })
+        return records
+
+    KNOWN_PLAYERS = known_player_records()
+
+    def bad_player_candidate(player):
+        nk = normalize_name(player)
+        if not nk or len(nk.split()) < 2:
+            return True
+        if re.search(r"\d", str(player or "")):
+            return True
+        bad_tokens = {"none", "null", "country", "player", "players", "over", "under", "higher", "lower", "wnba", "basketball"}
+        toks = set(nk.split())
+        if toks.intersection(bad_tokens):
+            return True
+        # Internal ids/slugs often have no normal full-name shape.
+        if any(len(t) <= 1 for t in toks):
+            return True
+        return False
+
+    def resolve_known_player(raw_text, candidate="", team_hint=""):
+        raw_text = str(raw_text or "")
+        raw_norm = normalize_name(raw_text)
+        team_hint = str(team_hint or "").upper().strip()
+
+        # If a candidate looks valid, map it back to the official cached name.
+        if candidate and not bad_player_candidate(candidate):
+            cand_key = normalize_name(candidate)
+            best, best_score = None, 0.0
+            for rec in KNOWN_PLAYERS:
+                sc = name_score(cand_key, rec["NameKey"])
+                if team_hint and rec.get("Team") == team_hint:
+                    sc += 0.03
+                if sc > best_score:
+                    best, best_score = rec, sc
+            if best and best_score >= 0.86:
+                return best["Player"], best.get("Team", team_hint)
+            return candidate, team_hint
+
+        # Full-name containment.
+        for rec in KNOWN_PLAYERS:
+            nk = rec["NameKey"]
+            if nk and nk in raw_norm:
+                return rec["Player"], rec.get("Team", team_hint)
+
+        # Underdog cards often show initials like J. Young -> normalized `j young`.
+        best, best_score = None, 0.0
+        for rec in KNOWN_PLAYERS:
+            abbrev = f"{rec['FirstInitial']} {rec['Last']}".strip()
+            score = 0.0
+            if abbrev and abbrev in raw_norm:
+                score = 0.94
+            elif rec["LastUnique"] and re.search(rf"\b{re.escape(rec['Last'])}\b", raw_norm):
+                score = 0.88
+            if team_hint and rec.get("Team") == team_hint:
+                score += 0.04
+            if score > best_score:
+                best, best_score = rec, score
+        if best and best_score >= 0.88:
+            return best["Player"], best.get("Team", team_hint)
+
+        return "", team_hint
+
     def add_row(player, team, market, line, source_mode, raw, start=""):
-        if not player or market not in MARKETS or pd.isna(line):
+        if market not in MARKETS or pd.isna(line):
+            return
+        resolved_player, resolved_team = resolve_known_player(raw, candidate=player, team_hint=team)
+        if not resolved_player or bad_player_candidate(resolved_player):
+            # Keep fake Underdog ids out of the board. They can still be inspected in Raw/debug.
             return
         rows.append({
-            "Player": str(player),
-            "Team": str(team or ""),
+            "Player": str(resolved_player),
+            "Team": str(resolved_team or team or ""),
             "Opponent": "",
             "Market": market,
             "Line": float(line),
@@ -1513,6 +1618,11 @@ def fetch_underdog_board():
     if rows:
         df = pd.DataFrame(rows)
         df["NameKey"] = df["Player"].map(normalize_name)
+        # Final safety: remove any internal ids/slugs that slipped through.
+        df = df[~df["Player"].map(bad_player_candidate)].copy()
+        if df.empty:
+            debug.append({"source": "Underdog", "url": "parser", "status": "name-match failed", "rows": 0, "message": "Lines parsed, but no Underdog player names matched cached WNBA players"})
+            return pd.DataFrame(columns=["Player", "Team", "Opponent", "Market", "Line", "Source", "Start", "Raw", "Parser Mode", "NameKey"]), pd.DataFrame(debug)
         df = df.sort_values(["NameKey", "Market", "Line"]).drop_duplicates(subset=["NameKey", "Market", "Line", "Source"], keep="first")
         return df.reset_index(drop=True), pd.DataFrame(debug)
 
