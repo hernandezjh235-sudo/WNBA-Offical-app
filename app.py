@@ -66,6 +66,12 @@ CACHE_FILES = {
     "projection_board": DATA_DIR / "wnba_projection_board.csv",
 }
 
+# Persistent board snapshots. These let the app reopen to the last saved board
+# without pulling Underdog or rebuilding projections first.
+SAVED_BOARD_FILE = DATA_DIR / "wnba_saved_board_snapshot.csv"
+SAVED_LINES_FILE = DATA_DIR / "wnba_saved_lines_snapshot.csv"
+SAVED_BOARD_META_FILE = LOCAL_DIR / "wnba_saved_board_meta.json"
+
 
 # Optional GitHub/raw cache support.
 # If you commit CSV caches into GitHub, the app will read them first from the
@@ -310,6 +316,73 @@ def save_json(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def save_board_snapshot(board_df: pd.DataFrame, lines_df: Optional[pd.DataFrame] = None, mode: str = "Today") -> int:
+    """Persist the current projection board + line snapshot so it reloads after app restart.
+
+    This mirrors the MLB flow: pull lines once, inspect the board, click Save Board,
+    then reopening the app can show the saved slate immediately without a fresh API pull.
+    """
+    try:
+        if board_df is None or board_df.empty:
+            return 0
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        out = board_df.copy()
+        out["SavedBoardAt"] = now_iso()
+        out["SavedBoardMode"] = mode
+        out.to_csv(SAVED_BOARD_FILE, index=False)
+        # Keep the normal projection cache synced too.
+        try:
+            out.to_csv(CACHE_FILES["projection_board"], index=False)
+        except Exception:
+            pass
+        if lines_df is not None and not lines_df.empty:
+            ldf = lines_df.copy()
+            ldf["SavedBoardAt"] = out["SavedBoardAt"].iloc[0]
+            ldf["SavedBoardMode"] = mode
+            ldf.to_csv(SAVED_LINES_FILE, index=False)
+        meta = {
+            "SavedAt": out["SavedBoardAt"].iloc[0],
+            "Mode": mode,
+            "Rows": int(len(out)),
+            "Players": int(out["Player"].nunique()) if "Player" in out.columns else int(len(out)),
+            "Markets": sorted(out["Market"].astype(str).str.upper().dropna().unique().tolist()) if "Market" in out.columns else [],
+        }
+        save_json(SAVED_BOARD_META_FILE, meta)
+        return int(len(out))
+    except Exception:
+        return 0
+
+
+def load_board_snapshot(mode: str = "Today") -> pd.DataFrame:
+    """Load the saved board snapshot. This should not call any external APIs."""
+    try:
+        if not SAVED_BOARD_FILE.exists():
+            return pd.DataFrame()
+        df = pd.read_csv(SAVED_BOARD_FILE)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if mode != "All Lines" and "Slate" in df.columns:
+            dff = df[df["Slate"].astype(str).str.lower().eq(str(mode).lower())].copy()
+            if not dff.empty:
+                df = dff
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_saved_lines_snapshot() -> pd.DataFrame:
+    try:
+        if SAVED_LINES_FILE.exists():
+            return pd.read_csv(SAVED_LINES_FILE)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def saved_board_meta() -> Dict[str, Any]:
+    return load_json(SAVED_BOARD_META_FILE, {})
 
 
 def safe_float(x, default=np.nan):
@@ -7052,23 +7125,91 @@ def render_grouped_player_card(player_df: pd.DataFrame):
         st.dataframe(player_df[show_cols], use_container_width=True, hide_index=True)
 
 
+
+def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: str, max_key: str, official_key: str, saved_view: bool = False) -> pd.DataFrame:
+    """Render an already-built projection board as grouped player cards."""
+    if proj_df is None or proj_df.empty:
+        st.info("No rows to show.")
+        return pd.DataFrame()
+    search = st.text_input("Search player", key=search_key)
+    official_only = st.toggle("Official / strong signals only", value=False, key=official_key)
+    max_players = st.slider("Max player cards", 10, 120, 40, 5, key=max_key)
+    view_df = proj_df.copy()
+    if search and "Player" in view_df.columns:
+        view_df = view_df[view_df["Player"].astype(str).str.contains(search, case=False, na=False)]
+    if official_only and "Official" in view_df.columns:
+        view_df = view_df[view_df["Official"].astype(str).str.contains("OVER|UNDER", na=False)]
+
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Players", view_df["Player"].nunique() if "Player" in view_df.columns else 0)
+    c2.metric("Markets", len(view_df))
+    c3.metric("Official plays", int(view_df.get("Official", pd.Series(dtype=str)).astype(str).str.contains("OVER|UNDER", na=False).sum()))
+    c4.metric("Avg edge", round(float(pd.to_numeric(view_df.get("Edge", pd.Series(dtype=float)), errors="coerce").abs().mean()), 2) if not view_df.empty else 0)
+
+    ac1, ac2, ac3 = st.columns([1.2,1.2,1.4])
+    with ac1:
+        if st.button(f"✅ Save {mode} Official Before", key=f"group_save_before_{mode}_{'saved' if saved_view else 'live'}", use_container_width=True):
+            n = save_officials(view_df); st.success(f"Saved {n} official plays for {mode}.")
+    with ac2:
+        if st.button(f"📊 Grade After Results", key=f"group_grade_after_{mode}_{'saved' if saved_view else 'live'}", use_container_width=True):
+            n = grade_pending(load_dataset("player_game_logs")); st.success(f"Graded {n} pending plays.")
+    with ac3:
+        st.download_button(f"Download {mode} Board CSV", view_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ','_')}_grouped_board.csv", "text/csv", key=f"group_dl_{mode}_{'saved' if saved_view else 'live'}")
+
+    if view_df.empty:
+        st.info("No rows after filters.")
+        return view_df
+    sort_df = view_df.copy()
+    sort_df["_abs_edge"] = pd.to_numeric(sort_df.get("Edge", np.nan), errors="coerce").abs()
+    sort_df["_score"] = pd.to_numeric(sort_df.get("Official Play Score", np.nan), errors="coerce")
+    player_order = sort_df.groupby("Player", dropna=False).agg(MaxScore=("_score","max"), MaxEdge=("_abs_edge","max")).reset_index().sort_values(["MaxScore","MaxEdge"], ascending=False)["Player"].head(max_players).tolist()
+    for player in player_order:
+        render_grouped_player_card(view_df[view_df["Player"] == player])
+    return view_df
+
 def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame):
     st.markdown(f"<div class='section-title'>{mode} — Grouped Player Cards</div>", unsafe_allow_html=True)
     top_cols = st.columns([1.2, 1.0, 1.0, 2.0])
     with top_cols[0]:
-        refresh_label = "🔄 Refresh Today — All-in-One" if mode == "Today" else f"🔄 Refresh {mode} — All-in-One"
+        refresh_label = "🔄 Refresh Live Today" if mode == "Today" else f"🔄 Refresh Live {mode}"
         if st.button(refresh_label, key=f"group_refresh_{mode}", use_container_width=True):
+            st.session_state[f"wnba_force_live_{mode}"] = True
             if mode == "Today":
                 run_one_click_refresh_today(mode, use_ud_flag)
             else:
                 clear_line_pull_caches(); pull_board_lines(use_ud_flag, False, False, ""); st.session_state["wnba_last_refresh"] = now_iso()
             st.rerun()
     with top_cols[1]:
-        st.metric("Last refresh", st.session_state.get("wnba_last_refresh", "not yet"))
+        meta = saved_board_meta()
+        st.metric("Last refresh", st.session_state.get("wnba_last_refresh", meta.get("SavedAt", "not yet")))
     with top_cols[2]:
         st.metric("Database players", 0 if master_global is None or master_global.empty else len(master_global))
     with top_cols[3]:
-        st.caption("Grouped layout: one player card contains PTS / REB / AST / PRA so we do not render duplicate player cards across market tabs.")
+        st.caption("Grouped layout: one player card contains PTS / REB / AST / PRA. Save Board lets this page reopen instantly without pulling lines again.")
+
+    # MLB-style persistence: if a board was saved, show it immediately on app open
+    # without calling Underdog or rebuilding the database. Refresh Live overrides this.
+    saved_df = load_board_snapshot(mode)
+    force_live = bool(st.session_state.get(f"wnba_force_live_{mode}", False))
+    if not force_live and saved_df is not None and not saved_df.empty:
+        meta = saved_board_meta()
+        st.success(f"Loaded saved board from {meta.get('SavedAt', 'saved snapshot')} — no live refresh needed.")
+        bc1, bc2, bc3 = st.columns([1.2, 1.2, 1.4])
+        with bc1:
+            if st.button("🔄 Refresh live lines", key=f"saved_refresh_live_{mode}", use_container_width=True):
+                st.session_state[f"wnba_force_live_{mode}"] = True
+                st.rerun()
+        with bc2:
+            if st.button("🧹 Clear saved board", key=f"clear_saved_board_{mode}", use_container_width=True):
+                for _p in [SAVED_BOARD_FILE, SAVED_LINES_FILE, SAVED_BOARD_META_FILE]:
+                    try:
+                        if _p.exists(): _p.unlink()
+                    except Exception: pass
+                st.success("Saved board cleared.")
+                st.rerun()
+        with bc3:
+            st.caption("Saved boards stay available after closing/reopening the app as long as Streamlit keeps the app files/cache.")
+        return _render_grouped_projection_df(saved_df, mode, f"saved_group_search_{mode}", f"saved_group_max_{mode}", f"saved_group_official_only_{mode}", saved_view=True)
 
     lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, False, False, "")
     lines, slate_note = filter_lines_for_slate(lines_all, mode)
@@ -7103,6 +7244,16 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     proj_df = apply_daily_team_context_v2_to_board(proj_df)
     CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
     proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
+
+    # Current live board is now built; allow user to persist it for instant reload later.
+    save_cols = st.columns([1.2, 2.8])
+    with save_cols[0]:
+        if st.button("💾 Save Board", key=f"save_board_snapshot_{mode}", use_container_width=True):
+            n = save_board_snapshot(proj_df, lines_all, mode)
+            st.session_state[f"wnba_force_live_{mode}"] = False
+            st.success(f"Saved {n:,} board rows. Next app open will load this board without refreshing.")
+    with save_cols[1]:
+        st.caption("Save Board keeps the pulled lines + projections available after closing/reopening, similar to the MLB app.")
 
     if search:
         proj_df = proj_df[proj_df["Player"].astype(str).str.contains(search, case=False, na=False)]
