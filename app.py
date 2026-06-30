@@ -365,8 +365,15 @@ def load_board_snapshot(mode: str = "Today") -> pd.DataFrame:
             return pd.DataFrame()
         if mode != "All Lines" and "Slate" in df.columns:
             dff = df[df["Slate"].astype(str).str.lower().eq(str(mode).lower())].copy()
-            if not dff.empty:
-                df = dff
+            # Important: never fall back to an All Lines / other-day snapshot when
+            # the user is viewing Today or Tomorrow. This prevents old/future
+            # props from leaking into the wrong slate after app restart.
+            return dff if not dff.empty else pd.DataFrame()
+        if mode != "All Lines" and "SlateDate" in df.columns:
+            target = slate_target_date(mode) if "slate_target_date" in globals() else None
+            if target is not None:
+                dff = df[df["SlateDate"].astype(str).eq(str(target))].copy()
+                return dff if not dff.empty else pd.DataFrame()
         return df
     except Exception:
         return pd.DataFrame()
@@ -3707,7 +3714,7 @@ def latest_closing_line_for_pick(player: str, market: str, saved_at: str = "", s
     return safe_float(h.iloc[-1].get("Line"), np.nan)
 
 
-def grade_pending(logs):
+def grade_pending(logs, mode: Optional[str] = None):
     """Auto-grade pending official plays using imported player logs.
 
     This version is safer than the original:
@@ -3722,6 +3729,8 @@ def grade_pending(logs):
     if logs.empty or "GameDate" not in logs.columns:
         return 0
     logs["GameDate"] = pd.to_datetime(logs["GameDate"], errors="coerce")
+    grade_target_date = slate_target_date(mode) if mode in ["Today", "Tomorrow"] else None
+    now_ts = pd.Timestamp.now()
     updated = 0
     learn = load_json(LEARNING_LOG, [])
     existing_ids = set()
@@ -3730,6 +3739,35 @@ def grade_pending(logs):
     for row in official:
         if row.get("Result") != "PENDING":
             continue
+        # If grading from a Today/Tomorrow board, grade only that slate.
+        # This prevents one-game slates from grading tomorrow/future games or
+        # old saved boards that are still pending.
+        row_slate_date = None
+        for _dc in [row.get("SlateDate"), row.get("Start"), row.get("GameDate")]:
+            _dt = pd.to_datetime(_dc, errors="coerce")
+            if pd.notna(_dt):
+                row_slate_date = _dt.date()
+                break
+        if grade_target_date is not None:
+            if row_slate_date is None:
+                row["GradeNote"] = f"Skipped: slate date missing for {mode} grader."
+                continue
+            if row_slate_date != grade_target_date:
+                row["GradeNote"] = f"Skipped: saved for {row_slate_date}, not {mode} ({grade_target_date})."
+                continue
+        # Never grade a game that has not started yet.
+        _start_dt = pd.to_datetime(row.get("Start"), errors="coerce")
+        if pd.notna(_start_dt):
+            try:
+                _start_dt = _start_dt.tz_convert(None)
+            except Exception:
+                try:
+                    _start_dt = _start_dt.tz_localize(None)
+                except Exception:
+                    pass
+            if _start_dt > now_ts:
+                row["GradeNote"] = "Skipped: game has not started yet."
+                continue
         player_name = row.get("Matched Player") or row.get("Player")
         key = normalize_name(player_name)
         market = str(row.get("Market", "")).upper()
@@ -3748,7 +3786,13 @@ def grade_pending(logs):
                 cutoff = tmp.tz_convert(None) if getattr(tmp, 'tzinfo', None) else tmp
                 break
         d = d.sort_values("GameDate")
-        if pd.notna(cutoff):
+        if grade_target_date is not None:
+            d_same = d[d["GameDate"].dt.date == grade_target_date].copy()
+            if d_same.empty:
+                row["GradeNote"] = f"Skipped: no completed player log for {grade_target_date}."
+                continue
+            d = d_same
+        elif pd.notna(cutoff):
             d_after = d[d["GameDate"] >= cutoff - pd.Timedelta(hours=12)].copy()
             if not d_after.empty:
                 d = d_after
@@ -5270,9 +5314,20 @@ def line_start_date_series(df: pd.DataFrame) -> pd.Series:
 
 
 def _slate_team_set(mode: str) -> set:
-    """Return teams scheduled for the selected slate from cached/online schedule data."""
+    """Return teams scheduled for the selected slate.
+
+    This is stricter than the earlier version: for Today/Tomorrow it will try
+    cached SportsDataverse first, then ESPN schedule fallback. If no schedule
+    can be verified, the caller should not show all Underdog rows as today's
+    slate because that mixes today/tomorrow/future props.
+    """
     try:
         sched = schedule_for_slate(mode)
+        target = slate_target_date(mode)
+        if (sched is None or sched.empty) and target is not None and "fetch_espn_wnba_schedule_for_date" in globals():
+            espn, _dbg = fetch_espn_wnba_schedule_for_date(target)
+            if espn is not None and not espn.empty:
+                sched = espn.copy()
         if sched is None or sched.empty:
             return set()
         teams = set()
@@ -5285,35 +5340,67 @@ def _slate_team_set(mode: str) -> set:
 
 
 def filter_lines_for_slate(lines: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame, str]:
-    """Filter loaded sportsbook/manual lines to Today/Tomorrow when possible.
+    """Strictly filter sportsbook/manual lines to the selected slate.
 
-    Underdog WNBA rows often do not include reliable start times. When dates are
-    absent, use the slate schedule teams as the source of truth so Today does not
-    show lines for games outside today/tomorrow.
+    Fixes two issues:
+    1) Today and Tomorrow could mix when Underdog rows had no start time.
+    2) If schedule context is unavailable, the app used to show all lines for
+       Today/Tomorrow. Now it refuses to guess and asks you to use All Lines or
+       refresh schedule/context.
     """
     if lines is None or lines.empty:
         return pd.DataFrame(), "No loaded lines."
     if mode == "All Lines":
-        return lines, "All loaded lines shown."
+        return lines.copy(), "All loaded lines shown."
     target = slate_target_date(mode)
     if target is None:
-        return lines, "All loaded lines shown."
+        return lines.copy(), "All loaded lines shown."
+
     d = lines.copy()
+    slate_teams = _slate_team_set(mode)
     start_dates = line_start_date_series(d)
     has_dates = start_dates.notna()
+
+    keep = pd.Series(False, index=d.index)
+
+    # 1) Best case: rows have a real start date.
     if has_dates.any():
-        filtered = d[(start_dates == target) | (~has_dates & d.get("Source", "").astype(str).eq("Manual"))].copy()
-        # If some sportsbook rows have no start date, also keep them only when
-        # their team belongs to this slate.
-        slate_teams = _slate_team_set(mode)
-        if slate_teams and "Team" in filtered.columns:
-            filtered = filtered[filtered["Team"].astype(str).map(team_abbrev).isin(slate_teams) | filtered.get("Source", "").astype(str).eq("Manual")].copy()
-        return filtered, f"Filtered to {mode.lower()} ({target})."
-    slate_teams = _slate_team_set(mode)
-    if slate_teams and "Team" in d.columns:
-        filtered = d[d["Team"].astype(str).map(team_abbrev).isin(slate_teams) | d.get("Source", "").astype(str).eq("Manual")].copy()
-        return filtered, f"Filtered to {mode.lower()} by scheduled teams: {', '.join(sorted(slate_teams))}."
-    return d, f"No reliable start times or cached schedule teams were found, so all loaded lines are shown for {mode.lower()}."
+        keep = keep | (start_dates == target)
+
+    # 2) Manual rows intentionally saved for this exact slate/date.
+    src = d.get("Source", pd.Series("", index=d.index)).astype(str)
+    if "Start" in d.columns:
+        start_txt = d["Start"].astype(str)
+        keep = keep | ((src == "Manual") & (start_txt == str(target)))
+    if "SlateDate" in d.columns:
+        keep = keep | (d["SlateDate"].astype(str) == str(target))
+    if "Slate" in d.columns:
+        keep = keep | (d["Slate"].astype(str).str.lower() == str(mode).lower())
+
+    # 3) Underdog WNBA often lacks start time. In that case, only keep rows
+    # whose team/opponent/matchup belongs to the verified Today/Tomorrow teams.
+    if slate_teams:
+        team_match = pd.Series(False, index=d.index)
+        for c in ["Team", "Opponent"]:
+            if c in d.columns:
+                team_match = team_match | d[c].astype(str).map(team_abbrev).isin(slate_teams)
+        if "Matchup" in d.columns:
+            matchup_text = d["Matchup"].astype(str).str.upper()
+            mkeep = pd.Series(False, index=d.index)
+            for t in slate_teams:
+                mkeep = mkeep | matchup_text.str.contains(t, regex=False, na=False)
+            team_match = team_match | mkeep
+        # Only apply team fallback to rows without dates; dated rows must match target.
+        keep = keep | ((~has_dates) & team_match)
+
+    filtered = d[keep].copy()
+    if not filtered.empty:
+        if slate_teams:
+            return filtered, f"Filtered to {mode.lower()} ({target}) using schedule teams: {', '.join(sorted(slate_teams))}."
+        return filtered, f"Filtered to {mode.lower()} ({target}) using line start dates."
+
+    # Do not show every line as Today/Tomorrow when slate could not be verified.
+    return pd.DataFrame(), f"No verified {mode.lower()} lines found. Refresh Today/Tomorrow schedule first, or use All Lines to view the full board."
 
 
 def schedule_for_slate(mode: str) -> pd.DataFrame:
@@ -6619,8 +6706,8 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
             st.success(f"Saved {n} official plays for {mode}.")
     with action_cols[1]:
         if st.button(f"📊 Grade After Results", key=f"grade_after_{mode}_{market_key}"):
-            n = grade_pending(logs_global)
-            st.success(f"Graded {n} pending plays.")
+            n = grade_pending(logs_global, mode)
+            st.success(f"Graded {n} pending plays for {mode} only.")
     with action_cols[2]:
         st.download_button(f"Download {mode} Board CSV", proj_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ', '_')}_projection_board.csv", "text/csv", key=f"dl_{mode}_{market_key}")
     with action_cols[3]:
@@ -7214,7 +7301,7 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
             n = save_officials(view_df); st.success(f"Saved {n} official plays for {mode}.")
     with ac2:
         if st.button(f"📊 Grade After Results", key=f"{key_prefix}_grade_after", use_container_width=True):
-            n = grade_pending(load_dataset("player_game_logs")); st.success(f"Graded {n} pending plays.")
+            n = grade_pending(load_dataset("player_game_logs"), mode); st.success(f"Graded {n} pending plays for {mode} only.")
     with ac3:
         st.download_button(f"Download {mode} Board CSV", view_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ','_')}_board.csv", "text/csv", key=f"{key_prefix}_download")
 
@@ -7541,8 +7628,8 @@ with tabs[2]:
                 st.success(f"Saved {n} official plays.")
     with c2:
         if st.button("📊 Grade pending after results", use_container_width=True):
-            n = grade_pending(logs_global)
-            st.success(f"AutoGrader updated {n} pending plays from imported player logs.")
+            n = grade_pending(logs_global, "Today")
+            st.success(f"AutoGrader updated {n} pending plays for Today from imported player logs.")
     with c3:
         if board.empty:
             st.metric("Current board", 0)
