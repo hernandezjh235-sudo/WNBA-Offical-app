@@ -6955,6 +6955,188 @@ def get_team_logo_src(team: Any) -> str:
 st.markdown("<style>.owp-logo{display:none!important}.owp-card-main{gap:10px!important}</style>", unsafe_allow_html=True)
 
 
+
+
+# -----------------------------------------------------------------------------
+# Grouped Player Cards Board (single-player card with PTS/REB/AST/PRA rows)
+# -----------------------------------------------------------------------------
+def _fmt_num_compact(x, dec=1, default="—"):
+    try:
+        v = safe_float(x, np.nan)
+        if pd.isna(v):
+            return default
+        return f"{v:.{dec}f}"
+    except Exception:
+        return default
+
+
+def _grouped_market_html(r: pd.Series) -> str:
+    market = str(r.get("Market", "PROP")).upper()
+    proj = _fmt_num_compact(r.get("Projection"), 1)
+    line = _fmt_num_compact(r.get("Line"), 1)
+    edge_v = safe_float(r.get("Edge"), np.nan)
+    edge = _fmt_num_compact(edge_v, 1)
+    lean = str(r.get("Lean", "TRACK")).upper()
+    official = str(r.get("Official", ""))
+    side_txt = "OVER" if "OVER" in f"{lean} {official}" else "UNDER" if "UNDER" in f"{lean} {official}" else "TRACK"
+    side_cls = "over" if side_txt == "OVER" else "under" if side_txt == "UNDER" else "track"
+    overp = safe_float(r.get("Over %"), np.nan)
+    underp = safe_float(r.get("Under %"), np.nan)
+    fill = overp if pd.notna(overp) else (100-underp if pd.notna(underp) else 50)
+    fill = max(0, min(100, fill))
+    conf = _fmt_num_compact(r.get("Official Play Score"), 0)
+    tier = str(r.get("Tier", ""))
+    vol = str(r.get("Volatility", "NA"))
+    note = str(r.get("Biggest Positive", "") or r.get("Projection Explanation", ""))[:130]
+    edge_cls = "pos" if pd.notna(edge_v) and edge_v > 0 else "neg" if pd.notna(edge_v) and edge_v < 0 else "flat"
+    return f"""
+      <div class='owp-market-row owp-mkt-{market.lower()}'>
+        <div class='owp-market-head'>
+          <span class='owp-market-name'>{market}</span>
+          <span class='owp-market-vol'>{vol}</span>
+          <span class='owp-market-conf {side_cls}'>HIGH {conf}%</span>
+          <span class='owp-market-side {side_cls}'>{side_txt}</span>
+        </div>
+        <div class='owp-market-main'>
+          <span class='owp-market-proj'>{proj}</span>
+          <span class='owp-market-edge {edge_cls}'>{edge} vs {line}</span>
+          <span class='owp-market-tier'>{tier}</span>
+        </div>
+        <div class='owp-prob-track owp-market-track'><div class='owp-prob-fill' style='width:{fill:.0f}%'></div></div>
+        <div class='owp-market-sub'><span>OVER {_fmt_num_compact(overp,0)}%</span><span>UNDER {_fmt_num_compact(underp,0)}%</span></div>
+        <div class='owp-market-note'>{note}</div>
+      </div>
+    """
+
+
+def render_grouped_player_card(player_df: pd.DataFrame):
+    if player_df is None or player_df.empty:
+        return
+    # Sort markets in the normal board order.
+    order = {m:i for i,m in enumerate(MARKETS)}
+    player_df = player_df.copy()
+    player_df["_market_order"] = player_df.get("Market", "").astype(str).str.upper().map(order).fillna(99)
+    player_df = player_df.sort_values(["_market_order", "Line"])
+    first = player_df.iloc[0]
+    player = str(first.get("Player", "Player"))
+    team = str(first.get("Team", ""))
+    matchup = str(first.get("Matchup", "") or first.get("Projection Matchup Used", "") or team)
+    pos = str(first.get("PositionGroup", "Role"))
+    source_count = ", ".join(sorted(set(player_df.get("Source", pd.Series(dtype=str)).astype(str).replace("nan", "").tolist())))
+    role = str(first.get("FallbackLineupRole", first.get("Minutes Safety", "NA")))
+    min_proj = _fmt_num_compact(player_df.get("MIN Proj", pd.Series([np.nan])).max(), 1)
+    data_score = _fmt_num_compact(player_df.get("Data Score", pd.Series([np.nan])).max(), 0)
+    best = player_df.copy()
+    best["_abs_edge"] = pd.to_numeric(best.get("Edge", np.nan), errors="coerce").abs()
+    best = best.sort_values("_abs_edge", ascending=False).iloc[0]
+    best_mkt = str(best.get("Market", "PROP"))
+    best_side = "OVER" if "OVER" in str(best.get("Lean", "")).upper() else "UNDER" if "UNDER" in str(best.get("Lean", "")).upper() else "TRACK"
+    market_html = "".join(_grouped_market_html(r) for _, r in player_df.iterrows())
+    st.markdown(f"""
+    <div class='owp-group-card'>
+      <div class='owp-group-top'>
+        <div>
+          <div class='owp-player'>{player}</div>
+          <div class='owp-match'>{matchup} <span class='owp-muted'>| {team} | {pos}</span></div>
+          <span class='owp-pill owp-pill-source'>{source_count or 'Lines'}</span>
+          <span class='owp-pill owp-pill-role'>Lineup/Role {role}</span>
+          <span class='owp-pill owp-pill-score'>Data {data_score}/100</span>
+        </div>
+        <div class='owp-group-best'>Best: {best_mkt} {best_side}<br><span>Min {min_proj}</span></div>
+      </div>
+      {market_html}
+    </div>
+    """, unsafe_allow_html=True)
+    with st.expander(f"Advanced details — {player} all markets", expanded=False):
+        show_cols = [c for c in ["Market","Projection","Line","Edge","Lean","Over %","Under %","Official Play Score","Tier","Source","Opponent","HomeAway","Projection Explanation"] if c in player_df.columns]
+        st.dataframe(player_df[show_cols], use_container_width=True, hide_index=True)
+
+
+def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame):
+    st.markdown(f"<div class='section-title'>{mode} — Grouped Player Cards</div>", unsafe_allow_html=True)
+    top_cols = st.columns([1.2, 1.0, 1.0, 2.0])
+    with top_cols[0]:
+        refresh_label = "🔄 Refresh Today — All-in-One" if mode == "Today" else f"🔄 Refresh {mode} — All-in-One"
+        if st.button(refresh_label, key=f"group_refresh_{mode}", use_container_width=True):
+            if mode == "Today":
+                run_one_click_refresh_today(mode, use_ud_flag)
+            else:
+                clear_line_pull_caches(); pull_board_lines(use_ud_flag, False, False, ""); st.session_state["wnba_last_refresh"] = now_iso()
+            st.rerun()
+    with top_cols[1]:
+        st.metric("Last refresh", st.session_state.get("wnba_last_refresh", "not yet"))
+    with top_cols[2]:
+        st.metric("Database players", 0 if master_global is None or master_global.empty else len(master_global))
+    with top_cols[3]:
+        st.caption("Grouped layout: one player card contains PTS / REB / AST / PRA so we do not render duplicate player cards across market tabs.")
+
+    lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, False, False, "")
+    lines, slate_note = filter_lines_for_slate(lines_all, mode)
+    render_source_status_card(lines_all, ud_debug, sl_debug, False, "")
+    if mode == "Today":
+        render_refresh_today_status()
+    st.caption(slate_note)
+    sched = schedule_for_slate(mode)
+    if not sched.empty:
+        with st.expander(f"{mode} schedule context", expanded=False):
+            st.dataframe(sched, use_container_width=True)
+
+    if lines is None or lines.empty:
+        st.error("No Underdog or manual lines loaded for this slate. Use Data Manager/manual fallback, then refresh.")
+        return pd.DataFrame()
+    if logs_global.empty or master_global.empty:
+        st.warning("Player baselines are not loaded yet. Data Manager can rebuild them, or official WNBA fallback will try to build enough data to project.")
+
+    search = st.text_input("Search player", key=f"group_search_{mode}")
+    official_only = st.toggle("Official / strong signals only", value=False, key=f"group_official_only_{mode}")
+    max_players = st.slider("Max player cards", 10, 120, 40, 5, key=f"group_max_{mode}")
+    st.session_state["wnba_current_mode"] = mode
+
+    proj_df = make_projection_board(lines[lines["Market"].isin(MARKETS)], logs_global, master_global, mode)
+    if proj_df.empty:
+        st.warning("Lines loaded, but grouped projection board could not be built. Check name matching/Data Manager.")
+        return pd.DataFrame()
+    proj_df["Slate"] = mode
+    proj_df["SlateDate"] = str(slate_target_date(mode) or "ALL")
+    proj_df = enrich_board_with_matchups(proj_df, mode)
+    proj_df = apply_matchup_context_to_board(proj_df)
+    proj_df = apply_daily_team_context_v2_to_board(proj_df)
+    CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
+    proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
+
+    if search:
+        proj_df = proj_df[proj_df["Player"].astype(str).str.contains(search, case=False, na=False)]
+    if official_only and "Official" in proj_df.columns:
+        proj_df = proj_df[proj_df["Official"].astype(str).str.contains("OVER|UNDER", na=False)]
+
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Players", proj_df["Player"].nunique() if "Player" in proj_df.columns else 0)
+    c2.metric("Markets", len(proj_df))
+    c3.metric("Official plays", int(proj_df.get("Official", pd.Series(dtype=str)).astype(str).str.contains("OVER|UNDER", na=False).sum()))
+    c4.metric("Avg edge", round(float(pd.to_numeric(proj_df.get("Edge", pd.Series(dtype=float)), errors="coerce").abs().mean()), 2) if not proj_df.empty else 0)
+
+    ac1, ac2, ac3 = st.columns([1.2,1.2,1.4])
+    with ac1:
+        if st.button(f"✅ Save {mode} Official Before", key=f"group_save_before_{mode}", use_container_width=True):
+            n = save_officials(proj_df); st.success(f"Saved {n} official plays for {mode}.")
+    with ac2:
+        if st.button(f"📊 Grade After Results", key=f"group_grade_after_{mode}", use_container_width=True):
+            n = grade_pending(logs_global); st.success(f"Graded {n} pending plays.")
+    with ac3:
+        st.download_button(f"Download {mode} Grouped Board CSV", proj_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ','_')}_grouped_board.csv", "text/csv", key=f"group_dl_{mode}")
+
+    if proj_df.empty:
+        st.info("No rows after filters.")
+        return proj_df
+    # Sort players by their strongest absolute edge/official score, but render each player once.
+    sort_df = proj_df.copy()
+    sort_df["_abs_edge"] = pd.to_numeric(sort_df.get("Edge", np.nan), errors="coerce").abs()
+    sort_df["_score"] = pd.to_numeric(sort_df.get("Official Play Score", np.nan), errors="coerce")
+    player_order = sort_df.groupby("Player", dropna=False).agg(MaxScore=("_score","max"), MaxEdge=("_abs_edge","max")).reset_index().sort_values(["MaxScore","MaxEdge"], ascending=False)["Player"].head(max_players).tolist()
+    for player in player_order:
+        render_grouped_player_card(proj_df[proj_df["Player"] == player])
+    return proj_df
+
 def render_data_manager_tab():
     st.subheader("Data Manager")
     st.caption("Data tools are manual-only so normal Refresh Today stays fast. Logos are disabled; this page focuses on stats/cache health.")
@@ -7094,29 +7276,28 @@ except Exception:
     hero_board_rows = hero_real_lines = hero_no_line = hero_strong = 0
 hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
 
-tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
 
-MARKET_TAB_META = {
-    "PTS": ("POINTS", "Points board: scoring projection, shot profile, pace, usage, matchup, line edge."),
-    "REB": ("REBOUNDS", "Rebounds board: minutes, role, team rebounding, opponent context, recent form."),
-    "AST": ("ASSISTS", "Assists board: minutes, usage proxy, lineup continuity, team shot environment."),
-    "PRA": ("PRA", "Combo board: points + rebounds + assists with full Monte Carlo distribution."),
-}
+st.markdown("""
+<style>
+.owp-group-card{border:1px solid rgba(168,85,247,.48);border-left:6px solid #a855f7;border-radius:28px;padding:22px;margin:18px 0;background:linear-gradient(180deg,rgba(17,10,31,.98),rgba(24,10,42,.94));box-shadow:0 0 28px rgba(168,85,247,.12)}
+.owp-group-top{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin-bottom:16px}.owp-group-best{text-align:right;font-weight:1000;color:#e9d5ff;font-size:.95rem}.owp-group-best span{color:#c4b5fd;font-weight:700}.owp-market-row{background:rgba(15,23,42,.58);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:14px;margin:12px 0}.owp-market-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.owp-market-name{font-size:1.05rem;font-weight:1000;color:#fb7185;letter-spacing:.08em}.owp-market-vol{font-size:.75rem;border:1px solid rgba(250,204,21,.55);color:#fde68a;border-radius:999px;padding:2px 8px;font-weight:900}.owp-market-conf{margin-left:auto;border:1px solid rgba(34,197,94,.45);border-radius:999px;padding:3px 10px;font-weight:1000;font-size:.85rem}.owp-market-side{font-weight:1000;font-size:1.35rem}.owp-market-conf.over,.owp-market-side.over,.owp-market-edge.pos{color:#4ade80}.owp-market-conf.under,.owp-market-side.under,.owp-market-edge.neg{color:#fb7185}.owp-market-conf.track,.owp-market-side.track,.owp-market-edge.flat{color:#e9d5ff}.owp-market-main{display:flex;align-items:baseline;gap:12px;margin-top:10px}.owp-market-proj{font-size:2.25rem;font-weight:1000;color:#f8fafc}.owp-market-edge{font-size:1.15rem;font-weight:1000}.owp-market-tier{color:#facc15;font-weight:900}.owp-market-track{height:10px;margin-top:10px}.owp-market-sub{display:flex;justify-content:space-between;color:#c4b5fd;font-size:.82rem;text-transform:uppercase;font-weight:900}.owp-market-note{font-size:.86rem;color:#a8a29e;margin-top:8px;background:rgba(255,255,255,.04);border-left:3px solid rgba(251,113,133,.6);border-radius:8px;padding:8px 10px}
+</style>
+""", unsafe_allow_html=True)
 
-for idx, market in enumerate(MARKETS):
-    with tabs[idx]:
-        title, caption = MARKET_TAB_META[market]
-        st.markdown(f"<div class='section-title'>{title} / Player Prop Model</div>", unsafe_allow_html=True)
-        st.caption(caption + " Main flow: Refresh → inspect cards → save before games → grade after results.")
-        slate_tabs = st.tabs(["Today", "Tomorrow", "All Lines"])
-        with slate_tabs[0]:
-            render_mlb_style_board("Today", use_ud, use_sleeper, logs_global, master_global, force_market=market)
-        with slate_tabs[1]:
-            render_mlb_style_board("Tomorrow", use_ud, use_sleeper, logs_global, master_global, force_market=market)
-        with slate_tabs[2]:
-            render_mlb_style_board("All Lines", use_ud, use_sleeper, logs_global, master_global, force_market=market)
+tabs = st.tabs(["Player Cards", "Best Bets", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
 
-with tabs[4]:
+with tabs[0]:
+    st.markdown("<div class='section-title'>PLAYER CARDS / Grouped Markets</div>", unsafe_allow_html=True)
+    st.caption("One player card now shows every live market pulled for that player: PTS, REB, AST, and PRA. The Underdog line pull and main-line selector are unchanged.")
+    slate_tabs = st.tabs(["Today", "Tomorrow", "All Lines"])
+    with slate_tabs[0]:
+        render_grouped_player_board("Today", use_ud, logs_global, master_global)
+    with slate_tabs[1]:
+        render_grouped_player_board("Tomorrow", use_ud, logs_global, master_global)
+    with slate_tabs[2]:
+        render_grouped_player_board("All Lines", use_ud, logs_global, master_global)
+
+with tabs[1]:
     st.subheader("Best Bets / Tier 1–8 Official Board")
     st.caption("Clean official board using edge, Monte Carlo, Bayesian confidence, data score, role confidence, line source reliability, similarity, pace, rest/travel, blowout, bench rotation, line movement, EV/Kelly, and model disagreement.")
     board_path = CACHE_FILES["projection_board"]
@@ -7147,7 +7328,7 @@ with tabs[4]:
         st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
-with tabs[5]:
+with tabs[2]:
     st.subheader("Official + Grade")
     st.caption("Save official plays before games. Grade after results are imported to update the learning log. Manual line tools are built into each market board. Underdog lines are used when available.")
     board = load_dataset("projection_board")
@@ -7185,10 +7366,10 @@ with tabs[5]:
         st.dataframe(learning.tail(300), use_container_width=True)
         st.download_button("Download learning log CSV", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
 
-with tabs[6]:
+with tabs[3]:
     render_data_manager_tab()
 
-with tabs[7]:
+with tabs[4]:
     st.subheader("Debug / Status")
     st.caption("Diagnostics only. Heavy imports/rebuilds are in Data Manager and never run automatically.")
     st.markdown("### Data status")
@@ -7232,7 +7413,7 @@ with tabs[7]:
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
 
-with tabs[8]:
+with tabs[5]:
     st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
     st.caption("This page keeps the main UI clean while giving you the same deeper review tools: line movement, closing-line value, projection calibration, and historical model testing.")
 
