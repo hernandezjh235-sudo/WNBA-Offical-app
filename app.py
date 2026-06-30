@@ -19,6 +19,7 @@ import json
 import math
 import time
 import zipfile
+import base64
 import hashlib
 import difflib
 import unicodedata
@@ -64,6 +65,69 @@ CACHE_FILES = {
     "master_features": DATA_DIR / "wnba_master_features.csv",
     "projection_board": DATA_DIR / "wnba_projection_board.csv",
 }
+
+# ============================================================
+# Team logo assets
+# ============================================================
+ASSETS_DIR = Path("assets")
+LOGO_DIR = ASSETS_DIR / "logos"
+TEAM_LOGO_ALIASES = {
+    "ATL": "ATL", "ATLANTA": "ATL", "ATLANTA DREAM": "ATL",
+    "CHI": "CHI", "CHICAGO": "CHI", "CHICAGO SKY": "CHI",
+    "CON": "CON", "CONN": "CON", "CONNECTICUT": "CON", "CONNECTICUT SUN": "CON",
+    "DAL": "DAL", "DALLAS": "DAL", "DALLAS WINGS": "DAL",
+    "GSV": "GSV", "GSW": "GSV", "GOLDEN STATE": "GSV", "GOLDEN STATE VALKYRIES": "GSV",
+    "IND": "IND", "INDIANA": "IND", "INDIANA FEVER": "IND",
+    "LVA": "LVA", "LV": "LVA", "LAS VEGAS": "LVA", "LAS VEGAS ACES": "LVA",
+    "LAS": "LAS", "LA": "LAS", "LOS ANGELES": "LAS", "LOS ANGELES SPARKS": "LAS",
+    "MIN": "MIN", "MINNESOTA": "MIN", "MINNESOTA LYNX": "MIN",
+    "NYL": "NYL", "NY": "NYL", "NEW YORK": "NYL", "NEW YORK LIBERTY": "NYL",
+    "PHX": "PHX", "PHO": "PHX", "PHOENIX": "PHX", "PHOENIX MERCURY": "PHX",
+    "SEA": "SEA", "SEATTLE": "SEA", "SEATTLE STORM": "SEA",
+    "WAS": "WAS", "WSH": "WAS", "WASHINGTON": "WAS", "WASHINGTON MYSTICS": "WAS",
+}
+
+def team_abbr_for_logo(team: Any) -> str:
+    t = str(team or "").strip().upper()
+    t = re.sub(r"[^A-Z0-9 ]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return "WNBA"
+    return TEAM_LOGO_ALIASES.get(t, TEAM_LOGO_ALIASES.get(t[:3], t[:3]))
+
+@st.cache_data(show_spinner=False)
+def local_logo_data_uri(abbr: str) -> str:
+    abbr = team_abbr_for_logo(abbr)
+    for ext, mime in [("png", "image/png"), ("jpg", "image/jpeg"), ("jpeg", "image/jpeg"), ("webp", "image/webp"), ("svg", "image/svg+xml")]:
+        path = LOGO_DIR / f"{abbr}.{ext}"
+        if path.exists():
+            raw = path.read_bytes()
+            return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+    return ""
+
+def github_logo_url(abbr: str) -> str:
+    """Optional remote fallback. Add WNBA_LOGO_BASE_URL in Streamlit secrets, e.g.
+    WNBA_LOGO_BASE_URL='https://raw.githubusercontent.com/<user>/<repo>/main/assets/logos'
+    """
+    abbr = team_abbr_for_logo(abbr)
+    try:
+        base = st.secrets.get("WNBA_LOGO_BASE_URL", "")
+    except Exception:
+        base = ""
+    base = str(base or "").strip().rstrip("/")
+    if base:
+        return f"{base}/{abbr}.png"
+    return ""
+
+def get_team_logo_src(team: Any) -> str:
+    abbr = team_abbr_for_logo(team)
+    src = local_logo_data_uri(abbr)
+    if src:
+        return src
+    gh = github_logo_url(abbr)
+    if gh:
+        return gh
+    return ""
 
 # ============================================================
 # Constants
@@ -4237,6 +4301,7 @@ def inject_css():
     /* ===== Clean WNBA player cards inspired by the MLB card, purple theme ===== */
     .owp-card-v2{background:linear-gradient(160deg,rgba(16,13,28,.98),rgba(8,8,14,.98));border:1px solid rgba(168,85,247,.55);border-left:4px solid #a855f7;border-radius:22px;padding:18px 18px 16px;margin:16px 0;box-shadow:0 0 24px rgba(168,85,247,.16);}
     .owp-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:12px;}
+    .owp-logo{width:48px;height:48px;object-fit:contain;border-radius:12px;background:rgba(255,255,255,.06);border:1px solid rgba(192,132,252,.35);padding:4px;flex:0 0 auto;}
     .owp-player{font-size:1.35rem;font-weight:1000;color:#fff;line-height:1.1;}
     .owp-match{color:#c7b7f5;font-weight:700;margin-top:5px;font-size:.95rem;}
     .owp-pill{display:inline-block;padding:5px 11px;border-radius:999px;font-size:.75rem;font-weight:1000;letter-spacing:.06em;text-transform:uppercase;margin:3px 4px 3px 0;border:1px solid rgba(255,255,255,.16);}
@@ -4328,6 +4393,8 @@ def render_card(r):
     slate = _val(r.get("Slate"), "")
     slate_date = _val(r.get("SlateDate"), "")
     matched = _val(r.get("Matched Player"), r.get("Player"))
+    logo_src = get_team_logo_src(r.get("Team"))
+    logo_html = f"<img class='owp-logo' src='{logo_src}'/>" if logo_src else f"<div class='owp-logo' style='display:flex;align-items:center;justify-content:center;font-weight:1000;color:#e9d5ff'>{team_abbr_for_logo(r.get('Team'))}</div>"
     why = _val(r.get("Projection Explanation"), "Projection explanation unavailable.")
     pos = _val(r.get("Biggest Positive"), "No major positive isolated.")
     risk = _val(r.get("Biggest Risk"), "No major risk isolated.")
@@ -4344,12 +4411,15 @@ def render_card(r):
     st.markdown(f"""
     <div class='owp-card-v2'>
       <div class='owp-card-top'>
-        <div>
-          <div class='owp-player'>{_val(r.get('Player'))}</div>
-          <div class='owp-match'>{matchup} <span class='owp-muted'>| {_val(r.get('PositionGroup'), 'Role')} | {slate} {slate_date}</span></div>
-          <span class='owp-pill owp-pill-source'>{source}</span>
-          <span class='owp-pill owp-pill-role'>Lineup/Role {_val(r.get('FallbackLineupRole'), r.get('Minutes Safety', 'NA'))}</span>
-          <span class='owp-pill owp-pill-score'>Score {confidence}/100</span>
+        <div style='display:flex;align-items:flex-start;gap:12px;'>
+          {logo_html}
+          <div>
+            <div class='owp-player'>{_val(r.get('Player'))}</div>
+            <div class='owp-match'>{matchup} <span class='owp-muted'>| {_val(r.get('PositionGroup'), 'Role')} | {slate} {slate_date}</span></div>
+            <span class='owp-pill owp-pill-source'>{source}</span>
+            <span class='owp-pill owp-pill-role'>Lineup/Role {_val(r.get('FallbackLineupRole'), r.get('Minutes Safety', 'NA'))}</span>
+            <span class='owp-pill owp-pill-score'>Score {confidence}/100</span>
+          </div>
         </div>
         <div class='owp-decision {side_cls}'>{side_label}<div class='owp-confidence'>Confidence {confidence}%</div></div>
       </div>
@@ -6364,6 +6434,101 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     return proj_df
 
 
+
+def render_data_manager_tab():
+    st.subheader("Data Manager")
+    st.caption("Visible again, but heavy jobs only run when you press a button. This keeps the normal app fast.")
+
+    st.markdown("### Local logo assets")
+    st.write("The app loads logos from `assets/logos` first. If a file is missing, it can fall back to `WNBA_LOGO_BASE_URL` in Streamlit Secrets.")
+    st.code('WNBA_LOGO_BASE_URL = "https://raw.githubusercontent.com/<user>/<repo>/main/assets/logos"', language="toml")
+    logo_rows = []
+    for abbr in sorted(set(TEAM_LOGO_ALIASES.values())):
+        found = any((LOGO_DIR / f"{abbr}.{ext}").exists() for ext in ["png", "jpg", "jpeg", "webp", "svg"])
+        logo_rows.append({"Team": abbr, "Local Logo": "✅ found" if found else "⚠️ missing", "Expected Path": f"assets/logos/{abbr}.png"})
+    st.dataframe(pd.DataFrame(logo_rows), use_container_width=True)
+
+    st.markdown("### Data status")
+    st.dataframe(dataset_status_table(), use_container_width=True)
+
+    st.markdown("### Fast-safe data tools")
+    st.caption("Use these only when you need to reload historical/stat data. Daily betting use should stay on Refresh Today.")
+    default_datasets = ["player_game_logs", "player_season_stats", "team_season_stats", "schedules", "rosters", "game_rosters"]
+    dataset_choices = st.multiselect(
+        "SportsDataverse datasets to refresh",
+        list(DATASET_LABELS.keys()),
+        default=default_datasets,
+        format_func=lambda k: DATASET_LABELS.get(k, k),
+        key="dm_dataset_choices_visible",
+    )
+    include_heavy = st.toggle("Include heavier add-ons: lineups + shots", value=True, key="dm_include_heavy_visible")
+    y1, y2 = st.columns(2)
+    with y1:
+        season_a = st.number_input("Current season to pull", min_value=2020, max_value=2032, value=int(season_now), step=1, key="dm_season_now_visible")
+    with y2:
+        season_b = st.number_input("Last season to pull", min_value=2020, max_value=2032, value=int(season_last), step=1, key="dm_season_last_visible")
+    if st.button("🔄 Refresh SportsDataverse + Build Advanced Features", use_container_width=True, key="dm_refresh_sd_visible"):
+        with st.spinner("Refreshing data and rebuilding advanced features..."):
+            master, team_ranks, debug, audit = refresh_data_and_build_advanced_features(dataset_choices, [int(season_b), int(season_a)], include_heavy)
+        st.success(f"Done. Master rows: {len(master)} | Team-rank rows: {len(team_ranks)}")
+        st.markdown("#### Refresh debug")
+        st.dataframe(debug, use_container_width=True)
+        st.markdown("#### Missing-field report")
+        st.dataframe(audit, use_container_width=True)
+
+    if st.button("🧠 Build Advanced Features / Fix Missing Columns Only", use_container_width=True, key="dm_build_features_only_visible"):
+        with st.spinner("Rebuilding master features from cached files..."):
+            master, team_ranks = build_master_features()
+            audit = feature_missing_report(master)
+            audit.to_csv(DATA_DIR / "wnba_feature_missing_report.csv", index=False)
+        st.success(f"Advanced features rebuilt. Master rows: {len(master)}")
+        st.dataframe(audit, use_container_width=True)
+
+    report_path = DATA_DIR / "wnba_feature_missing_report.csv"
+    if report_path.exists():
+        try:
+            report_df = pd.read_csv(report_path)
+            st.download_button("Download missing-field report", report_df.to_csv(index=False), "wnba_feature_missing_report.csv", "text/csv", use_container_width=True)
+        except Exception:
+            pass
+
+    st.markdown("### Manual upload/import backup")
+    uploaded = st.file_uploader("Upload SportsDataverse CSV/Parquet files", type=["csv", "parquet", "xlsx", "json"], accept_multiple_files=True, key="dm_manual_upload_visible")
+    if uploaded and st.button("Import uploaded files", use_container_width=True, key="dm_import_uploads_visible"):
+        rows = []
+        for f in uploaded:
+            try:
+                raw = f.read()
+                dataset_key = classify_filename(f.name)
+                if not dataset_key:
+                    rows.append({"file": f.name, "dataset": "unknown", "status": "skipped: could not classify", "rows": 0})
+                    continue
+                df = read_any_file(raw, f.name)
+                std = standardize_dataset(dataset_key, df)
+                if std is not None and not std.empty:
+                    save_dataset(dataset_key, std)
+                    rows.append({"file": f.name, "dataset": dataset_key, "status": "saved", "rows": len(std)})
+                else:
+                    rows.append({"file": f.name, "dataset": dataset_key, "status": "standardized empty", "rows": 0})
+            except Exception as e:
+                rows.append({"file": getattr(f, 'name', 'upload'), "dataset": "error", "status": str(e)[:180], "rows": 0})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        try:
+            master, _ = build_master_features()
+            st.success(f"Uploaded files imported and master rebuilt: {len(master)} rows")
+        except Exception as e:
+            st.warning(f"Files imported, but master rebuild needs review: {e}")
+
+    st.markdown("### Cached exports")
+    for key in ["master_features", "projection_board", "team_ranks", "player_game_logs"]:
+        path = CACHE_FILES.get(key)
+        if path and path.exists():
+            try:
+                data = path.read_text(errors="ignore")
+                st.download_button(f"Download {key}.csv", data, f"{key}.csv", "text/csv", use_container_width=True, key=f"dm_download_{key}")
+            except Exception:
+                pass
+
 with st.sidebar:
     st.header("Setup")
     season_now = st.number_input("Current season", min_value=2020, max_value=2032, value=datetime.now().year, step=1)
@@ -6402,7 +6567,7 @@ except Exception:
     hero_board_rows = hero_real_lines = hero_no_line = hero_strong = 0
 hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
 
-tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Debug / Status", "Model Reports"])
+tabs = st.tabs(["PTS", "REB", "AST", "PRA", "Best Bets", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
 
 MARKET_TAB_META = {
     "PTS": ("POINTS", "Points board: scoring projection, shot profile, pace, usage, matchup, line edge."),
@@ -6494,8 +6659,11 @@ with tabs[5]:
         st.download_button("Download learning log CSV", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
 
 with tabs[6]:
+    render_data_manager_tab()
+
+with tabs[7]:
     st.subheader("Debug / Status")
-    st.caption("Data Manager is hidden for speed. Backend data/refresh tools still run through Refresh Today and sidebar controls. This page is only for diagnostics.")
+    st.caption("Diagnostics only. Heavy imports/rebuilds are in Data Manager and never run automatically.")
     st.markdown("### Data status")
     st.dataframe(dataset_status_table(), use_container_width=True)
     st.markdown("### Aggregated real lines")
@@ -6537,7 +6705,7 @@ with tabs[6]:
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
 
-with tabs[7]:
+with tabs[8]:
     st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
     st.caption("This page keeps the main UI clean while giving you the same deeper review tools: line movement, closing-line value, projection calibration, and historical model testing.")
 
