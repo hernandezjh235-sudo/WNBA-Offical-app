@@ -32,7 +32,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NO_MONEYLINE — WNBA v2.0 — Underdog Mainline + Full Game Context Engine"
+APP_VERSION = "NO_MONEYLINE — WNBA v2.1 — Official Online Fallback + No Logos"
 
 # ============================================================
 # Storage
@@ -65,6 +65,92 @@ CACHE_FILES = {
     "master_features": DATA_DIR / "wnba_master_features.csv",
     "projection_board": DATA_DIR / "wnba_projection_board.csv",
 }
+
+
+# Optional GitHub/raw cache support.
+# If you commit CSV caches into GitHub, the app will read them first from the
+# local repo path above. If Streamlit runtime cache is empty and the CSV is not
+# committed locally, set one of these secrets to a raw GitHub folder URL:
+#   WNBA_DATA_BASE_URL = "https://raw.githubusercontent.com/<user>/<repo>/main/wnba_engine/data"
+#   GITHUB_DATA_BASE_URL = "https://raw.githubusercontent.com/<user>/<repo>/main/wnba_engine/data"
+# The file names must match CACHE_FILES values, e.g. wnba_master_features.csv.
+GITHUB_CACHE_DATA_KEYS = list(CACHE_FILES.keys())
+GITHUB_DATA_BASE_SECRET_NAMES = ["WNBA_DATA_BASE_URL", "GITHUB_DATA_BASE_URL"]
+
+
+def _read_secret_or_env(name: str, default: str = "") -> str:
+    """Read a Streamlit secret or environment variable without breaking local runs."""
+    try:
+        val = st.secrets.get(name, "")
+        if val not in [None, ""]:
+            return str(val).strip()
+    except Exception:
+        pass
+    return str(os.environ.get(name, default) or "").strip()
+
+
+def _github_data_base_url() -> str:
+    """Raw GitHub data folder URL. Empty means only local repo/runtime cache is used."""
+    for nm in GITHUB_DATA_BASE_SECRET_NAMES:
+        val = _read_secret_or_env(nm, "")
+        if val:
+            return val.rstrip("/")
+    return ""
+
+
+def _github_cache_url_for_key(dataset_key: str) -> str:
+    base = _github_data_base_url()
+    path = CACHE_FILES.get(dataset_key)
+    if not base or path is None:
+        return ""
+    return f"{base}/{Path(path).name}"
+
+
+def _read_csv_bytes(raw: bytes, dataset_key: str = "") -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(raw), low_memory=False)
+    if dataset_key in ["player_game_logs", "schedules", "game_rosters", "lineups", "shots", "master_features", "projection_board"]:
+        for c in ["GameDate"]:
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_github_cache_dataset(dataset_key: str) -> Tuple[pd.DataFrame, str]:
+    """Load a cached CSV from a raw GitHub URL if configured.
+
+    Returns (df, status). This never raises and never overwrites good local data
+    with an empty frame.
+    """
+    url = _github_cache_url_for_key(dataset_key)
+    if not url:
+        return pd.DataFrame(), "github cache not configured"
+    try:
+        r = requests.get(url, headers=DEFAULT_HEADERS, timeout=20)
+        if r.status_code >= 400:
+            return pd.DataFrame(), f"github {dataset_key}: HTTP {r.status_code}"
+        df = _read_csv_bytes(r.content, dataset_key)
+        if df is None or df.empty:
+            return pd.DataFrame(), f"github {dataset_key}: empty"
+        return df, f"github {dataset_key}: loaded {len(df)} rows"
+    except Exception as e:
+        return pd.DataFrame(), f"github {dataset_key}: {str(e)[:140]}"
+
+
+def github_cache_status_table() -> pd.DataFrame:
+    """Small Data Manager report for GitHub-backed caches."""
+    rows = []
+    base = _github_data_base_url()
+    for key, path in CACHE_FILES.items():
+        url = _github_cache_url_for_key(key)
+        local_exists = Path(path).exists()
+        rows.append({
+            "Dataset": key,
+            "Local/Repo CSV": "✅" if local_exists else "❌",
+            "GitHub Raw URL": url if base else "not configured",
+            "Expected File": Path(path).name,
+        })
+    return pd.DataFrame(rows)
 
 # ============================================================
 # Team logo assets
@@ -960,18 +1046,47 @@ def save_dataset(dataset_key: str, df: pd.DataFrame) -> None:
 
 
 def load_dataset(dataset_key: str) -> pd.DataFrame:
+    """Load data with resilient priority:
+    1) local repo/runtime cache at wnba_engine/data
+    2) raw GitHub cache if WNBA_DATA_BASE_URL/GITHUB_DATA_BASE_URL is configured
+    3) empty frame, allowing official WNBA fallback builders to run
+
+    Important: empty/bad remote pulls never overwrite good local CSVs.
+    """
     path = CACHE_FILES.get(dataset_key)
-    if not path or not path.exists():
-        return pd.DataFrame()
+    # 1) Local file from GitHub repo checkout or runtime cache.
+    if path and path.exists():
+        try:
+            df = pd.read_csv(path, low_memory=False)
+            if dataset_key in ["player_game_logs", "schedules", "game_rosters", "lineups", "shots", "master_features", "projection_board"]:
+                for c in ["GameDate"]:
+                    if c in df.columns:
+                        df[c] = pd.to_datetime(df[c], errors="coerce")
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+
+    # 2) Raw GitHub fallback if configured. Saves a runtime copy for speed.
     try:
-        df = pd.read_csv(path, low_memory=False)
-        if dataset_key in ["player_game_logs", "schedules", "game_rosters", "lineups", "shots", "master_features"]:
-            for c in ["GameDate"]:
-                if c in df.columns:
-                    df[c] = pd.to_datetime(df[c], errors="coerce")
-        return df
+        remote_df, remote_status = fetch_github_cache_dataset(dataset_key)
+        try:
+            st.session_state.setdefault("wnba_github_cache_debug", {})[dataset_key] = remote_status
+        except Exception:
+            pass
+        if remote_df is not None and not remote_df.empty:
+            try:
+                if path:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    remote_df.to_csv(path, index=False)
+            except Exception:
+                pass
+            return remote_df
     except Exception:
-        return pd.DataFrame()
+        pass
+
+    # 3) No cache available; caller can trigger official WNBA fallback.
+    return pd.DataFrame()
 
 # ============================================================
 # Feature builders
@@ -6528,6 +6643,418 @@ def render_data_manager_tab():
                 st.download_button(f"Download {key}.csv", data, f"{key}.csv", "text/csv", use_container_width=True, key=f"dm_download_{key}")
             except Exception:
                 pass
+
+
+
+# ============================================================
+# OFFICIAL WNBA ONLINE FALLBACK + NO-LOGO UI OVERRIDES
+# ============================================================
+# Purpose:
+# - If Streamlit cache/data folder is empty, still build usable player baselines
+#   from official WNBA Stats endpoints so Underdog lines can run projections.
+# - Keep local/GitHub logos out of the active UI per request.
+# - Preserve the working Underdog parser and one-click workflow.
+
+OFFICIAL_WNBA_PLAYER_CONTEXT_FILE = DATA_DIR / "wnba_official_player_context.csv"
+
+
+def _official_player_stats_params(season: int, measure: str = "Base") -> Dict[str, Any]:
+    return {
+        "College": "", "Conference": "", "Country": "", "DateFrom": "", "DateTo": "",
+        "Division": "", "DraftPick": "", "DraftYear": "", "GameScope": "", "GameSegment": "",
+        "Height": "", "LastNGames": "0", "LeagueID": "10", "Location": "", "MeasureType": measure,
+        "Month": "0", "OpponentTeamID": "0", "Outcome": "", "PORound": "0", "PaceAdjust": "N",
+        "PerMode": "PerGame", "Period": "0", "PlayerExperience": "", "PlayerPosition": "",
+        "PlusMinus": "N", "Rank": "N", "Season": str(season), "SeasonSegment": "",
+        "SeasonType": "Regular Season", "ShotClockRange": "", "StarterBench": "", "TeamID": "0",
+        "TwoWay": "0", "VsConference": "", "VsDivision": "", "Weight": "",
+    }
+
+
+def refresh_official_wnba_player_context(season: Optional[int] = None, force: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Pull official WNBA player stat tables and cache a season baseline.
+
+    This is a fallback for empty Streamlit/SportsDataverse cache. It gives the
+    prop engine enough Player/Team/MIN/PTS/REB/AST/efficiency data to run live
+    Underdog projections even when historical game logs are missing.
+    """
+    if season is None:
+        try:
+            season = int(st.session_state.get("season_now", datetime.utcnow().year))
+        except Exception:
+            season = int(datetime.utcnow().year)
+    if OFFICIAL_WNBA_PLAYER_CONTEXT_FILE.exists() and not force:
+        try:
+            cached = pd.read_csv(OFFICIAL_WNBA_PLAYER_CONTEXT_FILE)
+            if cached is not None and not cached.empty:
+                return cached, pd.DataFrame([{"Step":"official_wnba_player_context", "Status":"cached", "Rows":len(cached)}])
+        except Exception:
+            pass
+
+    dbg = []
+    base, msg = _wnba_stats_get("leaguedashplayerstats", _official_player_stats_params(season, "Base"), timeout=16)
+    dbg.append({"Step":"Official Player Base", "Status":msg, "Rows":0 if base is None else len(base)})
+    adv, msg = _wnba_stats_get("leaguedashplayerstats", _official_player_stats_params(season, "Advanced"), timeout=16)
+    dbg.append({"Step":"Official Player Advanced", "Status":msg, "Rows":0 if adv is None else len(adv)})
+
+    if base is None or base.empty:
+        return pd.DataFrame(), pd.DataFrame(dbg + [{"Step":"official_wnba_player_context", "Status":"empty official player pull", "Rows":0}])
+
+    d = base.copy()
+    player_col = find_col(d, ["PLAYER_NAME", "PLAYER", "PLAYER_NAME_I", "NAME"])
+    team_col = find_col(d, ["TEAM_ABBREVIATION", "TEAM", "TEAM_NAME"])
+    if not player_col:
+        return pd.DataFrame(), pd.DataFrame(dbg + [{"Step":"official_wnba_player_context", "Status":"no player column", "Rows":0}])
+    out = pd.DataFrame()
+    out["Player"] = d[player_col].astype(str)
+    out["Team"] = d[team_col].map(_team_key_for_matchup) if team_col else ""
+    out["Season"] = season
+    # Copy common base fields. Official endpoint names are usually NBA/WNBA Stats API style.
+    for dst, candidates in {
+        "GP": ["GP", "G", "Games"],
+        "MIN": ["MIN", "MINUTES"],
+        "PTS": ["PTS", "POINTS"],
+        "REB": ["REB", "REBOUNDS"],
+        "AST": ["AST", "ASSISTS"],
+        "FGA": ["FGA"], "FGM": ["FGM"], "FG3A": ["FG3A", "FG3_A"], "FG3M": ["FG3M", "FG3_M"],
+        "FTA": ["FTA"], "FTM": ["FTM"], "TOV": ["TOV", "TO"], "OREB": ["OREB"], "DREB": ["DREB"],
+        "STL": ["STL"], "BLK": ["BLK"],
+    }.items():
+        c = find_col(d, candidates)
+        out[dst] = d[c] if c else np.nan
+    out = coerce_numeric(out, [c for c in out.columns if c not in ["Player", "Team"]])
+    out["PRA"] = out["PTS"].fillna(0) + out["REB"].fillna(0) + out["AST"].fillna(0)
+    out["NameKey"] = out["Player"].map(normalize_name)
+
+    if adv is not None and not adv.empty:
+        a = adv.copy()
+        a_player = find_col(a, ["PLAYER_NAME", "PLAYER", "PLAYER_NAME_I", "NAME"])
+        a_team = find_col(a, ["TEAM_ABBREVIATION", "TEAM", "TEAM_NAME"])
+        adv_out = pd.DataFrame()
+        if a_player:
+            adv_out["NameKey"] = a[a_player].map(normalize_name)
+            adv_out["Team"] = a[a_team].map(_team_key_for_matchup) if a_team else ""
+            for dst, candidates in {
+                "USG%": ["USG_PCT", "USG%", "USAGE_RATE", "USAGE"],
+                "TS%": ["TS_PCT", "TS%", "TRUE_SHOOTING_PERCENTAGE"],
+                "eFG%": ["EFG_PCT", "EFG%", "EFFECTIVE_FIELD_GOAL_PERCENTAGE"],
+                "AST%": ["AST_PCT", "AST%"],
+                "TRB%": ["REB_PCT", "TRB%", "REB%"],
+                "PER": ["PIE", "PER"],
+            }.items():
+                c = find_col(a, candidates)
+                adv_out[dst] = a[c] if c else np.nan
+            adv_out = coerce_numeric(adv_out, [c for c in adv_out.columns if c not in ["NameKey", "Team"]])
+            out = out.merge(adv_out.drop_duplicates(["NameKey", "Team"]), on=["NameKey", "Team"], how="left")
+
+    # Estimate efficiency if advanced endpoint lacks it.
+    out["eFG%"] = out.get("eFG%", pd.Series(np.nan, index=out.index))
+    out["TS%"] = out.get("TS%", pd.Series(np.nan, index=out.index))
+    out["USG%"] = out.get("USG%", pd.Series(np.nan, index=out.index))
+    fga = pd.to_numeric(out.get("FGA", np.nan), errors="coerce")
+    fgm = pd.to_numeric(out.get("FGM", np.nan), errors="coerce")
+    fg3m = pd.to_numeric(out.get("FG3M", np.nan), errors="coerce")
+    fta = pd.to_numeric(out.get("FTA", np.nan), errors="coerce")
+    pts = pd.to_numeric(out.get("PTS", np.nan), errors="coerce")
+    out["eFG%"] = out["eFG%"].fillna(np.where(fga > 0, (fgm + 0.5 * fg3m) / fga, np.nan))
+    out["TS%"] = out["TS%"].fillna(np.where((2 * (fga + 0.44 * fta)) > 0, pts / (2 * (fga + 0.44 * fta)), np.nan))
+    out["USG%"] = out["USG%"].fillna((fga.fillna(0) + 0.44 * fta.fillna(0) + pd.to_numeric(out.get("TOV", 0), errors="coerce").fillna(0)))
+    out = out[out["NameKey"].astype(str).str.len() > 0].copy()
+    try:
+        OFFICIAL_WNBA_PLAYER_CONTEXT_FILE.parent.mkdir(exist_ok=True)
+        out.to_csv(OFFICIAL_WNBA_PLAYER_CONTEXT_FILE, index=False)
+        # Also fill player_season_stats cache if missing so Data Manager has a visible source.
+        if not CACHE_FILES["player_season_stats"].exists() or force:
+            save_dataset("player_season_stats", out)
+    except Exception:
+        pass
+    return out, pd.DataFrame(dbg + [{"Step":"official_wnba_player_context", "Status":"saved", "Rows":len(out)}])
+
+
+def build_official_baselines_from_player_context(player_ctx: pd.DataFrame, team_ctx: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    if player_ctx is None or player_ctx.empty:
+        return pd.DataFrame()
+    d = player_ctx.copy()
+    d["NameKey"] = d["Player"].map(normalize_name)
+    d["Team"] = d["Team"].map(_team_key_for_matchup)
+    for c in ["GP", "MIN", "PTS", "REB", "AST", "PRA", "FGA", "FGM", "FG3A", "FG3M", "FTA", "TOV", "OREB", "DREB"]:
+        if c not in d.columns: d[c] = np.nan
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    base = pd.DataFrame()
+    base["NameKey"] = d["NameKey"]
+    base["Player"] = d["Player"]
+    base["Team"] = d["Team"]
+    base["Season"] = d.get("Season", datetime.utcnow().year)
+    base["Games"] = d["GP"].fillna(1).clip(lower=1)
+    base["LastGame"] = pd.NaT
+    for src, dst in [("MIN", "MIN"), ("PTS", "PTS"), ("REB", "REB"), ("AST", "AST"), ("PRA", "PRA")]:
+        vals = d[src].fillna(0)
+        for suff in ["avg", "l3", "l5", "l10", "l20"]:
+            base[f"{dst}_{suff}"] = vals
+    for c in ["FGA", "FGM", "FG3A", "FG3M", "FTA", "TOV", "OREB", "DREB"]:
+        # convert per-game to rough season total for formulas that expect totals
+        base[c] = d[c].fillna(0) * base["Games"]
+    base["eFG%"] = pd.to_numeric(d.get("eFG%", np.nan), errors="coerce")
+    base["TS%"] = pd.to_numeric(d.get("TS%", np.nan), errors="coerce")
+    base["USG%"] = pd.to_numeric(d.get("USG%", np.nan), errors="coerce")
+    base["AST%"] = pd.to_numeric(d.get("AST%", np.nan), errors="coerce")
+    base["TRB%"] = pd.to_numeric(d.get("TRB%", np.nan), errors="coerce")
+    base["PER"] = pd.to_numeric(d.get("PER", np.nan), errors="coerce")
+    base["UsageProxy"] = d["FGA"].fillna(0) + 0.44 * d["FTA"].fillna(0) + d["TOV"].fillna(0)
+    base["AST%Proxy"] = base["AST_avg"] / base["MIN_avg"].replace(0, np.nan)
+    base["TRB%Proxy"] = base["REB_avg"] / base["MIN_avg"].replace(0, np.nan)
+    base["PERProxy"] = base["PTS_avg"] + base["REB_avg"] + base["AST_avg"]
+    base["Position"] = ""
+    base["PositionGroup"] = "Unknown"
+    # Official fallback has no shot-zone data. Use neutral values so points engine runs without fake edge.
+    base["ShotAttempts"] = d["FGA"].fillna(0) * base["Games"]
+    base["ThreePARate"] = np.where(d["FGA"] > 0, d["FG3A"] / d["FGA"], np.nan)
+    base["RimRate"] = np.nan
+    base["ShotMakeRate"] = np.where(d["FGA"] > 0, d["FGM"] / d["FGA"], np.nan)
+    base["PointsPerShot"] = np.where(d["FGA"] > 0, d["PTS"] / d["FGA"], np.nan)
+    base["ShotProfileScore"] = np.clip(50 + base["ThreePARate"].fillna(0.22)*12 + (base["ShotMakeRate"].fillna(0.42)-0.42)*55, 0, 100)
+    for m in MARKETS:
+        base[f"{m}_Std20"] = np.maximum(1.2, base[f"{m}_avg"].abs() * ({"PTS":0.28,"REB":0.32,"AST":0.38,"PRA":0.26}.get(m,0.3)))
+        base[f"{m}_per_min"] = base[f"{m}_avg"] / base["MIN_avg"].replace(0, np.nan)
+    base["RosterGames"] = base["Games"]
+    base["StarterGames"] = np.nan
+    base["StarterRate"] = np.nan
+    base["LineupMentions"] = np.nan
+    base["LineupShare"] = np.nan
+    base["LineupContinuityScore"] = 55
+    base["RoleConfidence"] = np.clip(48 + base["Games"].clip(0,25)*1.2 + base["MIN_avg"].clip(0,36)*0.8, 0, 92).round(1)
+    base["MinutesSafetyGrade"] = np.select([base["MIN_avg"] >= 30, base["MIN_avg"] >= 24, base["MIN_avg"] >= 18], ["A", "B", "C"], default="D")
+    base["MinutesProjectionBase"] = base["MIN_avg"].round(2)
+    base["BayesianPriorStrength"] = np.clip((base["Games"] / 20) * 100, 0, 100).round(1)
+    base["VolatilityScore"] = np.clip(30 + base[[f"{m}_Std20" for m in MARKETS]].mean(axis=1).fillna(0)*8, 0, 100).round(1)
+    base["OfficialOnlineFallback"] = "YES"
+    # Attach team context if available.
+    if team_ctx is not None and not team_ctx.empty and "Team" in team_ctx.columns:
+        tc = team_ctx.copy()
+        tc["Team"] = tc["Team"].map(_team_key_for_matchup)
+        keep = [c for c in tc.columns if c == "Team" or "Official" in str(c) or str(c) in ["Team"]]
+        base = base.merge(tc[keep].drop_duplicates("Team"), on="Team", how="left")
+        base["Team_Pace"] = pd.to_numeric(base.get("Team_Pace_Official", np.nan), errors="coerce")
+        base["Team_ORtg"] = pd.to_numeric(base.get("Team_ORtg_Official", np.nan), errors="coerce")
+        base["Team_DRtg"] = pd.to_numeric(base.get("Team_DRtg_Official", np.nan), errors="coerce")
+        base["Team_NetRtg"] = pd.to_numeric(base.get("Team_NetRtg_Official", np.nan), errors="coerce")
+    for c, val in [("Team_Pace",78),("Team_ORtg",100),("Team_DRtg",100),("Team_NetRtg",0)]:
+        if c not in base.columns: base[c] = val
+        base[c] = pd.to_numeric(base[c], errors="coerce").fillna(val)
+    base["TeamMatchupStrengthScore"] = np.clip(50 + base["Team_NetRtg"].fillna(0)*2.0, 0, 100).round(1)
+    base["DataScore"] = np.clip(56 + base["Games"].clip(0,25)*1.25 + base["MIN_avg"].clip(0,36)*0.65 + base["RoleConfidence"].fillna(55)*0.12, 0, 94).round(1)
+    return base
+
+
+def ensure_online_wnba_master_features(force_official: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return a master feature table even when local cache is empty.
+
+    Priority:
+    1) existing master_features cache
+    2) SportsDataverse/player logs cache via build_master_features()
+    3) official WNBA Stats API player/team fallback
+    """
+    debug = []
+    master = load_dataset("master_features")
+    if master is not None and not master.empty and not force_official:
+        return master, load_dataset("team_ranks"), pd.DataFrame([{"Step":"master_features", "Status":"cached", "Rows":len(master)}])
+    logs = load_dataset("player_game_logs")
+    if logs is not None and not logs.empty and not force_official:
+        try:
+            master, team_ranks = build_master_features()
+            if master is not None and not master.empty:
+                return master, team_ranks, pd.DataFrame([{"Step":"master_features", "Status":"rebuilt from cached logs", "Rows":len(master)}])
+        except Exception as e:
+            debug.append({"Step":"cached_log_build", "Status":str(e)[:180], "Rows":0})
+    team_ctx, team_dbg = refresh_official_wnba_team_context(int(datetime.utcnow().year), force=force_official)
+    player_ctx, player_dbg = refresh_official_wnba_player_context(int(datetime.utcnow().year), force=force_official)
+    debug.extend(team_dbg.to_dict("records") if team_dbg is not None and not team_dbg.empty else [])
+    debug.extend(player_dbg.to_dict("records") if player_dbg is not None and not player_dbg.empty else [])
+    master = build_official_baselines_from_player_context(player_ctx, team_ctx)
+    if master is not None and not master.empty:
+        try:
+            save_dataset("master_features", master)
+            feature_missing_report(master).to_csv(DATA_DIR / "wnba_feature_missing_report.csv", index=False)
+        except Exception:
+            pass
+        team_ranks = _build_team_context_from_cached_sources()
+        return master, team_ranks, pd.DataFrame(debug + [{"Step":"master_features", "Status":"built from official WNBA online fallback", "Rows":len(master)}])
+    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(debug + [{"Step":"master_features", "Status":"unavailable; online fallback failed", "Rows":0}])
+
+
+# Override Refresh Today so live lines can still project if no local SportsDataverse cache exists.
+def refresh_today_pipeline(mode: str, use_ud_flag: bool = True) -> Dict[str, Any]:
+    started = time.time()
+    status = {"Mode": mode, "Schedule Loaded": "NO", "Games": 0, "Underdog Lines": 0, "Cards": 0, "Status": "started"}
+    sched, sched_dbg = update_schedule_cache_with_espn(mode)
+    status["Games"] = 0 if sched is None or sched.empty else len(sched)
+    status["Schedule Loaded"] = "YES" if status["Games"] else "NO/CACHED"
+    st.session_state["wnba_schedule_debug"] = sched_dbg
+    master, team_ranks, master_dbg = ensure_online_wnba_master_features(force_official=False)
+    st.session_state["wnba_online_master_debug"] = master_dbg
+    status["Master Rows"] = 0 if master is None or master.empty else len(master)
+    try:
+        game_ctx, game_dbg = build_game_context_cache(mode, force_official=True)
+        status["Game Context Rows"] = 0 if game_ctx is None or game_ctx.empty else len(game_ctx)
+        st.session_state["wnba_game_context_debug"] = game_dbg
+        daily_ctx, daily_dbg = build_daily_team_context_cache_v2(mode, force=True)
+        status["Daily Context Rows"] = 0 if daily_ctx is None or daily_ctx.empty else len(daily_ctx)
+        st.session_state["wnba_daily_team_context_v2_debug"] = daily_dbg
+    except Exception as _gce:
+        status["Game Context Rows"] = 0
+        st.session_state["wnba_game_context_last_error"] = str(_gce)[:180]
+    clear_line_pull_caches()
+    lines_all, ud_debug, manual_debug = pull_board_lines(use_ud_flag, False, False, "")
+    lines, _ = filter_lines_for_slate(lines_all, mode)
+    status["Underdog Lines"] = int((lines.get("Source", pd.Series(dtype=str)).astype(str) == "Underdog").sum()) if lines is not None and not lines.empty else 0
+    logs = load_dataset("player_game_logs")
+    if logs is None:
+        logs = pd.DataFrame()
+    if lines is not None and not lines.empty and master is not None and not master.empty:
+        try:
+            board = make_projection_board(lines, logs, master, mode)
+            board["Slate"] = mode
+            board["SlateDate"] = str(slate_target_date(mode) or "ALL")
+            board = enrich_board_with_matchups(board, mode)
+            board = apply_matchup_context_to_board(board)
+            board = apply_daily_team_context_v2_to_board(board)
+            CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
+            board.to_csv(CACHE_FILES["projection_board"], index=False)
+            status["Cards"] = len(board)
+            status["Status"] = "complete"
+        except Exception as e:
+            status["Status"] = f"board build error: {str(e)[:150]}"
+    else:
+        status["Status"] = "no lines or no master baselines"
+    status["Seconds"] = round(time.time() - started, 2)
+    return status
+
+
+def run_one_click_refresh_today(mode: str = "Today", use_ud_flag: bool = True) -> Dict[str, Any]:
+    status = {"Mode": mode, "Status": "started"}
+    started = time.time()
+    try:
+        master, _, dbg = ensure_online_wnba_master_features(force_official=False)
+        status["Database"] = f"ready {0 if master is None or master.empty else len(master):,} players"
+        st.session_state["wnba_online_master_debug"] = dbg
+        pipe_status = refresh_today_pipeline(mode, use_ud_flag)
+        status.update(pipe_status or {})
+        status["Status"] = status.get("Status", "complete")
+    except Exception as e:
+        status["Status"] = f"one-click error: {str(e)[:160]}"
+    status["Seconds"] = round(time.time() - started, 2)
+    st.session_state["wnba_refresh_today_status"] = status
+    st.session_state["wnba_last_refresh"] = now_iso()
+    return status
+
+
+# No-logo UI override: hide/remove logo boxes and keep Data Manager data-focused.
+def get_team_logo_src(team: Any) -> str:
+    return ""
+
+st.markdown("<style>.owp-logo{display:none!important}.owp-card-main{gap:10px!important}</style>", unsafe_allow_html=True)
+
+
+def render_data_manager_tab():
+    st.subheader("Data Manager")
+    st.caption("Data tools are manual-only so normal Refresh Today stays fast. Logos are disabled; this page focuses on stats/cache health.")
+
+    st.markdown("### Data status")
+    st.dataframe(dataset_status_table(), use_container_width=True)
+
+    st.markdown("### GitHub cache fallback")
+    st.caption("Optional: commit CSVs into wnba_engine/data or set WNBA_DATA_BASE_URL to a raw GitHub data folder. The app loads GitHub/cache first, then official WNBA fallback if missing.")
+    st.dataframe(github_cache_status_table(), use_container_width=True)
+    if st.button("🔎 Test GitHub Cache Load", use_container_width=True, key="dm_test_github_cache_load"):
+        test_rows = []
+        for _k in GITHUB_CACHE_DATA_KEYS:
+            _df, _status = fetch_github_cache_dataset(_k)
+            test_rows.append({"Dataset": _k, "Rows": 0 if _df is None or _df.empty else len(_df), "Status": _status})
+        st.dataframe(pd.DataFrame(test_rows), use_container_width=True)
+
+    st.markdown("### Official WNBA online fallback")
+    st.write("Use this if Streamlit cache is empty. It pulls official WNBA player/team stats and builds a usable master baseline so live Underdog lines can still project.")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🌐 Pull Official WNBA Stats + Build Baselines", use_container_width=True, key="dm_official_online_build"):
+            with st.spinner("Pulling official WNBA stats and building fallback baselines..."):
+                master, team_ranks, dbg = ensure_online_wnba_master_features(force_official=True)
+            st.session_state["wnba_online_master_debug"] = dbg
+            if master is not None and not master.empty:
+                st.success(f"Official WNBA fallback master built: {len(master):,} players")
+                st.dataframe(feature_missing_report(master), use_container_width=True)
+            else:
+                st.error("Official WNBA fallback did not return player baselines. Check Debug / Status.")
+    with c2:
+        if st.button("🧠 Build Advanced Features / Fix Missing Columns", use_container_width=True, key="dm_build_advanced_visible_nologo"):
+            with st.spinner("Rebuilding master features from cached files, with official fallback if needed..."):
+                master, team_ranks, dbg = ensure_online_wnba_master_features(force_official=False)
+                if master is None or master.empty:
+                    master, team_ranks = build_master_features()
+                audit = feature_missing_report(master)
+                audit.to_csv(DATA_DIR / "wnba_feature_missing_report.csv", index=False)
+            st.success(f"Advanced features ready. Master rows: {len(master)}")
+            st.dataframe(audit, use_container_width=True)
+
+    if "wnba_online_master_debug" in st.session_state:
+        with st.expander("Official WNBA fallback debug", expanded=False):
+            st.dataframe(st.session_state.get("wnba_online_master_debug", pd.DataFrame()), use_container_width=True)
+
+    st.markdown("### Remote SportsDataverse refresh")
+    st.caption("Use only when you need to reload historical/stat data. Daily betting use should stay on Refresh Today.")
+    default_datasets = ["player_game_logs", "player_season_stats", "team_season_stats", "schedules", "rosters", "game_rosters"]
+    dataset_choices = st.multiselect(
+        "SportsDataverse datasets to refresh",
+        list(DATASET_LABELS.keys()),
+        default=default_datasets,
+        format_func=lambda k: DATASET_LABELS.get(k, k),
+        key="dm_dataset_choices_visible_nologo",
+    )
+    include_heavy = st.toggle("Include heavier add-ons: lineups + shots", value=True, key="dm_include_heavy_visible_nologo")
+    y1, y2 = st.columns(2)
+    with y1:
+        if st.button("Refresh SportsDataverse Database", use_container_width=True, key="dm_refresh_remote_visible_nologo"):
+            with st.spinner("Refreshing SportsDataverse cache..."):
+                dbg, master, team_ranks = refresh_data_and_build_advanced_features(dataset_choices, [int(season_last), int(season_now)], include_heavy)
+            st.success(f"SportsDataverse refresh complete. Master rows: {0 if master is None else len(master)}")
+            st.dataframe(dbg, use_container_width=True)
+    with y2:
+        if st.button("Download missing-field report", use_container_width=True, key="dm_report_button_nologo"):
+            report_path = DATA_DIR / "wnba_feature_missing_report.csv"
+            if report_path.exists():
+                st.download_button("Download CSV", report_path.read_text(errors="ignore"), "wnba_feature_missing_report.csv", "text/csv", use_container_width=True)
+            else:
+                st.info("No report yet. Build features first.")
+
+    st.markdown("### Manual upload/import backup")
+    uploaded = st.file_uploader("Upload SportsDataverse CSV/Parquet files", type=["csv", "parquet", "xlsx", "json"], accept_multiple_files=True, key="dm_manual_upload_visible_nologo")
+    if uploaded and st.button("Import uploaded files", use_container_width=True, key="dm_import_uploads_visible_nologo"):
+        rows = []
+        for f in uploaded:
+            try:
+                raw = f.read(); dataset_key = classify_filename(f.name)
+                if not dataset_key:
+                    rows.append({"file": f.name, "dataset": "unknown", "status": "skipped: could not classify", "rows": 0}); continue
+                df = read_any_file(raw, f.name); std = standardize_dataset(dataset_key, df)
+                if std is not None and not std.empty:
+                    save_dataset(dataset_key, std); rows.append({"file": f.name, "dataset": dataset_key, "status": "saved", "rows": len(std)})
+                else:
+                    rows.append({"file": f.name, "dataset": dataset_key, "status": "standardized empty", "rows": 0})
+            except Exception as e:
+                rows.append({"file": getattr(f, 'name', 'upload'), "dataset": "error", "status": str(e)[:180], "rows": 0})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        master, _, dbg = ensure_online_wnba_master_features(force_official=False)
+        st.success(f"Files imported and master ready: {0 if master is None else len(master)} rows")
+
+    st.markdown("### Cached exports")
+    for key in ["master_features", "projection_board", "team_ranks", "player_game_logs", "player_season_stats"]:
+        path = CACHE_FILES.get(key)
+        if path and path.exists():
+            try:
+                st.download_button(f"Download {key}.csv", path.read_text(errors="ignore"), f"{key}.csv", "text/csv", use_container_width=True, key=f"dm_download_{key}_nologo")
+            except Exception:
+                pass
+
 
 with st.sidebar:
     st.header("Setup")
