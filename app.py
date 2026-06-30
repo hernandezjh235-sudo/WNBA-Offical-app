@@ -5269,9 +5269,32 @@ def line_start_date_series(df: pd.DataFrame) -> pd.Series:
     return pd.to_datetime(df["Start"], errors="coerce", utc=True).dt.tz_convert(None).dt.date
 
 
+def _slate_team_set(mode: str) -> set:
+    """Return teams scheduled for the selected slate from cached/online schedule data."""
+    try:
+        sched = schedule_for_slate(mode)
+        if sched is None or sched.empty:
+            return set()
+        teams = set()
+        for c in ["Away", "Home", "AwayTeam", "HomeTeam", "Team", "Opponent"]:
+            if c in sched.columns:
+                teams.update([team_abbrev(x) for x in sched[c].dropna().astype(str).tolist()])
+        return {t for t in teams if t}
+    except Exception:
+        return set()
+
+
 def filter_lines_for_slate(lines: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame, str]:
-    if lines is None or lines.empty or mode == "All Lines":
-        return lines if lines is not None else pd.DataFrame(), "All loaded lines shown."
+    """Filter loaded sportsbook/manual lines to Today/Tomorrow when possible.
+
+    Underdog WNBA rows often do not include reliable start times. When dates are
+    absent, use the slate schedule teams as the source of truth so Today does not
+    show lines for games outside today/tomorrow.
+    """
+    if lines is None or lines.empty:
+        return pd.DataFrame(), "No loaded lines."
+    if mode == "All Lines":
+        return lines, "All loaded lines shown."
     target = slate_target_date(mode)
     if target is None:
         return lines, "All loaded lines shown."
@@ -5280,8 +5303,17 @@ def filter_lines_for_slate(lines: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame
     has_dates = start_dates.notna()
     if has_dates.any():
         filtered = d[(start_dates == target) | (~has_dates & d.get("Source", "").astype(str).eq("Manual"))].copy()
-        return filtered, f"Filtered to {mode.lower()} ({target}). Manual lines without a start date are included."
-    return d, f"Sportsbook rows did not include reliable start times, so all loaded lines are shown for {mode.lower()}."
+        # If some sportsbook rows have no start date, also keep them only when
+        # their team belongs to this slate.
+        slate_teams = _slate_team_set(mode)
+        if slate_teams and "Team" in filtered.columns:
+            filtered = filtered[filtered["Team"].astype(str).map(team_abbrev).isin(slate_teams) | filtered.get("Source", "").astype(str).eq("Manual")].copy()
+        return filtered, f"Filtered to {mode.lower()} ({target})."
+    slate_teams = _slate_team_set(mode)
+    if slate_teams and "Team" in d.columns:
+        filtered = d[d["Team"].astype(str).map(team_abbrev).isin(slate_teams) | d.get("Source", "").astype(str).eq("Manual")].copy()
+        return filtered, f"Filtered to {mode.lower()} by scheduled teams: {', '.join(sorted(slate_teams))}."
+    return d, f"No reliable start times or cached schedule teams were found, so all loaded lines are shown for {mode.lower()}."
 
 
 def schedule_for_slate(mode: str) -> pd.DataFrame:
@@ -7126,14 +7158,35 @@ def render_grouped_player_card(player_df: pd.DataFrame):
 
 
 
-def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: str, max_key: str, official_key: str, saved_view: bool = False) -> pd.DataFrame:
-    """Render an already-built projection board as grouped player cards."""
+
+def grouped_board_table_view(proj_df: pd.DataFrame) -> pd.DataFrame:
+    """Compact grouped table for speed: one row per player/market, sorted by player and market."""
+    if proj_df is None or proj_df.empty:
+        return pd.DataFrame()
+    df = proj_df.copy()
+    order = {m:i for i,m in enumerate(MARKETS)}
+    df["_market_order"] = df.get("Market", "").astype(str).str.upper().map(order).fillna(99)
+    # Keep only useful board columns so this loads much faster than rendering all cards.
+    keep = [c for c in [
+        "Player", "Team", "Opponent", "Matchup", "Market", "Projection", "Line", "Edge",
+        "Lean", "Over %", "Under %", "Official Play Score", "Tier", "Volatility",
+        "MIN Proj", "FallbackLineupRole", "Source"
+    ] if c in df.columns]
+    if not keep:
+        return df
+    out = df.sort_values(["Player", "_market_order", "Line"], na_position="last")[keep].copy()
+    for c in ["Projection", "Line", "Edge", "Over %", "Under %", "Official Play Score", "MIN Proj"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
+    return out
+
+def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: str, default_cards: bool = False) -> pd.DataFrame:
+    """Fast display switcher. Table mode avoids rendering dozens of heavy HTML cards."""
     if proj_df is None or proj_df.empty:
         st.info("No rows to show.")
         return pd.DataFrame()
-    search = st.text_input("Search player", key=search_key)
-    official_only = st.toggle("Official / strong signals only", value=False, key=official_key)
-    max_players = st.slider("Max player cards", 10, 120, 40, 5, key=max_key)
+    search = st.text_input("Search player", key=f"{key_prefix}_search")
+    official_only = st.toggle("Official / strong signals only", value=False, key=f"{key_prefix}_official")
     view_df = proj_df.copy()
     if search and "Player" in view_df.columns:
         view_df = view_df[view_df["Player"].astype(str).str.contains(search, case=False, na=False)]
@@ -7146,19 +7199,38 @@ def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: 
     c3.metric("Official plays", int(view_df.get("Official", pd.Series(dtype=str)).astype(str).str.contains("OVER|UNDER", na=False).sum()))
     c4.metric("Avg edge", round(float(pd.to_numeric(view_df.get("Edge", pd.Series(dtype=float)), errors="coerce").abs().mean()), 2) if not view_df.empty else 0)
 
+    display_mode = st.radio(
+        "View",
+        ["Fast table", "Player cards"],
+        index=1 if default_cards else 0,
+        horizontal=True,
+        key=f"{key_prefix}_display_mode",
+        help="Fast table loads quickest. Player cards show the full grouped-card view."
+    )
+
     ac1, ac2, ac3 = st.columns([1.2,1.2,1.4])
     with ac1:
-        if st.button(f"✅ Save {mode} Official Before", key=f"group_save_before_{mode}_{'saved' if saved_view else 'live'}", use_container_width=True):
+        if st.button(f"✅ Save {mode} Official Before", key=f"{key_prefix}_save_before", use_container_width=True):
             n = save_officials(view_df); st.success(f"Saved {n} official plays for {mode}.")
     with ac2:
-        if st.button(f"📊 Grade After Results", key=f"group_grade_after_{mode}_{'saved' if saved_view else 'live'}", use_container_width=True):
+        if st.button(f"📊 Grade After Results", key=f"{key_prefix}_grade_after", use_container_width=True):
             n = grade_pending(load_dataset("player_game_logs")); st.success(f"Graded {n} pending plays.")
     with ac3:
-        st.download_button(f"Download {mode} Board CSV", view_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ','_')}_grouped_board.csv", "text/csv", key=f"group_dl_{mode}_{'saved' if saved_view else 'live'}")
+        st.download_button(f"Download {mode} Board CSV", view_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ','_')}_board.csv", "text/csv", key=f"{key_prefix}_download")
 
     if view_df.empty:
         st.info("No rows after filters.")
         return view_df
+
+    if display_mode == "Fast table":
+        compact = grouped_board_table_view(view_df)
+        st.dataframe(compact, use_container_width=True, hide_index=True, height=620)
+        st.caption("Fast table mode shows every loaded player/market without rendering heavy cards. Switch to Player cards only when you want the full card layout.")
+        return view_df
+
+    show_all = st.toggle("Show all player cards", value=False, key=f"{key_prefix}_show_all_cards")
+    max_default = min(40, max(10, int(view_df["Player"].nunique() if "Player" in view_df.columns else 40)))
+    max_players = len(view_df["Player"].dropna().unique()) if show_all and "Player" in view_df.columns else st.slider("Max player cards", 10, 120, max_default, 5, key=f"{key_prefix}_max_cards")
     sort_df = view_df.copy()
     sort_df["_abs_edge"] = pd.to_numeric(sort_df.get("Edge", np.nan), errors="coerce").abs()
     sort_df["_score"] = pd.to_numeric(sort_df.get("Official Play Score", np.nan), errors="coerce")
@@ -7166,6 +7238,11 @@ def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: 
     for player in player_order:
         render_grouped_player_card(view_df[view_df["Player"] == player])
     return view_df
+
+def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: str, max_key: str, official_key: str, saved_view: bool = False) -> pd.DataFrame:
+    """Render an already-built projection board with fast table / card toggle."""
+    key_prefix = f"saved_group_{mode}" if saved_view else f"live_group_{mode}"
+    return render_grouped_table_or_cards(proj_df, mode, key_prefix, default_cards=False)
 
 def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame):
     st.markdown(f"<div class='section-title'>{mode} — Grouped Player Cards</div>", unsafe_allow_html=True)
@@ -7255,38 +7332,9 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     with save_cols[1]:
         st.caption("Save Board keeps the pulled lines + projections available after closing/reopening, similar to the MLB app.")
 
-    if search:
-        proj_df = proj_df[proj_df["Player"].astype(str).str.contains(search, case=False, na=False)]
-    if official_only and "Official" in proj_df.columns:
-        proj_df = proj_df[proj_df["Official"].astype(str).str.contains("OVER|UNDER", na=False)]
-
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Players", proj_df["Player"].nunique() if "Player" in proj_df.columns else 0)
-    c2.metric("Markets", len(proj_df))
-    c3.metric("Official plays", int(proj_df.get("Official", pd.Series(dtype=str)).astype(str).str.contains("OVER|UNDER", na=False).sum()))
-    c4.metric("Avg edge", round(float(pd.to_numeric(proj_df.get("Edge", pd.Series(dtype=float)), errors="coerce").abs().mean()), 2) if not proj_df.empty else 0)
-
-    ac1, ac2, ac3 = st.columns([1.2,1.2,1.4])
-    with ac1:
-        if st.button(f"✅ Save {mode} Official Before", key=f"group_save_before_{mode}", use_container_width=True):
-            n = save_officials(proj_df); st.success(f"Saved {n} official plays for {mode}.")
-    with ac2:
-        if st.button(f"📊 Grade After Results", key=f"group_grade_after_{mode}", use_container_width=True):
-            n = grade_pending(logs_global); st.success(f"Graded {n} pending plays.")
-    with ac3:
-        st.download_button(f"Download {mode} Grouped Board CSV", proj_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ','_')}_grouped_board.csv", "text/csv", key=f"group_dl_{mode}")
-
-    if proj_df.empty:
-        st.info("No rows after filters.")
-        return proj_df
-    # Sort players by their strongest absolute edge/official score, but render each player once.
-    sort_df = proj_df.copy()
-    sort_df["_abs_edge"] = pd.to_numeric(sort_df.get("Edge", np.nan), errors="coerce").abs()
-    sort_df["_score"] = pd.to_numeric(sort_df.get("Official Play Score", np.nan), errors="coerce")
-    player_order = sort_df.groupby("Player", dropna=False).agg(MaxScore=("_score","max"), MaxEdge=("_abs_edge","max")).reset_index().sort_values(["MaxScore","MaxEdge"], ascending=False)["Player"].head(max_players).tolist()
-    for player in player_order:
-        render_grouped_player_card(proj_df[proj_df["Player"] == player])
-    return proj_df
+    # Fast table / grouped cards toggle. Default to Fast table for speed; switch to
+    # Player cards only when you want the full visual cards.
+    return render_grouped_table_or_cards(proj_df, mode, f"live_group_{mode}", default_cards=False)
 
 def render_data_manager_tab():
     st.subheader("Data Manager")
