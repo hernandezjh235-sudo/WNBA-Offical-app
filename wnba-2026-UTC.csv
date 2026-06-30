@@ -1,0 +1,331 @@
+Match Number,Round Number,Date,Location,Home Team,Away Team,Result
+1,1,08/05/2026 23:30,Barclays Center,New York Liberty,Connecticut Sun,106 - 75
+2,1,08/05/2026 23:30,Coca-Cola Coliseum,Toronto Tempo,Washington Mystics,65 - 68
+3,1,09/05/2026 02:00,Climate Pledge Arena,Seattle Storm,Golden State Valkyries,80 - 91
+4,1,09/05/2026 17:00,Gainbridge Fieldhouse,Indiana Fever,Dallas Wings,104 - 107
+5,1,09/05/2026 19:30,T-Mobile Arena,Las Vegas Aces,Phoenix Mercury,66 - 99
+10,1,10/05/2026 00:00,Target Center,Minnesota Lynx,Atlanta Dream,90 - 91
+6,1,10/05/2026 01:00,Moda Center,Portland Fire,Chicago Sky,83 - 98
+7,1,10/05/2026 17:00,Mohegan Sun Arena,Connecticut Sun,Seattle Storm,82 - 89
+8,1,10/05/2026 19:00,CareFirst Arena,Washington Mystics,New York Liberty,93 - 98
+9,1,10/05/2026 22:00,Crypto.com Arena,Los Angeles Sparks,Las Vegas Aces,78 - 105
+11,1,11/05/2026 00:30,Chase Center,Golden State Valkyries,Phoenix Mercury,95 - 79
+12,1,13/05/2026 00:00,College Park Center,Dallas Wings,Atlanta Dream,72 - 77
+13,1,13/05/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Minnesota Lynx,84 - 88
+14,1,13/05/2026 02:00,Moda Center,Portland Fire,New York Liberty,98 - 96
+15,2,13/05/2026 23:00,Coca-Cola Coliseum,Toronto Tempo,Seattle Storm,86 - 73
+16,2,14/05/2026 00:00,Mohegan Sun Arena,Connecticut Sun,Las Vegas Aces,69 - 98
+17,2,14/05/2026 02:00,Chase Center,Golden State Valkyries,Chicago Sky,63 - 69
+18,2,14/05/2026 02:30,Crypto.com Arena,Los Angeles Sparks,Indiana Fever,78 - 87
+19,2,15/05/2026 00:00,College Park Center,Dallas Wings,Minnesota Lynx,86 - 90
+20,2,15/05/2026 02:00,Moda Center,Portland Fire,New York Liberty,82 - 100
+21,2,15/05/2026 23:30,Mohegan Sun Arena,Connecticut Sun,Las Vegas Aces,94 - 101
+22,2,15/05/2026 23:30,Gainbridge Fieldhouse,Indiana Fever,Washington Mystics,102 - 104
+23,2,16/05/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Toronto Tempo,99 - 95
+24,2,16/05/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Chicago Sky,91 - 83
+26,2,17/05/2026 17:30,State Farm Arena,Atlanta Dream,Las Vegas Aces,84 - 85
+27,2,17/05/2026 22:00,Gainbridge Fieldhouse,Indiana Fever,Seattle Storm,89 - 78
+25,2,17/05/2026 23:00,Target Center,Minnesota Lynx,Chicago Sky,79 - 86
+28,2,17/05/2026 23:00,Crypto.com Arena,Los Angeles Sparks,Toronto Tempo,96 - 106
+29,2,19/05/2026 00:00,College Park Center,Dallas Wings,Washington Mystics,92 - 69
+30,2,19/05/2026 02:00,Moda Center,Portland Fire,Connecticut Sun,83 - 82
+31,2,20/05/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Toronto Tempo,90 - 98
+32,3,20/05/2026 23:00,Gainbridge Fieldhouse,Indiana Fever,Portland Fire,90 - 73
+33,3,21/05/2026 01:00,Wintrust Arena,Chicago Sky,Dallas Wings,89 - 99
+34,3,21/05/2026 02:00,Climate Pledge Arena,Seattle Storm,Connecticut Sun,78 - 80
+35,3,22/05/2026 00:00,Barclays Center,New York Liberty,Golden State Valkyries,70 - 87
+36,3,22/05/2026 00:00,Target Center,Minnesota Lynx,Toronto Tempo,100 - 72
+37,3,22/05/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Los Angeles Sparks,88 - 97
+38,3,22/05/2026 23:30,Gateway Center Arena @ College Park,Atlanta Dream,Dallas Wings,86 - 69
+39,3,22/05/2026 23:30,Gainbridge Fieldhouse,Indiana Fever,Golden State Valkyries,90 - 82
+40,3,23/05/2026 02:00,Climate Pledge Arena,Seattle Storm,Connecticut Sun,77 - 59
+41,3,23/05/2026 17:00,Wintrust Arena,Chicago Sky,Minnesota Lynx,75 - 85
+42,3,23/05/2026 22:00,Coca-Cola Coliseum,Toronto Tempo,Portland Fire,80 - 99
+43,3,24/05/2026 00:00,Michelob ULTRA Arena,Las Vegas Aces,Los Angeles Sparks,95 - 101
+44,3,24/05/2026 19:00,Gateway Center Arena @ College Park,Atlanta Dream,Phoenix Mercury,82 - 80
+45,3,24/05/2026 19:30,Barclays Center,New York Liberty,Dallas Wings,76 - 91
+46,3,24/05/2026 22:00,Climate Pledge Arena,Seattle Storm,Washington Mystics,97 - 85
+47,3,26/05/2026 00:00,Barclays Center,New York Liberty,Portland Fire,74 - 81
+48,3,26/05/2026 02:00,Chase Center,Golden State Valkyries,Connecticut Sun,97 - 70
+49,4,27/05/2026 23:00,Barclays Center,New York Liberty,Phoenix Mercury,84 - 74
+50,4,28/05/2026 00:00,Wintrust Arena,Chicago Sky,Toronto Tempo,104 - 111
+51,4,28/05/2026 01:00,Target Center,Minnesota Lynx,Atlanta Dream,96 - 81
+52,4,28/05/2026 02:00,Moda Center,Portland Fire,Connecticut Sun,71 - 61
+53,4,28/05/2026 02:00,Climate Pledge Arena,Seattle Storm,Washington Mystics,64 - 78
+54,4,29/05/2026 00:00,College Park Center,Dallas Wings,Las Vegas Aces,95 - 87
+55,4,29/05/2026 02:00,Chase Center,Golden State Valkyries,Indiana Fever,90 - 88
+56,4,29/05/2026 23:30,Barclays Center,New York Liberty,Phoenix Mercury,75 - 68
+57,4,29/05/2026 23:30,CareFirst Arena,Washington Mystics,Los Angeles Sparks,87 - 92
+58,4,29/05/2026 23:30,Wintrust Arena,Chicago Sky,Minnesota Lynx,58 - 79
+59,4,30/05/2026 02:00,Moda Center,Portland Fire,Atlanta Dream,66 - 86
+60,4,30/05/2026 17:00,Coca-Cola Coliseum,Toronto Tempo,Seattle Storm,93 - 72
+61,4,30/05/2026 22:00,PeoplesBank Arena,Connecticut Sun,Los Angeles Sparks,84 - 81
+62,4,31/05/2026 00:00,Moda Center,Portland Fire,Indiana Fever,100 - 84
+63,4,31/05/2026 19:30,Chase Center,Golden State Valkyries,Las Vegas Aces,81 - 91
+64,4,02/06/2026 00:00,College Park Center,Dallas Wings,Seattle Storm,79 - 56
+65,4,02/06/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Minnesota Lynx,77 - 111
+66,4,02/06/2026 23:30,Gateway Center Arena @ College Park,Atlanta Dream,Connecticut Sun,91 - 75
+67,4,02/06/2026 23:30,CareFirst Arena,Washington Mystics,Chicago Sky,90 - 72
+68,4,03/06/2026 02:00,Chase Center,Golden State Valkyries,Portland Fire,95 - 77
+69,4,03/06/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Las Vegas Aces,69 - 79
+70,5,03/06/2026 23:30,Barclays Center,New York Liberty,Toronto Tempo,97 - 82
+71,5,04/06/2026 02:00,Climate Pledge Arena,Seattle Storm,Phoenix Mercury,68 - 72
+72,5,04/06/2026 23:00,Gainbridge Fieldhouse,Indiana Fever,Atlanta Dream,83 - 71
+73,5,05/06/2026 01:00,Target Center,Minnesota Lynx,Golden State Valkyries,87 - 84
+74,5,05/06/2026 23:30,Wintrust Arena,Chicago Sky,Connecticut Sun,85 - 80
+75,5,06/06/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Dallas Wings,96 - 104
+76,5,06/06/2026 02:00,Moda Center,Portland Fire,Phoenix Mercury,72 - 78
+77,5,06/06/2026 17:00,Target Center,Minnesota Lynx,Seattle Storm,88 - 68
+78,5,06/06/2026 19:00,Michelob ULTRA Arena,Las Vegas Aces,Golden State Valkyries,84 - 79
+79,5,06/06/2026 22:00,Gateway Center Arena @ College Park,Atlanta Dream,Washington Mystics,109 - 77
+80,5,07/06/2026 00:00,Barclays Center,New York Liberty,Indiana Fever,83 - 75
+81,5,07/06/2026 19:00,Coca-Cola Coliseum,Toronto Tempo,Chicago Sky,85 - 68
+82,5,07/06/2026 23:00,Crypto.com Arena,Los Angeles Sparks,Portland Fire,89 - 72
+83,5,08/06/2026 23:00,Mohegan Sun Arena,Connecticut Sun,New York Liberty,80 - 89
+84,5,08/06/2026 23:00,CareFirst Arena,Washington Mystics,Indiana Fever,76 - 78
+85,5,09/06/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,Seattle Storm,101 - 91
+86,5,09/06/2026 23:00,Wintrust Arena,Chicago Sky,Atlanta Dream,75 - 82
+87,5,10/06/2026 00:00,Target Center,Minnesota Lynx,Dallas Wings,100 - 76
+88,5,10/06/2026 02:00,Chase Center,Golden State Valkyries,Phoenix Mercury,87 - 81
+89,6,10/06/2026 23:00,Coca-Cola Coliseum,Toronto Tempo,Connecticut Sun,106 - 102
+90,6,11/06/2026 02:00,Climate Pledge Arena,Seattle Storm,Los Angeles Sparks,83 - 88
+91,6,11/06/2026 23:00,Gainbridge Fieldhouse,Indiana Fever,Chicago Sky,114 - 106
+92,6,11/06/2026 23:30,Gateway Center Arena @ College Park,Atlanta Dream,New York Liberty,90 - 104
+93,6,12/06/2026 01:00,College Park Center,Dallas Wings,Phoenix Mercury,85 - 70
+94,6,12/06/2026 02:00,Moda Center,Portland Fire,Las Vegas Aces,89 - 105
+95,6,12/06/2026 23:30,CareFirst Arena,Washington Mystics,Toronto Tempo,86 - 85
+96,6,13/06/2026 02:00,Climate Pledge Arena,Seattle Storm,Golden State Valkyries,72 - 76
+97,6,13/06/2026 22:00,Mohegan Sun Arena,Connecticut Sun,Indiana Fever,75 - 85
+98,6,14/06/2026 00:00,Michelob ULTRA Arena,Las Vegas Aces,Minnesota Lynx,100 - 97
+99,6,14/06/2026 00:30,Moda Center,Portland Fire,Dallas Wings,84 - 83
+100,6,14/06/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Los Angeles Sparks,102 - 111
+101,6,14/06/2026 19:00,Barclays Center,New York Liberty,Washington Mystics,86 - 64
+102,6,14/06/2026 19:00,Coca-Cola Coliseum,Toronto Tempo,Atlanta Dream,77 - 102
+103,6,16/06/2026 00:00,College Park Center,Dallas Wings,Las Vegas Aces,96 - 66
+104,6,16/06/2026 00:00,Target Center,Minnesota Lynx,Portland Fire,107 - 74
+105,6,16/06/2026 02:00,Chase Center,Golden State Valkyries,Los Angeles Sparks,78 - 58
+106,6,16/06/2026 23:00,Gainbridge Fieldhouse,Indiana Fever,Toronto Tempo,113 - 91
+107,7,17/06/2026 23:00,Mohegan Sun Arena,Connecticut Sun,Washington Mystics,81 - 88
+108,7,18/06/2026 00:00,Wintrust Arena,Chicago Sky,New York Liberty,95 - 96
+109,7,18/06/2026 02:00,Chase Center,Golden State Valkyries,Dallas Wings,91 - 80
+110,7,18/06/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Minnesota Lynx,83 - 99
+111,7,18/06/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Las Vegas Aces,76 - 86
+112,7,18/06/2026 02:00,Moda Center,Portland Fire,Seattle Storm,94 - 89
+113,7,18/06/2026 23:30,Gainbridge Fieldhouse,Indiana Fever,Atlanta Dream,101 - 108
+114,7,19/06/2026 23:30,Mohegan Sun Arena,Connecticut Sun,Toronto Tempo,97 - 101
+115,7,19/06/2026 23:30,Barclays Center,New York Liberty,Washington Mystics,83 - 86
+116,7,20/06/2026 02:00,Chase Center,Golden State Valkyries,Minnesota Lynx,75 - 81
+117,7,20/06/2026 17:00,State Farm Arena,Atlanta Dream,Indiana Fever,113 - 96
+118,7,20/06/2026 19:00,Mortgage Matchup Center,Phoenix Mercury,Seattle Storm,93 - 73
+119,7,21/06/2026 00:00,College Park Center,Dallas Wings,Chicago Sky,93 - 92
+120,7,21/06/2026 20:00,Michelob ULTRA Arena,Las Vegas Aces,Golden State Valkyries,92 - 73
+121,7,21/06/2026 22:00,Target Center,Minnesota Lynx,Washington Mystics,79 - 84
+122,7,22/06/2026 00:00,Crypto.com Arena,Los Angeles Sparks,New York Liberty,98 - 97
+123,7,22/06/2026 23:00,Mohegan Sun Arena,Connecticut Sun,Chicago Sky,92 - 63
+124,7,22/06/2026 23:30,State Farm Arena,Atlanta Dream,Toronto Tempo,94 - 87
+125,7,23/06/2026 00:00,Gainbridge Fieldhouse,Indiana Fever,Phoenix Mercury,86 - 77
+126,7,23/06/2026 02:00,Climate Pledge Arena,Seattle Storm,Dallas Wings,110 - 112
+127,7,24/06/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,New York Liberty,76 - 87
+128,8,24/06/2026 23:30,Gainbridge Fieldhouse,Indiana Fever,Phoenix Mercury,109 - 111
+129,8,24/06/2026 23:30,CareFirst Arena,Washington Mystics,Minnesota Lynx,76 - 78
+130,8,25/06/2026 00:00,Wintrust Arena,Chicago Sky,Portland Fire,101 - 78
+131,8,25/06/2026 02:00,Chase Center,Golden State Valkyries,Atlanta Dream,77 - 66
+132,8,25/06/2026 23:00,Coca-Cola Coliseum,Toronto Tempo,Los Angeles Sparks,125 - 97
+133,8,26/06/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,Dallas Wings,99 - 84
+134,8,26/06/2026 02:00,Climate Pledge Arena,Seattle Storm,New York Liberty,99 - 88
+135,8,26/06/2026 23:30,Mohegan Sun Arena,Connecticut Sun,Washington Mystics,68 - 57
+136,8,26/06/2026 23:30,Wintrust Arena,Chicago Sky,Portland Fire,124 - 94
+137,8,27/06/2026 02:00,Chase Center,Golden State Valkyries,Atlanta Dream,78 - 75
+138,8,27/06/2026 18:00,Scotiabank Arena,Toronto Tempo,Phoenix Mercury,80 - 89
+139,8,28/06/2026 00:00,Gainbridge Fieldhouse,Indiana Fever,Los Angeles Sparks,111 - 87
+140,8,28/06/2026 01:00,Climate Pledge Arena,Seattle Storm,Atlanta Dream,105 - 90
+141,8,28/06/2026 18:00,College Park Center,Dallas Wings,Minnesota Lynx,
+142,8,28/06/2026 19:00,CareFirst Arena,Washington Mystics,Portland Fire,
+143,8,28/06/2026 20:00,United Center,Chicago Sky,Las Vegas Aces,
+144,8,28/06/2026 23:00,Chase Center,Golden State Valkyries,New York Liberty,
+145,9,02/07/2026 23:30,CareFirst Arena,Washington Mystics,Atlanta Dream,
+146,9,03/07/2026 00:00,PeoplesBank Arena,Connecticut Sun,Dallas Wings,
+147,9,03/07/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Seattle Storm,
+148,9,03/07/2026 23:30,Barclays Center,New York Liberty,Minnesota Lynx,
+149,9,04/07/2026 02:00,T-Mobile Arena,Las Vegas Aces,Chicago Sky,
+150,9,04/07/2026 17:00,Gateway Center Arena @ College Park,Atlanta Dream,Golden State Valkyries,
+151,9,05/07/2026 01:00,Climate Pledge Arena,Seattle Storm,Portland Fire,
+152,9,05/07/2026 19:00,Coca-Cola Coliseum,Toronto Tempo,Dallas Wings,
+153,9,05/07/2026 23:00,T-Mobile Arena,Las Vegas Aces,Indiana Fever,
+154,9,06/07/2026 23:30,CareFirst Arena,Washington Mystics,Golden State Valkyries,
+155,9,07/07/2026 00:00,Target Center,Minnesota Lynx,Connecticut Sun,
+156,9,07/07/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Seattle Storm,
+157,9,08/07/2026 00:00,Barclays Center,New York Liberty,Dallas Wings,
+158,9,08/07/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Chicago Sky,
+159,9,08/07/2026 23:00,Coca-Cola Coliseum,Toronto Tempo,Golden State Valkyries,
+160,9,08/07/2026 23:30,Mohegan Sun Arena,Connecticut Sun,Minnesota Lynx,
+161,9,09/07/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Indiana Fever,
+162,9,10/07/2026 00:00,Gateway Center Arena @ College Park,Atlanta Dream,Seattle Storm,
+163,9,10/07/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Indiana Fever,
+164,9,10/07/2026 02:00,Moda Center,Portland Fire,Las Vegas Aces,
+165,10,10/07/2026 23:30,Mohegan Sun Arena,Connecticut Sun,Golden State Valkyries,
+166,10,10/07/2026 23:30,Bell Centre,Toronto Tempo,Dallas Wings,
+167,10,11/07/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Chicago Sky,
+168,10,11/07/2026 17:00,Target Center,Minnesota Lynx,New York Liberty,
+170,10,11/07/2026 20:00,Gateway Center Arena @ College Park,Atlanta Dream,Portland Fire,
+169,10,11/07/2026 22:00,Michelob ULTRA Arena,Las Vegas Aces,Phoenix Mercury,
+171,10,12/07/2026 19:00,Bell Centre,Toronto Tempo,New York Liberty,
+172,10,12/07/2026 19:00,CareFirst Arena,Washington Mystics,Seattle Storm,
+173,10,12/07/2026 23:00,American Airlines Center,Dallas Wings,Chicago Sky,
+174,10,13/07/2026 01:00,Michelob ULTRA Arena,Las Vegas Aces,Indiana Fever,
+175,10,13/07/2026 23:00,Gateway Center Arena @ College Park,Atlanta Dream,Los Angeles Sparks,
+176,10,14/07/2026 01:00,Target Center,Minnesota Lynx,Phoenix Mercury,
+177,10,14/07/2026 15:00,Mohegan Sun Arena,Connecticut Sun,Portland Fire,
+178,10,14/07/2026 23:00,Coca-Cola Coliseum,Toronto Tempo,Washington Mystics,
+179,10,15/07/2026 16:00,Wintrust Arena,Chicago Sky,Seattle Storm,
+180,10,15/07/2026 17:00,Target Center,Minnesota Lynx,Los Angeles Sparks,
+181,10,16/07/2026 00:00,Gainbridge Fieldhouse,Indiana Fever,Golden State Valkyries,
+182,10,16/07/2026 23:00,CareFirst Arena,Washington Mystics,Portland Fire,
+183,10,17/07/2026 01:00,College Park Center,Dallas Wings,New York Liberty,
+184,11,17/07/2026 23:30,Gainbridge Fieldhouse,Indiana Fever,Seattle Storm,
+185,11,17/07/2026 23:30,Coca-Cola Coliseum,Toronto Tempo,Atlanta Dream,
+186,11,17/07/2026 23:30,Wintrust Arena,Chicago Sky,Los Angeles Sparks,
+187,11,18/07/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Connecticut Sun,
+188,11,19/07/2026 00:00,Gainbridge Fieldhouse,Indiana Fever,New York Liberty,
+189,11,19/07/2026 00:00,Target Center,Minnesota Lynx,Portland Fire,
+190,11,19/07/2026 00:30,Chase Center,Golden State Valkyries,Washington Mystics,
+191,11,19/07/2026 17:00,College Park Center,Dallas Wings,Los Angeles Sparks,
+192,11,19/07/2026 20:00,Gateway Center Arena @ College Park,Atlanta Dream,Chicago Sky,
+193,11,19/07/2026 23:00,Mortgage Matchup Center,Phoenix Mercury,Connecticut Sun,
+194,11,21/07/2026 00:00,Coca-Cola Coliseum,Toronto Tempo,Las Vegas Aces,
+195,11,21/07/2026 02:00,Chase Center,Golden State Valkyries,Washington Mystics,
+196,11,21/07/2026 02:00,Climate Pledge Arena,Seattle Storm,Minnesota Lynx,
+197,11,22/07/2026 19:00,Crypto.com Arena,Los Angeles Sparks,Phoenix Mercury,
+198,11,22/07/2026 19:00,Climate Pledge Arena,Seattle Storm,Minnesota Lynx,
+199,11,22/07/2026 23:00,Barclays Center,New York Liberty,Chicago Sky,
+200,11,22/07/2026 23:30,CareFirst Arena,Washington Mystics,Las Vegas Aces,
+201,11,23/07/2026 00:00,Gainbridge Fieldhouse,Indiana Fever,Connecticut Sun,
+202,11,23/07/2026 02:00,Moda Center,Portland Fire,Dallas Wings,
+203,12,28/07/2026 23:30,CareFirst Arena,Washington Mystics,Connecticut Sun,
+204,12,29/07/2026 00:00,Target Center,Minnesota Lynx,Toronto Tempo,
+205,12,29/07/2026 01:30,Climate Pledge Arena,Seattle Storm,Indiana Fever,
+206,12,29/07/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,Portland Fire,
+207,12,29/07/2026 02:00,Crypto.com Arena,Los Angeles Sparks,New York Liberty,
+208,12,30/07/2026 00:00,College Park Center,Dallas Wings,Atlanta Dream,
+209,12,30/07/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Golden State Valkyries,
+210,12,30/07/2026 23:00,Scotiabank Arena,Toronto Tempo,Minnesota Lynx,
+211,12,31/07/2026 00:00,Wintrust Arena,Chicago Sky,Connecticut Sun,
+212,12,31/07/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,New York Liberty,
+213,12,31/07/2026 23:30,Gateway Center Arena @ College Park,Atlanta Dream,Seattle Storm,
+214,12,31/07/2026 23:30,CareFirst Arena,Washington Mystics,Dallas Wings,
+215,12,01/08/2026 02:00,Moda Center,Portland Fire,Indiana Fever,
+216,12,01/08/2026 17:00,Wintrust Arena,Chicago Sky,Las Vegas Aces,
+217,12,01/08/2026 19:00,Mortgage Matchup Center,Phoenix Mercury,New York Liberty,
+218,12,02/08/2026 17:00,Target Center,Minnesota Lynx,Indiana Fever,
+219,12,02/08/2026 19:30,Moda Center,Portland Fire,Los Angeles Sparks,
+220,12,02/08/2026 23:00,College Park Center,Dallas Wings,Connecticut Sun,
+221,12,03/08/2026 00:30,Chase Center,Golden State Valkyries,Toronto Tempo,
+223,13,03/08/2026 23:00,Barclays Center,New York Liberty,Seattle Storm,
+222,13,03/08/2026 23:30,Gateway Center Arena @ College Park,Atlanta Dream,Las Vegas Aces,
+224,13,04/08/2026 01:00,Wintrust Arena,Chicago Sky,Phoenix Mercury,
+225,13,05/08/2026 02:00,Chase Center,Golden State Valkyries,Toronto Tempo,
+226,13,05/08/2026 23:00,Gateway Center Arena @ College Park,Atlanta Dream,Phoenix Mercury,
+227,13,05/08/2026 23:00,Barclays Center,New York Liberty,Seattle Storm,
+228,13,05/08/2026 23:30,CareFirst Arena,Washington Mystics,Dallas Wings,
+229,13,06/08/2026 01:00,Wintrust Arena,Chicago Sky,Los Angeles Sparks,
+230,13,06/08/2026 23:00,Gainbridge Fieldhouse,Indiana Fever,Las Vegas Aces,
+231,13,07/08/2026 01:00,Target Center,Minnesota Lynx,Los Angeles Sparks,
+232,13,07/08/2026 02:00,Moda Center,Portland Fire,Toronto Tempo,
+233,13,07/08/2026 23:30,Mohegan Sun Arena,Connecticut Sun,Phoenix Mercury,
+234,13,07/08/2026 23:30,CareFirst Arena,Washington Mystics,Atlanta Dream,
+235,13,08/08/2026 01:30,American Airlines Center,Dallas Wings,Golden State Valkyries,
+236,13,08/08/2026 17:00,Target Center,Minnesota Lynx,Las Vegas Aces,
+237,13,08/08/2026 19:30,United Center,Chicago Sky,Indiana Fever,
+238,13,09/08/2026 00:30,Moda Center,Portland Fire,Seattle Storm,
+239,13,09/08/2026 16:30,Barclays Center,New York Liberty,Las Vegas Aces,
+240,13,09/08/2026 19:00,CareFirst Arena,Washington Mystics,Phoenix Mercury,
+241,13,09/08/2026 19:30,Target Center,Minnesota Lynx,Dallas Wings,
+242,13,09/08/2026 23:00,Crypto.com Arena,Los Angeles Sparks,Golden State Valkyries,
+243,14,11/08/2026 00:00,Gateway Center Arena @ College Park,Atlanta Dream,Toronto Tempo,
+244,14,11/08/2026 02:00,Climate Pledge Arena,Seattle Storm,Chicago Sky,
+245,14,11/08/2026 23:30,Gainbridge Fieldhouse,Indiana Fever,New York Liberty,
+246,14,12/08/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,Washington Mystics,
+247,14,12/08/2026 02:00,Galen Center,Los Angeles Sparks,Phoenix Mercury,
+248,14,13/08/2026 00:00,College Park Center,Dallas Wings,Toronto Tempo,
+249,14,13/08/2026 02:00,Chase Center,Golden State Valkyries,Chicago Sky,
+250,14,13/08/2026 02:00,Moda Center,Portland Fire,Minnesota Lynx,
+251,14,13/08/2026 23:00,Mohegan Sun Arena,Connecticut Sun,Atlanta Dream,
+252,14,14/08/2026 00:00,Barclays Center,New York Liberty,Los Angeles Sparks,
+253,14,14/08/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,Washington Mystics,
+254,14,14/08/2026 23:30,Gainbridge Fieldhouse,Indiana Fever,Dallas Wings,
+255,14,15/08/2026 02:00,Climate Pledge Arena,Seattle Storm,Portland Fire,
+256,14,15/08/2026 17:00,Mohegan Sun Arena,Connecticut Sun,New York Liberty,
+257,14,15/08/2026 23:30,CareFirst Arena,Washington Mystics,Los Angeles Sparks,
+258,14,16/08/2026 00:00,Michelob ULTRA Arena,Las Vegas Aces,Minnesota Lynx,
+259,14,16/08/2026 21:00,Climate Pledge Arena,Seattle Storm,Chicago Sky,
+261,14,16/08/2026 21:00,State Farm Arena,Atlanta Dream,Indiana Fever,
+260,14,16/08/2026 23:00,Mortgage Matchup Center,Phoenix Mercury,Portland Fire,
+262,15,18/08/2026 02:00,Chase Center,Golden State Valkyries,Dallas Wings,
+263,15,18/08/2026 23:00,TD Garden,Connecticut Sun,Los Angeles Sparks,
+264,15,18/08/2026 23:00,Scotiabank Arena,Toronto Tempo,Indiana Fever,
+265,15,19/08/2026 01:00,Wintrust Arena,Chicago Sky,New York Liberty,
+266,15,19/08/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,Atlanta Dream,
+267,15,19/08/2026 23:30,CareFirst Arena,Washington Mystics,Toronto Tempo,
+268,15,20/08/2026 02:00,Chase Center,Golden State Valkyries,Minnesota Lynx,
+269,15,21/08/2026 00:00,American Airlines Center,Dallas Wings,Indiana Fever,
+270,15,21/08/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,Connecticut Sun,
+271,15,21/08/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Atlanta Dream,
+272,15,21/08/2026 23:30,CareFirst Arena,Washington Mystics,Minnesota Lynx,
+273,15,21/08/2026 23:30,Wintrust Arena,Chicago Sky,Golden State Valkyries,
+274,15,22/08/2026 02:00,Rogers Arena,Toronto Tempo,Portland Fire,
+275,15,22/08/2026 23:00,Barclays Center,New York Liberty,Indiana Fever,
+276,15,23/08/2026 01:00,Crypto.com Arena,Los Angeles Sparks,Connecticut Sun,
+277,15,23/08/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Atlanta Dream,
+278,15,23/08/2026 20:00,College Park Center,Dallas Wings,Seattle Storm,
+279,15,23/08/2026 23:00,Wintrust Arena,Chicago Sky,Indiana Fever,
+280,15,23/08/2026 23:00,Moda Center,Portland Fire,Washington Mystics,
+281,15,23/08/2026 23:00,Rogers Arena,Toronto Tempo,Las Vegas Aces,
+282,16,25/08/2026 00:00,Target Center,Minnesota Lynx,Golden State Valkyries,
+283,16,25/08/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Atlanta Dream,
+284,16,25/08/2026 23:00,Mohegan Sun Arena,Connecticut Sun,Chicago Sky,
+285,16,26/08/2026 00:00,College Park Center,Dallas Wings,Portland Fire,
+286,16,26/08/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Washington Mystics,
+287,16,26/08/2026 23:00,Mohegan Sun Arena,Connecticut Sun,Golden State Valkyries,
+288,16,27/08/2026 02:00,Climate Pledge Arena,Seattle Storm,Toronto Tempo,
+289,16,28/08/2026 00:00,Barclays Center,New York Liberty,Golden State Valkyries,
+290,16,28/08/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Washington Mystics,
+291,16,28/08/2026 23:30,Gateway Center Arena @ College Park,Atlanta Dream,Portland Fire,
+292,16,28/08/2026 23:30,Gainbridge Fieldhouse,Indiana Fever,Connecticut Sun,
+293,16,29/08/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,Toronto Tempo,
+294,16,29/08/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Washington Mystics,
+295,16,29/08/2026 17:00,Barclays Center,New York Liberty,Chicago Sky,
+296,16,30/08/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Toronto Tempo,
+297,16,30/08/2026 19:00,Gateway Center Arena @ College Park,Atlanta Dream,Minnesota Lynx,
+298,16,30/08/2026 21:00,Climate Pledge Arena,Seattle Storm,Los Angeles Sparks,
+299,16,30/08/2026 23:00,Moda Center,Portland Fire,Golden State Valkyries,
+300,16,31/08/2026 00:00,College Park Center,Dallas Wings,Connecticut Sun,
+301,17,17/09/2026 23:30,Gateway Center Arena @ College Park,Atlanta Dream,Connecticut Sun,
+302,17,18/09/2026 00:00,Wintrust Arena,Chicago Sky,Washington Mystics,
+303,17,18/09/2026 00:00,College Park Center,Dallas Wings,Los Angeles Sparks,
+304,17,18/09/2026 02:00,Moda Center,Portland Fire,Phoenix Mercury,
+305,17,18/09/2026 02:00,Climate Pledge Arena,Seattle Storm,Las Vegas Aces,
+306,17,18/09/2026 23:30,Coca-Cola Coliseum,Toronto Tempo,Indiana Fever,
+307,17,18/09/2026 23:30,Target Center,Minnesota Lynx,New York Liberty,
+308,17,19/09/2026 02:00,Chase Center,Golden State Valkyries,Portland Fire,
+309,17,19/09/2026 17:00,College Park Center,Dallas Wings,Phoenix Mercury,
+310,17,19/09/2026 23:00,State Farm Arena,Atlanta Dream,Chicago Sky,
+311,17,20/09/2026 01:00,Chase Center,Golden State Valkyries,Seattle Storm,
+312,17,20/09/2026 17:00,Mohegan Sun Arena,Connecticut Sun,Minnesota Lynx,
+313,17,20/09/2026 19:00,Coca-Cola Coliseum,Toronto Tempo,New York Liberty,
+314,17,20/09/2026 20:00,Gainbridge Fieldhouse,Indiana Fever,Washington Mystics,
+315,17,20/09/2026 23:00,Crypto.com Arena,Los Angeles Sparks,Portland Fire,
+316,17,21/09/2026 01:00,Michelob ULTRA Arena,Las Vegas Aces,Seattle Storm,
+317,17,22/09/2026 00:00,Barclays Center,New York Liberty,Atlanta Dream,
+318,17,22/09/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Dallas Wings,
+319,17,22/09/2026 23:30,CareFirst Arena,Washington Mystics,Connecticut Sun,
+320,17,23/09/2026 00:00,Gainbridge Fieldhouse,Indiana Fever,Minnesota Lynx,
+321,17,23/09/2026 00:00,Wintrust Arena,Chicago Sky,Toronto Tempo,
+322,17,23/09/2026 02:00,Michelob ULTRA Arena,Las Vegas Aces,Los Angeles Sparks,
+323,17,23/09/2026 02:00,Moda Center,Portland Fire,Golden State Valkyries,
+324,17,24/09/2026 00:00,Barclays Center,New York Liberty,Atlanta Dream,
+325,17,24/09/2026 02:00,Climate Pledge Arena,Seattle Storm,Dallas Wings,
+326,17,24/09/2026 23:00,Mohegan Sun Arena,Connecticut Sun,Toronto Tempo,
+327,17,24/09/2026 23:30,Capital One Arena,Washington Mystics,Chicago Sky,
+328,17,25/09/2026 00:00,Target Center,Minnesota Lynx,Indiana Fever,
+329,17,25/09/2026 02:00,Crypto.com Arena,Los Angeles Sparks,Golden State Valkyries,
+330,17,25/09/2026 02:00,Mortgage Matchup Center,Phoenix Mercury,Las Vegas Aces,
