@@ -2275,6 +2275,17 @@ def xgboost_blend_projection(features: Dict[str, float], baseline: float) -> Tup
     return baseline + nudge, f"XGBoost-style blend nudge {nudge:+.2f}"
 
 
+def use_xgb_blend_enabled() -> bool:
+    """Sidebar-controlled XGBoost/GBM ensemble switch.
+    Default True to preserve current projection behavior, but user can turn it off
+    while the grading database is still small.
+    """
+    try:
+        return bool(st.session_state.get("use_xgb_blend", True))
+    except Exception:
+        return True
+
+
 def monte_carlo(player, market, line, proj, logs, matched_player=""):
     if pd.isna(proj) or pd.isna(line):
         return {"Floor": np.nan, "Median": np.nan, "Ceiling": np.nan, "Over %": np.nan, "Under %": np.nan, "Volatility": "NA"}
@@ -3624,7 +3635,7 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
         row.update(xgb)
         # Ensemble recalibration: blend current projection with trained model when available.
         p0=safe_float(row.get("Projection"), np.nan); px=safe_float(row.get("XGBoost Projection"), np.nan)
-        if pd.notna(p0) and pd.notna(px):
+        if use_xgb_blend_enabled() and pd.notna(p0) and pd.notna(px):
             row["Ensemble Projection"] = round(0.72*p0 + 0.28*px, 2)
             row["Projection"] = row["Ensemble Projection"]
             row["Edge"] = round(row["Projection"] - safe_float(row.get("Line"), np.nan), 2)
@@ -3827,6 +3838,111 @@ def grade_pending(logs, mode: Optional[str] = None):
     save_json(OFFICIAL_LOG, official)
     save_json(LEARNING_LOG, learn)
     return updated
+
+
+def grade_diagnostics(logs, mode: Optional[str] = None) -> Dict[str, Any]:
+    """Quick status check so user can see why AutoGrader updated 0 plays."""
+    official = load_json(OFFICIAL_LOG, [])
+    out = {"Saved Official Plays": len(official), "Pending Plays": 0, "Eligible Slate Pending": 0, "Completed Player Logs": 0, "Matched Completed Logs": 0, "Skipped/Notes": []}
+    if not official:
+        out["Skipped/Notes"].append("No saved official plays found. Click Save official before games first.")
+        return out
+    pending = [r for r in official if str(r.get("Result", "PENDING")).upper() == "PENDING"]
+    out["Pending Plays"] = len(pending)
+    target = slate_target_date(mode) if mode in ["Today", "Tomorrow"] else None
+    if target is not None:
+        scoped=[]
+        for r in pending:
+            row_date=None
+            for dc in [r.get("SlateDate"), r.get("Start"), r.get("GameDate")]:
+                dt=pd.to_datetime(dc, errors="coerce")
+                if pd.notna(dt):
+                    row_date=dt.date(); break
+            if row_date == target:
+                scoped.append(r)
+        pending = scoped
+    out["Eligible Slate Pending"] = len(pending)
+    if logs is None or getattr(logs, "empty", True):
+        out["Skipped/Notes"].append("No player game logs loaded yet. Import/refresh final player logs after the game.")
+        return out
+    try:
+        lg = standardize_player_logs(logs) if "NameKey" not in logs.columns else logs.copy()
+    except Exception:
+        lg = logs.copy()
+    if "GameDate" not in lg.columns:
+        out["Skipped/Notes"].append("Player logs loaded, but GameDate column is missing.")
+        return out
+    lg["GameDate"] = pd.to_datetime(lg["GameDate"], errors="coerce")
+    if target is not None:
+        lg = lg[lg["GameDate"].dt.date == target].copy()
+    out["Completed Player Logs"] = len(lg.dropna(subset=["GameDate"])) if "GameDate" in lg.columns else len(lg)
+    names = set(lg.get("NameKey", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    matched = 0
+    for r in pending:
+        if normalize_name(r.get("Matched Player") or r.get("Player")) in names:
+            matched += 1
+    out["Matched Completed Logs"] = matched
+    if len(pending) and matched == 0:
+        out["Skipped/Notes"].append("Pending plays exist, but no matching completed player logs were found for this slate/date.")
+    if len(pending) == 0:
+        out["Skipped/Notes"].append("No pending plays for the selected grade scope.")
+    return out
+
+
+# ============================================================
+# After-game results report helpers
+# ============================================================
+def build_after_game_results_table(source_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a clean user-facing ✅/❌ after-game results table from official/learning logs."""
+    if source_df is None or source_df.empty:
+        return pd.DataFrame()
+    df = source_df.copy()
+    for c in ["Player", "Market", "Line", "Lean", "Projection", "Actual", "Result"]:
+        if c not in df.columns:
+            df[c] = None
+    df["Lean"] = df["Lean"].astype(str).str.upper()
+    df["Market"] = df["Market"].astype(str).str.upper()
+    df["Line"] = pd.to_numeric(df["Line"], errors="coerce")
+    df["Projection"] = pd.to_numeric(df["Projection"], errors="coerce")
+    df["Actual"] = pd.to_numeric(df["Actual"], errors="coerce")
+    def _cleared(r):
+        result = str(r.get("Result", "")).upper()
+        if result == "WIN":
+            return "✅"
+        if result == "LOSS":
+            return "❌"
+        if result == "PUSH":
+            return "➖"
+        return "⏳"
+    def _actual_vs_line(r):
+        actual = r.get("Actual")
+        line = r.get("Line")
+        if pd.isna(actual) or pd.isna(line):
+            return ""
+        return f"{actual:.1f} vs {line:.1f}"
+    def _margin(r):
+        actual = r.get("Actual")
+        line = r.get("Line")
+        lean = str(r.get("Lean", "")).upper()
+        if pd.isna(actual) or pd.isna(line):
+            return np.nan
+        return round((actual - line) if lean == "OVER" else (line - actual), 2)
+    df["✅/❌"] = df.apply(_cleared, axis=1)
+    df["Actual vs Line"] = df.apply(_actual_vs_line, axis=1)
+    df["Cleared By"] = df.apply(_margin, axis=1)
+    if "SavedAt" in df.columns:
+        df["SavedAt"] = pd.to_datetime(df["SavedAt"], errors="coerce")
+    if "ActualGameDate" in df.columns:
+        df["ActualGameDate"] = pd.to_datetime(df["ActualGameDate"], errors="coerce")
+    sort_col = "ActualGameDate" if "ActualGameDate" in df.columns else "SavedAt" if "SavedAt" in df.columns else None
+    if sort_col:
+        df = df.sort_values(sort_col, ascending=False)
+    cols = [c for c in [
+        "✅/❌", "Result", "Player", "Team", "Opponent", "Matchup", "Market", "Lean",
+        "Line", "Actual", "Actual vs Line", "Cleared By", "Projection", "Edge",
+        "Official Play Score", "Source", "ActualGameDate", "SavedAt", "GradeNote"
+    ] if c in df.columns]
+    return df[cols]
 
 
 def make_backup_zip() -> bytes:
@@ -5231,7 +5347,7 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
         if b is None: b = pd.Series(dtype=object)
         xgb = model_prediction_for_row(row); row.update(xgb)
         p0=safe_float(row.get("Projection"), np.nan); px=safe_float(row.get("XGBoost Projection"), np.nan)
-        if pd.notna(p0) and pd.notna(px):
+        if use_xgb_blend_enabled() and pd.notna(p0) and pd.notna(px):
             row["Ensemble Projection"] = round(0.72*p0 + 0.28*px, 2)
             row["Projection"] = row["Ensemble Projection"]
             row["Edge"] = round(row["Projection"] - safe_float(row.get("Line"), np.nan), 2)
@@ -7534,8 +7650,10 @@ with st.sidebar:
     odds_api_key = ""
     st.caption("Active line sources: Underdog + saved manual lines. Sleeper, Odds API, and SportsGameOdds are disabled.")
     use_remote = st.toggle("Allow SportsDataverse remote downloads", value=True)
+    use_xgb_blend = st.toggle("Use XGBoost/GBM blend", value=True, help="Keep ON when you want the ensemble projection blended in. Turn OFF while testing if graded samples are still too small.")
+    st.session_state["use_xgb_blend"] = bool(use_xgb_blend)
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
-    st.markdown("**Model:** Monte Carlo + Bayesian confidence + XGBoost-style blend")
+    st.markdown("**Model:** Monte Carlo + Bayesian confidence" + (" + XGBoost/GBM blend" if use_xgb_blend else ""))
     st.divider()
     if st.button("🔄 Refresh Today — All-in-One", use_container_width=True):
         run_one_click_refresh_today("Today", use_ud)
@@ -7616,41 +7734,74 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Official + Grade")
-    st.caption("Save official plays before games. Grade after results are imported to update the learning log. Manual line tools are built into each market board. Underdog lines are used when available.")
-    board = load_dataset("projection_board")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("💾 Save official before games", use_container_width=True):
-            if board.empty:
-                st.warning("No projection board cached yet. Refresh a market board first.")
-            else:
-                n = save_officials(board)
-                st.success(f"Saved {n} official plays.")
-    with c2:
-        if st.button("📊 Grade pending after results", use_container_width=True):
-            n = grade_pending(logs_global, "Today")
-            st.success(f"AutoGrader updated {n} pending plays for Today from imported player logs.")
-    with c3:
-        if board.empty:
-            st.metric("Current board", 0)
-        else:
-            st.metric("Current board", len(board))
+    st.caption("Save official plays before games. Grade after results are imported. The Results tab shows ✅/❌ by player and market so you can quickly see what cleared the line.")
+    grade_tabs = st.tabs(["Save / Grade", "After Game Results ✅❌", "Raw Logs"])
+    with grade_tabs[0]:
+        board = load_dataset("projection_board")
+        diag_scope_preview = st.selectbox("Grade diagnostics scope", ["Today", "Tomorrow", "All pending"], index=0, key="grade_diag_scope_after_results")
+        diag_mode = None if diag_scope_preview == "All pending" else diag_scope_preview
+        diag = grade_diagnostics(logs_global, diag_mode)
+        with st.expander("AutoGrader status / why it may grade 0", expanded=False):
+            st.json(diag)
+            st.caption("If Matched Completed Logs is 0, import/refresh final player logs first. ESPN screenshots confirm results, but the app needs those stats in the player logs table to auto-grade.")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("💾 Save official before games", use_container_width=True):
+                if board.empty:
+                    st.warning("No projection board cached yet. Refresh a market board first.")
+                else:
+                    n = save_officials(board)
+                    st.success(f"Saved {n} official plays.")
+        with c2:
+            grade_scope = st.selectbox("Grade scope", ["Today", "Tomorrow", "All pending"], index=0, key="grade_scope_after_results")
+            if st.button("📊 Grade pending after results", use_container_width=True):
+                mode_arg = None if grade_scope == "All pending" else grade_scope
+                n = grade_pending(logs_global, mode_arg)
+                st.success(f"AutoGrader updated {n} pending plays for {grade_scope}.")
+        with c3:
+            st.metric("Current board", 0 if board.empty else len(board))
+        st.info("AutoGrader only marks plays when a completed player log exists. Future/not-started games remain pending/skipped.")
     official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
     learning = pd.DataFrame(load_json(LEARNING_LOG, []))
-    if not official.empty:
-        st.markdown("### Official snapshot log")
-        st.dataframe(official.tail(300), use_container_width=True)
-        st.download_button("Download official log CSV", official.to_csv(index=False), "wnba_official_pick_log.csv", "text/csv")
-    else:
-        st.info("No official plays saved yet.")
-    if not learning.empty:
-        st.markdown("### Learning log")
-        if "Result" in learning.columns:
-            total = len(learning)
-            wins = (learning["Result"] == "WIN").sum()
-            st.metric("Learning win rate", f"{wins}/{total} ({wins/total:.1%})" if total else "0/0")
-        st.dataframe(learning.tail(300), use_container_width=True)
-        st.download_button("Download learning log CSV", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
+    with grade_tabs[1]:
+        st.markdown("### After Game Results")
+        results_source = learning if not learning.empty else official
+        results = build_after_game_results_table(results_source)
+        if results.empty:
+            st.info("No graded results yet. After the game, import/refresh player logs and click Grade pending after results.")
+        else:
+            status_filter = st.multiselect("Result filter", sorted(results["Result"].dropna().astype(str).unique().tolist()) if "Result" in results.columns else [], default=sorted(results["Result"].dropna().astype(str).unique().tolist()) if "Result" in results.columns else [])
+            show_results = results.copy()
+            if status_filter and "Result" in show_results.columns:
+                show_results = show_results[show_results["Result"].astype(str).isin(status_filter)]
+            c1, c2, c3, c4 = st.columns(4)
+            total = len(show_results)
+            wins = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "WIN").sum()) if total else 0
+            losses = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "LOSS").sum()) if total else 0
+            pushes = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "PUSH").sum()) if total else 0
+            c1.metric("Graded", total)
+            c2.metric("✅ Wins", wins)
+            c3.metric("❌ Losses", losses)
+            c4.metric("Push", pushes)
+            if total:
+                st.metric("Win rate", f"{wins}/{total} ({wins/total:.1%})")
+            st.dataframe(show_results, use_container_width=True)
+            st.download_button("Download after-game results CSV", show_results.to_csv(index=False), "wnba_after_game_results.csv", "text/csv")
+    with grade_tabs[2]:
+        if not official.empty:
+            st.markdown("### Official snapshot log")
+            st.dataframe(official.tail(300), use_container_width=True)
+            st.download_button("Download official log CSV", official.to_csv(index=False), "wnba_official_pick_log.csv", "text/csv")
+        else:
+            st.info("No official plays saved yet.")
+        if not learning.empty:
+            st.markdown("### Learning log")
+            if "Result" in learning.columns:
+                total = len(learning)
+                wins = (learning["Result"] == "WIN").sum()
+                st.metric("Learning win rate", f"{wins}/{total} ({wins/total:.1%})" if total else "0/0")
+            st.dataframe(learning.tail(300), use_container_width=True)
+            st.download_button("Download learning log CSV", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
 
 with tabs[3]:
     render_data_manager_tab()
