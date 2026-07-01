@@ -3840,6 +3840,180 @@ def grade_pending(logs, mode: Optional[str] = None):
     return updated
 
 
+
+# ============================================================
+# ESPN final boxscore pull + MLB-style end-game autograder
+# ============================================================
+def _espn_parse_min_to_float(v: Any) -> float:
+    """Parse ESPN minutes strings like '34', '34:12', 'DNP' into decimal minutes."""
+    s = str(v or "").strip()
+    if not s or s.upper().startswith("DNP"):
+        return 0.0
+    try:
+        if ":" in s:
+            a, b = s.split(":", 1)
+            return float(a) + float(b[:2] or 0) / 60.0
+        return float(s)
+    except Exception:
+        return safe_float(s, 0.0)
+
+
+def _espn_map_player_stats(labels: List[Any], stats: List[Any]) -> Dict[str, Any]:
+    """Map ESPN boxscore label/value arrays to normalized WNBA player log fields."""
+    row = {"MIN": 0, "PTS": 0, "REB": 0, "AST": 0, "FGA": 0, "FGM": 0, "FG3A": 0, "FG3M": 0, "FTA": 0, "FTM": 0, "OREB": 0, "DREB": 0, "STL": 0, "BLK": 0, "TOV": 0, "PLUS_MINUS": 0}
+    labels = [str(x or "").strip().upper() for x in (labels or [])]
+    values = list(stats or [])
+    # ESPN often uses labels like MIN, FG, 3PT, FT, OREB, DREB, REB, AST, STL, BLK, TO, PF, +/-, PTS
+    for i, lab in enumerate(labels):
+        if i >= len(values):
+            continue
+        val = values[i]
+        if lab in ["MIN", "MINUTES"]:
+            row["MIN"] = _espn_parse_min_to_float(val)
+        elif lab in ["PTS", "POINTS"]:
+            row["PTS"] = safe_float(val, 0)
+        elif lab in ["REB", "REBOUNDS", "TOT"]:
+            row["REB"] = safe_float(val, 0)
+        elif lab in ["AST", "ASSISTS"]:
+            row["AST"] = safe_float(val, 0)
+        elif lab in ["OREB", "OR"]:
+            row["OREB"] = safe_float(val, 0)
+        elif lab in ["DREB", "DR"]:
+            row["DREB"] = safe_float(val, 0)
+        elif lab in ["STL"]:
+            row["STL"] = safe_float(val, 0)
+        elif lab in ["BLK"]:
+            row["BLK"] = safe_float(val, 0)
+        elif lab in ["TO", "TOV"]:
+            row["TOV"] = safe_float(val, 0)
+        elif lab in ["+/-", "PLUS/MINUS", "PLUS_MINUS"]:
+            row["PLUS_MINUS"] = safe_float(val, 0)
+        elif lab in ["FG", "FGM-A"]:
+            s = str(val)
+            if "/" in s:
+                m, a = s.split("/", 1); row["FGM"] = safe_float(m, 0); row["FGA"] = safe_float(a, 0)
+        elif lab in ["3PT", "3P", "FG3", "3PM-A"]:
+            s = str(val)
+            if "/" in s:
+                m, a = s.split("/", 1); row["FG3M"] = safe_float(m, 0); row["FG3A"] = safe_float(a, 0)
+        elif lab in ["FT", "FTM-A"]:
+            s = str(val)
+            if "/" in s:
+                m, a = s.split("/", 1); row["FTM"] = safe_float(m, 0); row["FTA"] = safe_float(a, 0)
+    # Some ESPN groups omit OREB/DREB but include REB; keep REB as source of truth.
+    row["PRA"] = safe_float(row.get("PTS"), 0) + safe_float(row.get("REB"), 0) + safe_float(row.get("AST"), 0)
+    return row
+
+
+def _espn_event_is_final(event: Dict[str, Any]) -> bool:
+    status = event.get("status", {}) or {}
+    typ = status.get("type", {}) or {}
+    state = str(typ.get("state", "")).lower()
+    name = str(typ.get("name", "")).upper()
+    desc = str(typ.get("description", "")).lower()
+    return state in {"post"} or "FINAL" in name or "final" in desc
+
+
+def pull_espn_final_player_logs(mode: str = "Today", force: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Pull final ESPN WNBA boxscores for the selected slate and merge them into player_game_logs.
+
+    This gives the app MLB-style end-game grading: once ESPN marks the game final, the app can fetch
+    player PTS/REB/AST/MIN and grade saved props without you manually importing SportsDataverse logs.
+    Live/not-final games are skipped so tomorrow or in-progress games do not get graded.
+    """
+    target = slate_target_date(mode) if mode in ["Today", "Tomorrow"] else date.today()
+    dbg = []
+    if target is None:
+        return pd.DataFrame(), pd.DataFrame([{"step":"espn_final_logs", "status":"skipped", "message":"No slate date"}])
+    ymd = target.strftime("%Y%m%d")
+    scoreboard_url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard?dates={ymd}"
+    try:
+        r = requests.get(scoreboard_url, timeout=14, headers={"User-Agent":"Mozilla/5.0", "Accept":"application/json"})
+        dbg.append({"step":"scoreboard", "status":f"HTTP {r.status_code}", "message":scoreboard_url})
+        js = r.json() if r.status_code == 200 else {}
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame([{"step":"scoreboard", "status":"error", "message":str(e)[:220]}])
+
+    all_rows = []
+    for ev in js.get("events", []) or []:
+        event_id = str(ev.get("id") or "")
+        if not event_id:
+            continue
+        if not _espn_event_is_final(ev):
+            status_desc = (((ev.get("status") or {}).get("type") or {}).get("description") or "not final")
+            dbg.append({"step":"event", "status":"skipped_not_final", "message":f"{event_id}: {status_desc}"})
+            continue
+        event_date = pd.to_datetime(ev.get("date"), errors="coerce")
+        comps = ev.get("competitions", []) or []
+        comp = comps[0] if comps else {}
+        competitor_teams = {}
+        for c in comp.get("competitors", []) or []:
+            tid = str((c.get("team") or {}).get("id") or c.get("id") or "")
+            ab = _team_key_for_matchup((c.get("team") or {}).get("abbreviation") or (c.get("team") or {}).get("shortDisplayName") or (c.get("team") or {}).get("displayName") or "")
+            competitor_teams[tid] = {"Team": ab, "HomeAway": str(c.get("homeAway", "")).upper()}
+        summary_url = f"https://site.web.api.espn.com/apis/site/v2/sports/basketball/wnba/summary?event={event_id}"
+        try:
+            sr = requests.get(summary_url, timeout=16, headers={"User-Agent":"Mozilla/5.0", "Accept":"application/json"})
+            dbg.append({"step":"summary", "status":f"HTTP {sr.status_code}", "message":summary_url})
+            sj = sr.json() if sr.status_code == 200 else {}
+        except Exception as e:
+            dbg.append({"step":"summary", "status":"error", "message":f"{event_id}: {str(e)[:180]}"})
+            continue
+        players_groups = ((sj.get("boxscore") or {}).get("players") or [])
+        for team_group in players_groups:
+            team_obj = team_group.get("team", {}) or {}
+            team_ab = _team_key_for_matchup(team_obj.get("abbreviation") or team_obj.get("shortDisplayName") or team_obj.get("displayName") or "")
+            team_id = str(team_obj.get("id") or "")
+            if not team_ab and team_id in competitor_teams:
+                team_ab = competitor_teams[team_id].get("Team", "")
+            home_away = competitor_teams.get(team_id, {}).get("HomeAway", "")
+            for stat_group in team_group.get("statistics", []) or []:
+                labels = stat_group.get("labels") or stat_group.get("keys") or []
+                athletes = stat_group.get("athletes") or []
+                for a in athletes:
+                    athlete = a.get("athlete", {}) or {}
+                    player = athlete.get("displayName") or athlete.get("shortName") or athlete.get("name") or ""
+                    if not player:
+                        continue
+                    stats = a.get("stats") or a.get("statistics") or []
+                    vals = _espn_map_player_stats(labels, stats)
+                    # Include DNP rows too, but grading will use actual 0 where a player prop was saved.
+                    row = {
+                        "Player": player,
+                        "Team": team_ab,
+                        "Opponent": "",
+                        "GameDate": event_date if pd.notna(event_date) else pd.Timestamp(target),
+                        "Season": target.year,
+                        "GameID": event_id,
+                        "HomeAway": home_away,
+                        "Starter": bool(a.get("starter", False)),
+                        "Source": "ESPN final boxscore",
+                    }
+                    row.update(vals)
+                    all_rows.append(row)
+    logs_new = standardize_player_logs(pd.DataFrame(all_rows)) if all_rows else pd.DataFrame()
+    if logs_new.empty:
+        return pd.DataFrame(), pd.DataFrame(dbg + [{"step":"espn_final_logs", "status":"no_final_logs", "message":"No final ESPN player rows parsed yet."}])
+    old = load_dataset("player_game_logs")
+    combined = pd.concat([old, logs_new], ignore_index=True, sort=False) if old is not None and not old.empty else logs_new.copy()
+    combined = standardize_player_logs(combined)
+    try:
+        combined.to_csv(CACHE_FILES["player_game_logs"], index=False)
+    except Exception as e:
+        dbg.append({"step":"save_logs", "status":"error", "message":str(e)[:180]})
+    dbg.append({"step":"espn_final_logs", "status":"saved", "message":f"{len(logs_new)} new/updated ESPN player rows; cache now {len(combined)} rows."})
+    return logs_new, pd.DataFrame(dbg)
+
+
+def pull_final_results_and_grade(mode: str = "Today") -> Tuple[int, pd.DataFrame]:
+    """Fetch final ESPN player logs for finished games, then grade selected slate."""
+    logs_new, dbg = pull_espn_final_player_logs(mode, force=True)
+    logs = load_dataset("player_game_logs")
+    n = grade_pending(logs, mode)
+    extra = pd.DataFrame([{"step":"grade_pending", "status":"done", "message":f"Updated {n} pending plays for {mode}."}])
+    dbg = pd.concat([dbg, extra], ignore_index=True, sort=False) if dbg is not None and not dbg.empty else extra
+    return n, dbg
+
 def grade_diagnostics(logs, mode: Optional[str] = None) -> Dict[str, Any]:
     """Quick status check so user can see why AutoGrader updated 0 plays."""
     official = load_json(OFFICIAL_LOG, [])
@@ -7652,6 +7826,8 @@ with st.sidebar:
     use_remote = st.toggle("Allow SportsDataverse remote downloads", value=True)
     use_xgb_blend = st.toggle("Use XGBoost/GBM blend", value=True, help="Keep ON when you want the ensemble projection blended in. Turn OFF while testing if graded samples are still too small.")
     st.session_state["use_xgb_blend"] = bool(use_xgb_blend)
+    auto_final_grade = st.toggle("Auto-check final ESPN results + grade", value=False, help="When ON and the app is open, it checks ESPN final boxscores every few minutes and grades only finished games for today. It does not grade future/not-started games.")
+    st.session_state["auto_final_grade"] = bool(auto_final_grade)
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
     st.markdown("**Model:** Monte Carlo + Bayesian confidence" + (" + XGBoost/GBM blend" if use_xgb_blend else ""))
     st.divider()
@@ -7661,6 +7837,20 @@ with st.sidebar:
     st.caption("This one button refreshes schedule/context, rebuilds feature cache when logs exist, pulls Underdog/manual lines, and rebuilds the projection board.")
 
 logs_global = load_dataset("player_game_logs")
+# MLB-style final-result check: only runs while app is open, throttled so tab switching is safe.
+if st.session_state.get("auto_final_grade", False):
+    last_auto = pd.to_datetime(st.session_state.get("last_auto_final_grade_check", None), errors="coerce")
+    should_check = pd.isna(last_auto) or (pd.Timestamp.now() - last_auto).total_seconds() > 300
+    if should_check:
+        with st.spinner("Checking ESPN final boxscores and grading finished games..."):
+            try:
+                n_auto, dbg_auto = pull_final_results_and_grade("Today")
+                st.session_state["last_auto_final_grade_check"] = now_iso()
+                st.session_state["last_auto_final_grade_count"] = int(n_auto)
+                st.session_state["last_auto_final_grade_dbg"] = dbg_auto.to_dict("records") if dbg_auto is not None else []
+                logs_global = load_dataset("player_game_logs")
+            except Exception as e:
+                st.session_state["last_auto_final_grade_error"] = str(e)[:220]
 master_global = load_dataset("master_features")
 if master_global.empty and not logs_global.empty:
     try:
@@ -7758,9 +7948,15 @@ with tabs[2]:
                 mode_arg = None if grade_scope == "All pending" else grade_scope
                 n = grade_pending(logs_global, mode_arg)
                 st.success(f"AutoGrader updated {n} pending plays for {grade_scope}.")
+            if st.button("🏁 Pull final ESPN results + grade finished games", use_container_width=True):
+                mode_arg = "Today" if grade_scope == "All pending" else grade_scope
+                n, dbg = pull_final_results_and_grade(mode_arg)
+                st.success(f"Pulled final ESPN boxscores and graded {n} finished-game plays for {mode_arg}.")
+                with st.expander("Final-result pull diagnostics", expanded=True):
+                    st.dataframe(dbg, use_container_width=True)
         with c3:
             st.metric("Current board", 0 if board.empty else len(board))
-        st.info("AutoGrader only marks plays when a completed player log exists. Future/not-started games remain pending/skipped.")
+        st.info("AutoGrader only marks plays when a completed player log exists. The ESPN final-results button can pull those logs after the game. Future/not-started games remain pending/skipped.")
     official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
     learning = pd.DataFrame(load_json(LEARNING_LOG, []))
     with grade_tabs[1]:
