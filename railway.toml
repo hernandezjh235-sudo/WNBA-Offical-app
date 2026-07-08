@@ -1,5 +1,5 @@
 [deploy]
-startCommand = "streamlit run app.py --server.address=0.0.0.0 --client.toolbarMode=minimal --logger.level=debug"
+startCommand = "streamlit run app.py --server.address=0.0.0.0 --server.port=$PORT --client.toolbarMode=minimal --logger.level=debug"
 healthcheckPath = "/_stcore/health"
 healthcheckTimeout = 30
 
