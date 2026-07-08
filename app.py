@@ -7854,7 +7854,9 @@ def get_global_datasets() -> Tuple[pd.DataFrame, pd.DataFrame]:
             _master = pd.DataFrame()
     return _logs, _master
 
-logs_global, master_global = get_global_datasets()
+# Lazy load: initialize empty, will load on first UI access
+logs_global = pd.DataFrame()
+master_global = pd.DataFrame()
 
 # MLB-style final-result check: only runs while app is open, throttled so tab switching is safe.
 if st.session_state.get("auto_final_grade", False):
