@@ -7836,7 +7836,26 @@ with st.sidebar:
         st.rerun()
     st.caption("This one button refreshes schedule/context, rebuilds feature cache when logs exist, pulls Underdog/manual lines, and rebuilds the projection board.")
 
-logs_global = load_dataset("player_game_logs")
+@st.cache_data(show_spinner=False)
+def get_global_datasets() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Lazily load player_game_logs and master_features on first use.
+
+    Wrapped in st.cache_data so the blocking I/O (local CSV read or remote
+    GitHub fetch) only happens once per session rather than on every Streamlit
+    rerun, and — critically — never at module import time, which was causing
+    the 2-minute startup timeout.
+    """
+    _logs = load_dataset("player_game_logs")
+    _master = load_dataset("master_features")
+    if _master.empty and not _logs.empty:
+        try:
+            _master, _ = build_master_features()
+        except Exception:
+            _master = pd.DataFrame()
+    return _logs, _master
+
+logs_global, master_global = get_global_datasets()
+
 # MLB-style final-result check: only runs while app is open, throttled so tab switching is safe.
 if st.session_state.get("auto_final_grade", False):
     last_auto = pd.to_datetime(st.session_state.get("last_auto_final_grade_check", None), errors="coerce")
@@ -7848,15 +7867,11 @@ if st.session_state.get("auto_final_grade", False):
                 st.session_state["last_auto_final_grade_check"] = now_iso()
                 st.session_state["last_auto_final_grade_count"] = int(n_auto)
                 st.session_state["last_auto_final_grade_dbg"] = dbg_auto.to_dict("records") if dbg_auto is not None else []
-                logs_global = load_dataset("player_game_logs")
+                # Invalidate the cache so the refreshed logs are picked up on the next rerun.
+                get_global_datasets.clear()
+                logs_global, master_global = get_global_datasets()
             except Exception as e:
                 st.session_state["last_auto_final_grade_error"] = str(e)[:220]
-master_global = load_dataset("master_features")
-if master_global.empty and not logs_global.empty:
-    try:
-        master_global, _ = build_master_features()
-    except Exception:
-        master_global = pd.DataFrame()
 
 # Pull state once for hero summary without forcing rerun behavior.
 try:
