@@ -5066,7 +5066,6 @@ def render_card(r):
         <b>Risk:</b> {risk}<br/>
         <b>Projection matchup used:</b> {_val(r.get('Projection Matchup Used'), matchup)}<br/>
         <b>Opponent context:</b> {_val(r.get('Opponent Context Note'), 'Neutral opponent factor.')}<br/>
-        <b>Opponent market defense:</b> Rank {_val(r.get('Opponent Market Rank'),'—')}/{_val(r.get('Opponent Market Rank Teams'),'—')} (1 toughest) · DRtg {_val(r.get('Opponent DRtg'),'—')} · Pace {_val(r.get('Opponent Pace'),'—')}<br/>
         <b>Matchup:</b> {_val(r.get('Defense vs Position'), 'Position/matchup context unavailable.')}<br/>
         <b>Shot profile:</b> {_val(r.get('Shot Profile Note'), 'No shot profile note.')}<br/>
         <span class='owp-expander-note'><b>Notes:</b> {pass_reason}</span>
@@ -5489,64 +5488,19 @@ def build_position_defense_by_market(force: bool = False) -> pd.DataFrame:
 
 
 def position_defense_context(row: Dict[str, Any], base_row: pd.Series) -> Dict[str, Any]:
-    """Return market/position defense factor plus a visible league rank.
-
-    Rank convention: 1 = toughest (allows the least), N = easiest (allows the most).
-    When only team DRtg fallback data exists, rank is based on DefenseFactor/DRtg proxy
-    and clearly labeled as a fallback rather than pretending it is true position data.
-    """
     opp = _team_key_for_matchup(row.get("Opponent")); market = str(row.get("Market", "")).upper()
     pos = str(row.get("PositionGroup") or base_row.get("PositionGroup") or "ALL")
     d = build_position_defense_by_market(force=False)
-    empty = {"Position Defense Factor": 1.0, "Opponent Market Rank": np.nan,
-             "Opponent Market Rank Teams": np.nan,
-             "Position Defense Note": "Position-defense calibration unavailable."}
     if d.empty or not opp or not market:
-        return empty
-
-    dm = d[d["Market"].astype(str).str.upper() == market].copy()
-    if dm.empty:
-        return empty
-
-    # Prefer the player's exact position group. If unavailable, use ALL/fallback.
-    exact_all = dm[dm["PositionGroup"].astype(str).str.upper() == pos.upper()].copy()
-    if exact_all.empty:
-        exact_all = dm[dm["PositionGroup"].astype(str).str.upper() == "ALL"].copy()
-    if exact_all.empty:
-        exact_all = dm.copy()
-
-    exact_all["_OppKey"] = exact_all["Opponent"].map(_team_key_for_matchup)
-    exact_all["_Allowed"] = pd.to_numeric(exact_all.get("AllowedAvg"), errors="coerce")
-    exact_all["_Factor"] = pd.to_numeric(exact_all.get("DefenseFactor"), errors="coerce")
-    # Keep one row per defense to prevent duplicate-team ranks.
-    exact_all = exact_all.sort_values(["_OppKey"]).drop_duplicates("_OppKey", keep="last")
-    pick_df = exact_all[exact_all["_OppKey"] == opp]
-    if pick_df.empty:
-        return {**empty, "Position Defense Note": f"No {market} defense row matched for {opp}."}
-    pick = pick_df.iloc[0]
+        return {"Position Defense Factor": 1.0, "Position Defense Note": "Position-defense calibration unavailable."}
+    dd = d[(d["Opponent"].map(_team_key_for_matchup) == opp) & (d["Market"].astype(str).str.upper() == market)].copy()
+    if dd.empty:
+        return {"Position Defense Factor": 1.0, "Position Defense Note": "No market-specific opponent defense row."}
+    exact = dd[dd["PositionGroup"].astype(str).str.upper() == pos.upper()]
+    pick = exact.iloc[0] if not exact.empty else dd.iloc[0]
     factor = safe_float(pick.get("DefenseFactor"), 1.0)
     sample = safe_float(pick.get("Sample"), 0)
-
-    # True allowed-stat rank where available. Lower allowed = tougher = rank 1.
-    if exact_all["_Allowed"].notna().sum() >= 3 and pd.notna(pick.get("_Allowed")):
-        exact_all["_RankMetric"] = exact_all["_Allowed"]
-        rank_source = "opponent allowed"
-    else:
-        # Lower factor means tougher; higher means easier.
-        exact_all["_RankMetric"] = exact_all["_Factor"]
-        rank_source = "team DRtg fallback"
-    exact_all = exact_all[exact_all["_RankMetric"].notna()].copy()
-    exact_all["_MarketRank"] = exact_all["_RankMetric"].rank(method="min", ascending=True)
-    rank_row = exact_all[exact_all["_OppKey"] == opp]
-    market_rank = safe_float(rank_row.iloc[0].get("_MarketRank"), np.nan) if not rank_row.empty else np.nan
-    team_count = int(exact_all["_OppKey"].nunique())
-    rank_text = f"rank {int(market_rank)}/{team_count} (1 toughest)" if pd.notna(market_rank) else "rank unavailable"
-    return {
-        "Position Defense Factor": round(float(factor), 4),
-        "Opponent Market Rank": round(float(market_rank), 0) if pd.notna(market_rank) else np.nan,
-        "Opponent Market Rank Teams": team_count,
-        "Position Defense Note": f"{opp} vs {pos} {market}: {rank_text}; factor {factor:.3f}, sample {int(sample)} ({rank_source}; {pick.get('Source','')})."
-    }
+    return {"Position Defense Factor": round(float(factor), 4), "Position Defense Note": f"{opp} vs {pos} {market}: factor {factor:.3f}, sample {int(sample)} ({pick.get('Source','')})."}
 
 
 def referee_tendency_engine(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -7804,6 +7758,104 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
 
 
 
+# -----------------------------------------------------------------------------
+# Copy / Paste Slate Tracker
+# -----------------------------------------------------------------------------
+def _slate_side_and_icon(row: pd.Series) -> tuple[str, str]:
+    lean = str(row.get("Lean", "")).upper()
+    official = str(row.get("Official", "")).upper()
+    score = safe_float(row.get("Official Play Score"), 0)
+    side_prob = safe_float(row.get("Over %"), 0) if "OVER" in f"{lean} {official}" else safe_float(row.get("Under %"), 0)
+    if "OVER" in f"{lean} {official}":
+        side = "O"
+    elif "UNDER" in f"{lean} {official}":
+        side = "U"
+    else:
+        side = "O" if safe_float(row.get("Edge"), 0) >= 0 else "U"
+    if score >= 82 and side_prob >= 64:
+        icon = "🔥"
+    elif score >= 70 and side_prob >= 58:
+        icon = "⚠️"
+    else:
+        icon = ""
+    return side, icon
+
+
+def _slate_matchup_label(row: pd.Series) -> str:
+    matchup = str(row.get("Matchup", "") or row.get("Projection Matchup Used", "")).strip()
+    if matchup and matchup.lower() not in {"nan", "none", "unknown"}:
+        return matchup.replace(" vs ", " @ ").replace(" VS ", " @ ")
+    team = str(row.get("Team", "")).strip().upper()
+    opp = str(row.get("Opponent", "")).strip().upper()
+    homeaway = str(row.get("HomeAway", "")).upper()
+    if team and opp:
+        return f"{team} @ {opp}" if homeaway == "AWAY" else f"{opp} @ {team}" if homeaway == "HOME" else f"{team} vs {opp}"
+    return team or opp or "WNBA SLATE"
+
+
+def build_copy_paste_slate(df: pd.DataFrame, best_only: bool = False, max_rows: int = 0) -> str:
+    """Create a clean matchup-grouped tracking slate from every real line."""
+    if df is None or df.empty:
+        return "No projections available."
+    work = df.copy()
+    for c in ["Line", "Projection", "Edge", "Official Play Score", "Over %", "Under %", "MIN Proj"]:
+        if c in work.columns:
+            work[c] = pd.to_numeric(work[c], errors="coerce")
+    work = work[work.get("Line", pd.Series(index=work.index, dtype=float)).notna() & work.get("Projection", pd.Series(index=work.index, dtype=float)).notna()].copy()
+    if "Source" in work.columns:
+        bad = work["Source"].astype(str).str.upper().str.contains("NO LINE|TRACKED ONLY|MISSING", na=False)
+        work = work[~bad]
+    if work.empty:
+        return "No real-line projections available."
+    work["_matchup"] = work.apply(_slate_matchup_label, axis=1)
+    work["_abs_edge"] = pd.to_numeric(work.get("Edge", 0), errors="coerce").abs()
+    work["_score"] = pd.to_numeric(work.get("Official Play Score", 0), errors="coerce").fillna(0)
+    if best_only:
+        official_mask = work.get("Official", pd.Series(index=work.index, dtype=str)).astype(str).str.contains("OVER|UNDER", case=False, na=False)
+        strong = work[official_mask | ((work["_score"] >= 70) & (work["_abs_edge"] >= 1.5))].copy()
+        if not strong.empty:
+            work = strong
+        else:
+            work = work.sort_values(["_score", "_abs_edge"], ascending=False).head(12)
+    work = work.sort_values(["_matchup", "_score", "_abs_edge"], ascending=[True, False, False])
+    if max_rows and max_rows > 0:
+        work = work.head(max_rows)
+    blocks = []
+    for matchup, group in work.groupby("_matchup", sort=False):
+        lines = [str(matchup)]
+        for _, r in group.iterrows():
+            side, icon = _slate_side_and_icon(r)
+            player = str(r.get("Player", "Player"))
+            market = str(r.get("Market", "PROP")).upper()
+            line = _fmt_num_compact(r.get("Line"), 1)
+            proj = _fmt_num_compact(r.get("Projection"), 2)
+            mins = _fmt_num_compact(r.get("MIN Proj"), 2)
+            icon_txt = f"{icon} " if icon else ""
+            minute_txt = f" — MIN {mins}" if mins != "—" else ""
+            lines.append(f"• {player} — {icon_txt}{side} {line} {market} — {proj} PROJ{minute_txt}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def render_slate_tracker(board_df: pd.DataFrame, key_prefix: str = "slate_tracker"):
+    st.subheader("Copy/Paste Slate — All WNBA Projections")
+    st.caption("Tracking list grouped by matchup. It shows every real-line projection and keeps Best Slate separate from the full board.")
+    if board_df is None or board_df.empty:
+        st.warning("No projection board cached yet. Refresh Today or All Lines first.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        best_text = build_copy_paste_slate(board_df, best_only=True)
+        st.markdown("#### Best slate")
+        st.text_area("Best projections slate", best_text, height=320, key=f"{key_prefix}_best_text")
+        st.download_button("Download best slate.txt", best_text, "wnba_best_slate.txt", "text/plain", key=f"{key_prefix}_best_dl")
+    with c2:
+        all_text = build_copy_paste_slate(board_df, best_only=False)
+        st.markdown("#### All projections slate")
+        st.text_area("All projections slate", all_text, height=320, key=f"{key_prefix}_all_text")
+        st.download_button("Download all projections.txt", all_text, "wnba_all_projections.txt", "text/plain", key=f"{key_prefix}_all_dl")
+    st.info("Save Before tracks the real-line rows for grading. The text slate is for copy/paste and quick tracking; it does not replace the saved official log.")
+
 def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: str, max_key: str, official_key: str, saved_view: bool = False) -> pd.DataFrame:
     """Render an already-built projection board with fast table / card toggle."""
     key_prefix = f"saved_group_{mode}" if saved_view else f"live_group_{mode}"
@@ -8517,8 +8569,8 @@ def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
     for idx, rr in out.iterrows():
         market = str(rr.get("Market", "PTS")).upper()
         opponent = _first_text_value(rr, ["Opponent", "Opp", "Opponent Team"], "")
-        pace = _first_numeric_value(rr, ["Opponent Pace", "Game Context Pace", "Opp_Team_Pace_Official", "Opp Pace", "Opp_Pace", "Game Pace Projection", "Projected Pace"])
-        drtg = _first_numeric_value(rr, ["Opponent DRtg", "Opponent DRtg Used", "Opp_Team_DRtg_Official", "Opp_Adv_DEF_RATING", "Opp DRtg", "Opp_DRtg", "Opponent Defensive Rating"])
+        pace = _first_numeric_value(rr, ["Opponent Pace", "Opp Pace", "Opp_Pace", "Game Pace Projection", "Projected Pace", "Team_Pace_Official"])
+        drtg = _first_numeric_value(rr, ["Opponent DRtg", "Opp DRtg", "Opp_DRtg", "Opponent Defensive Rating", "Team_DRtg_Official"])
         net = _first_numeric_value(rr, ["Opponent NetRtg", "Opp NetRtg", "Opp_NetRtg"])
         pos_factor = _first_numeric_value(rr, ["Position Defense Factor", "Market Defense Factor"], 1.0)
         market_rank = _first_numeric_value(rr, [f"{market} Allowed Rank", "Opponent Market Rank", "Defense Rank", "Opp Def Rank"])
@@ -8531,11 +8583,8 @@ def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
         context_score = float(np.clip(context_score, 0, 100))
         grade = "Favorable" if context_score >= 58 else "Tough" if context_score <= 42 else "Neutral"
         rank_label = _rank_label(market_rank)
-        rank_teams = _first_numeric_value(rr, ["Opponent Market Rank Teams"], np.nan)
         note_parts = [f"{opponent or 'Opponent unavailable'}", f"{market} matchup: {grade}"]
-        if pd.notna(market_rank):
-            denom = f"/{int(rank_teams)}" if pd.notna(rank_teams) else ""
-            note_parts.append(f"market def rank {market_rank:.0f}{denom} ({rank_label}; 1 toughest)")
+        if pd.notna(market_rank): note_parts.append(f"def rank {market_rank:.0f} ({rank_label})")
         if pd.notna(pace): note_parts.append(f"pace {pace:.1f}")
         if pd.notna(drtg): note_parts.append(f"DRtg {drtg:.1f}")
         if pd.notna(pos_factor): note_parts.append(f"position factor {pos_factor:.3f}")
@@ -8554,161 +8603,6 @@ def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
             out.at[idx, "PASS Reason"] = "Opponent could not be verified from today's schedule."
     return out
 
-
-
-# -----------------------------------------------------------------------------
-# v3.5 FULL PROJECTION PRECISION UPGRADE
-# Adds minutes/usage/opportunity confidence, automatic opponent verification,
-# projection ranges, explainability, and stricter official-play validation.
-# -----------------------------------------------------------------------------
-
-def _bounded_score(value: float, low: float = 0.0, high: float = 100.0) -> float:
-    try:
-        return float(np.clip(float(value), low, high))
-    except Exception:
-        return float(low)
-
-
-def _row_recent_std(row: pd.Series, market: str) -> float:
-    candidates = [
-        row.get("Recent Std"), row.get("Std"), row.get("L10 Std"),
-        row.get(f"{market} Std"), row.get("Market Std"), row.get("Simulation SD")
-    ]
-    for v in candidates:
-        n = safe_float(v, np.nan)
-        if pd.notna(n) and n > 0:
-            return float(n)
-    defaults = {"PTS": 5.0, "REB": 2.4, "AST": 2.0, "PRA": 6.7}
-    return defaults.get(market, 4.0)
-
-
-def _full_projection_precision_layer(board: pd.DataFrame, base: pd.DataFrame, mode: str = "Today") -> pd.DataFrame:
-    if board is None or board.empty:
-        return board
-    out = board.copy()
-    try:
-        out = enrich_board_with_matchups(out, mode)
-        out = apply_matchup_context_to_board(out)
-    except Exception:
-        pass
-
-    bmap = {}
-    if base is not None and not base.empty and "Player" in base.columns:
-        bmap = {normalize_name(r.get("Player")): r for _, r in base.iterrows()}
-
-    rows = []
-    for _, rr in out.iterrows():
-        row = rr.copy()
-        market = str(row.get("Market", "PTS")).upper()
-        br = bmap.get(normalize_name(row.get("Player")), pd.Series(dtype=object))
-
-        mins = safe_float(row.get("MIN Proj"), safe_float(br.get("MinutesProjectionBase"), np.nan))
-        min_l5 = safe_float(br.get("MIN_l5"), safe_float(row.get("L5 Minutes"), mins))
-        min_l10 = safe_float(br.get("MIN_l10"), safe_float(row.get("L10 Minutes"), mins))
-        min_season = safe_float(br.get("MIN_avg"), safe_float(row.get("Season Minutes"), mins))
-        min_spread = np.nanstd([x for x in [min_l5, min_l10, min_season] if pd.notna(x)])
-        starter_conf = safe_float(row.get("Role Confidence"), safe_float(br.get("RoleConfidence"), 70))
-        minutes_conf = 92 - min(35, float(min_spread if pd.notna(min_spread) else 3.0) * 7)
-        minutes_conf = _bounded_score(0.65 * minutes_conf + 0.35 * starter_conf)
-        if pd.isna(mins) or mins < 5 or mins > 40.5:
-            minutes_conf = min(minutes_conf, 35)
-
-        fga = safe_float(row.get("Projected FGA"), np.nan)
-        usage_proxy = safe_float(row.get("Usage Proxy"), safe_float(br.get("USG_avg"), np.nan))
-        l5_avg = safe_float(row.get("L5 Avg"), np.nan)
-        l10_avg = safe_float(row.get("L10 Avg"), np.nan)
-        season_avg = safe_float(row.get("Season Avg"), np.nan)
-        recent_dispersion = np.nanstd([x for x in [l5_avg, l10_avg, season_avg] if pd.notna(x)])
-        usage_conf = 84.0
-        if pd.notna(fga): usage_conf += 5
-        if pd.notna(usage_proxy): usage_conf += 5
-        if pd.notna(recent_dispersion): usage_conf -= min(24, recent_dispersion * 3.0)
-        usage_conf = _bounded_score(usage_conf)
-
-        opponent = str(row.get("Opponent") or "").strip()
-        matchup_score = safe_float(row.get("Opponent Matchup Score"), 50)
-        matchup_conf = 90 if opponent else 35
-        if str(row.get("Data Integrity", "")).upper() == "VERIFIED":
-            matchup_conf += 4
-        matchup_conf = _bounded_score(matchup_conf)
-
-        injury_text = " ".join(str(row.get(c, "")) for c in ["Injury Status", "Health Status", "Lineup Status", "Status"]).upper()
-        health_conf = 100.0
-        if any(k in injury_text for k in ["QUESTIONABLE", "GTD", "DOUBTFUL", "LIMIT", "RETURN"]):
-            health_conf = 58.0
-        if any(k in injury_text for k in ["OUT", "INACTIVE"]):
-            health_conf = 15.0
-
-        data_score = safe_float(row.get("Data Score"), safe_float(br.get("DataScore"), 65))
-        final_conf = _bounded_score(
-            0.34 * minutes_conf + 0.23 * usage_conf + 0.15 * matchup_conf +
-            0.12 * health_conf + 0.16 * data_score
-        )
-
-        proj = safe_float(row.get("Projection"), np.nan)
-        line = safe_float(row.get("Line"), np.nan)
-        sd = _row_recent_std(row, market)
-        # Uncertain minutes widen the range instead of falsely inflating the mean.
-        sd *= 1.0 + max(0.0, (80.0 - minutes_conf) / 160.0)
-        floor = proj - 0.85 * sd if pd.notna(proj) else np.nan
-        ceiling = proj + 0.85 * sd if pd.notna(proj) else np.nan
-        median = safe_float(row.get("Median Projection"), proj)
-
-        base_proj = safe_float(row.get("Raw Projection Before Matchup"), safe_float(row.get("Baseline Projection"), np.nan))
-        if pd.isna(base_proj):
-            base_proj = proj
-        matchup_delta = (proj - base_proj) if pd.notna(proj) and pd.notna(base_proj) else 0.0
-        recent_note = "stable" if pd.isna(recent_dispersion) or recent_dispersion < 1.25 else "mixed" if recent_dispersion < 2.75 else "volatile"
-        explain = (
-            f"Base {base_proj:.2f} → minutes {mins:.1f} ({minutes_conf:.0f}% confidence) → "
-            f"opportunity {usage_conf:.0f}% → matchup {matchup_delta:+.2f} vs {opponent or 'unresolved'} → "
-            f"recent form {recent_note} → final {proj:.2f}."
-        ) if pd.notna(proj) and pd.notna(mins) else str(row.get("Projection Explanation", "Projection inputs incomplete."))
-
-        row["Minutes Confidence"] = round(minutes_conf, 1)
-        row["Usage Confidence"] = round(usage_conf, 1)
-        row["Matchup Confidence"] = round(matchup_conf, 1)
-        row["Health Confidence"] = round(health_conf, 1)
-        row["Final Projection Confidence"] = round(final_conf, 1)
-        row["Projection Floor"] = round(max(0.0, floor), 2) if pd.notna(floor) else np.nan
-        row["Projection Median"] = round(max(0.0, median), 2) if pd.notna(median) else np.nan
-        row["Projection Mean"] = round(max(0.0, proj), 2) if pd.notna(proj) else np.nan
-        row["Projection Ceiling"] = round(max(0.0, ceiling), 2) if pd.notna(ceiling) else np.nan
-        row["Explainability Panel"] = explain
-        row["Opponent Verified"] = "YES" if opponent else "NO"
-
-        edge = abs(safe_float(row.get("Edge"), 0))
-        side_prob = max(safe_float(row.get("Over %"), 50), safe_float(row.get("Under %"), 50))
-        sanity = str(row.get("Projection Sanity", "PASS")).upper()
-        integrity = str(row.get("Data Integrity", "LIMITED")).upper()
-        # A line remains visible and trackable, but cannot be promoted as official
-        # unless workload, matchup, health, and the full confidence stack verify.
-        min_edge = {"PTS": 1.5, "REB": 0.9, "AST": 0.8, "PRA": 2.2}.get(market, 1.2)
-        if (not opponent or final_conf < 74 or minutes_conf < 72 or health_conf < 55 or
-                side_prob < 60 or edge < min_edge or sanity == "FAIL" or integrity == "INCOMPLETE"):
-            row["Official"] = "PASS"
-            row["PASS Reason"] = (
-                f"Opponent {'verified' if opponent else 'missing'} · final confidence {final_conf:.0f}% · "
-                f"minutes {minutes_conf:.0f}% · probability {side_prob:.1f}% · edge {edge:.2f}"
-            )
-            if str(row.get("Tier", "")).upper() in ["S", "A", "B"]:
-                row["Tier"] = "TRACK"
-
-        # Improve hit score by rewarding repeatable opportunity and penalizing uncertainty.
-        old_hit = safe_float(row.get("Hit Score"), side_prob)
-        row["Hit Score"] = round(_bounded_score(0.55 * old_hit + 0.25 * final_conf + 0.20 * minutes_conf), 1)
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-_make_projection_board_v34_precision = make_projection_board
-
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
-    board = _make_projection_board_v34_precision(lines, logs, base, mode)
-    board = _full_projection_precision_layer(board, base, mode or "Today")
-    if board is not None and not board.empty:
-        save_dataset("projection_board", board)
-    return board
 
 # Card/table overrides: show the actual opponent, matchup score, data integrity,
 # projection audit, minutes and component breakdown without hiding any lines.
@@ -8733,7 +8627,7 @@ def _grouped_market_html(r: pd.Series) -> str:
         <div class='owp-market-main'><span class='owp-market-proj'>{proj}</span><span class='owp-market-edge {edge_cls}'>{_fmt_num_compact(edge_v,1)} vs {line}</span><span class='owp-market-tier'>{r.get('Tier','')}</span></div>
         <div class='owp-prob-track owp-market-track'><div class='owp-prob-fill' style='width:{fill:.0f}%'></div></div>
         <div class='owp-market-sub'><span>OVER {_fmt_num_compact(overp,0)}%</span><span>UNDER {_fmt_num_compact(underp,0)}%</span></div>
-        <div class='owp-market-note'><b>Opponent:</b> {matchup}<br/><b>Market defense:</b> Rank {_fmt_num_compact(r.get('Opponent Market Rank'),0)}/{_fmt_num_compact(r.get('Opponent Market Rank Teams'),0)} (1 toughest) · DRtg {_fmt_num_compact(r.get('Opponent DRtg'),1)} · Pace {_fmt_num_compact(r.get('Opponent Pace'),1)}<br/><b>Workload:</b> {opportunity or 'minutes-based projection'}<br/><b>Range:</b> {_fmt_num_compact(r.get('Projection Floor'),1)} / {_fmt_num_compact(r.get('Projection Median'),1)} / {_fmt_num_compact(r.get('Projection Ceiling'),1)} (floor/median/ceiling)<br/><b>Confidence:</b> Minutes {_fmt_num_compact(r.get('Minutes Confidence'),0)}% · Usage {_fmt_num_compact(r.get('Usage Confidence'),0)}% · Matchup {_fmt_num_compact(r.get('Matchup Confidence'),0)}% · Final {_fmt_num_compact(r.get('Final Projection Confidence'),0)}%<br/><b>Why:</b> {str(r.get('Explainability Panel',''))[:220]}<br/><b>Checks:</b> Data {integrity} · Projection {sanity}</div>
+        <div class='owp-market-note'><b>Opponent:</b> {matchup}<br/><b>Workload:</b> {opportunity or 'minutes-based projection'}<br/><b>Checks:</b> Data {integrity} · Projection {sanity}</div>
       </div>
     """
 
@@ -8745,487 +8639,14 @@ def grouped_board_table_view(proj_df: pd.DataFrame) -> pd.DataFrame:
     df["_market_order"] = df.get("Market", "").astype(str).str.upper().map(order).fillna(99)
     keep = [c for c in [
         "Player","Team","Opponent","Matchup","Opponent Matchup Grade","Opponent Matchup Score",
-        "Opponent Market Rank","Opponent Market Rank Teams","Opponent Pace","Opponent DRtg","Market","Projection","Line","Edge",
+        "Opponent Market Rank","Opponent Pace","Opponent DRtg","Market","Projection","Line","Edge",
         "Lean","Over %","Under %","Hit Score","Official Play Score","Tier","MIN Proj","Projected FGA",
-        "L5 Avg","L10 Avg","Season Avg","Minutes Confidence","Usage Confidence","Matchup Confidence","Health Confidence","Final Projection Confidence","Projection Floor","Projection Median","Projection Ceiling","Opponent Verified","Data Integrity","Projection Sanity","Official","PASS Reason","Source"
+        "L5 Avg","L10 Avg","Season Avg","Data Integrity","Projection Sanity","Official","PASS Reason","Source"
     ] if c in df.columns]
     out = df.sort_values(["Player","_market_order","Line"], na_position="last")[keep].copy()
-    for c in ["Projection","Line","Edge","Over %","Under %","Hit Score","Official Play Score","MIN Proj","Projected FGA","Opponent Matchup Score","Opponent Market Rank","Opponent Market Rank Teams","Opponent Pace","Opponent DRtg","Minutes Confidence","Usage Confidence","Matchup Confidence","Health Confidence","Final Projection Confidence","Projection Floor","Projection Median","Projection Ceiling"]:
+    for c in ["Projection","Line","Edge","Over %","Under %","Hit Score","Official Play Score","MIN Proj","Projected FGA","Opponent Matchup Score","Opponent Market Rank","Opponent Pace","Opponent DRtg"]:
         if c in out.columns: out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
     return out
-
-
-
-# -----------------------------------------------------------------------------
-# v3.6 TRUE PROJECTION + 12-LAYER DECISION ENGINE
-# Uses only fields actually available in the live/cached datasets. Missing
-# inputs lower confidence; they are never silently invented as real data.
-# -----------------------------------------------------------------------------
-
-def _v36_num(row, names, default=np.nan):
-    for name in names:
-        if name in row.index:
-            value = safe_float(row.get(name), np.nan)
-            if pd.notna(value):
-                return float(value)
-    return default
-
-
-def _v36_text(row, names, default=""):
-    for name in names:
-        if name in row.index:
-            value = str(row.get(name) or "").strip()
-            if value and value.lower() not in {"nan", "none"}:
-                return value
-    return default
-
-
-def _v36_market_sd(market, mean, recent_std=np.nan, minutes_conf=75.0):
-    fallback = {"PTS": 5.0, "REB": 2.5, "AST": 2.1, "PRA": 7.0}.get(market, 4.0)
-    sd = recent_std if pd.notna(recent_std) and recent_std > 0 else fallback
-    # Scale naturally for unusually low/high means, then widen for uncertain role.
-    scale = np.clip((max(mean, 1.0) / {"PTS": 16, "REB": 6, "AST": 4, "PRA": 25}.get(market, 10)) ** 0.18, 0.78, 1.32)
-    uncertainty = 1.0 + max(0.0, 78.0 - minutes_conf) / 130.0
-    return float(np.clip(sd * scale * uncertainty, 0.65, 14.0))
-
-
-def _v36_projection_engine(board: pd.DataFrame, base: pd.DataFrame, mode: str = "Today") -> pd.DataFrame:
-    if board is None or board.empty:
-        return board
-    out = board.copy()
-    bmap = {}
-    if base is not None and not base.empty and "Player" in base.columns:
-        bmap = {normalize_name(r.get("Player")): r for _, r in base.iterrows()}
-
-    enhanced = []
-    for _, src in out.iterrows():
-        row = src.copy()
-        br = bmap.get(normalize_name(row.get("Player")), pd.Series(dtype=object))
-        market = str(row.get("Market", "PTS")).upper()
-        line = safe_float(row.get("Line"), np.nan)
-        old_proj = safe_float(row.get("Projection"), np.nan)
-        if pd.isna(old_proj):
-            enhanced.append(row); continue
-
-        # 1) Player ability + adaptive Bayesian recent-form shrinkage.
-        season = _v36_num(row, ["Season Avg", "Season Average"], _v36_num(br, [f"{market}_avg", market], old_proj))
-        l5 = _v36_num(row, ["L5 Avg"], _v36_num(br, [f"{market}_l5"], np.nan))
-        l10 = _v36_num(row, ["L10 Avg"], _v36_num(br, [f"{market}_l10"], np.nan))
-        l20 = _v36_num(row, ["L20 Avg"], _v36_num(br, [f"{market}_l20"], np.nan))
-        prior = _v36_num(br, [f"{market}_prior", f"{market}_last", f"{market}_avg"], season)
-        role_change = abs(_v36_num(row, ["MIN Proj"], 0) - _v36_num(br, ["MIN_avg", "MinutesProjectionBase"], _v36_num(row,["MIN Proj"],0)))
-        recent_weight = 0.54 if role_change >= 3.0 else 0.40
-        recent_vals = [(l5, 0.45), (l10, 0.35), (l20, 0.20)]
-        present = [(v,w) for v,w in recent_vals if pd.notna(v)]
-        recent = sum(v*w for v,w in present)/sum(w for _,w in present) if present else season
-        ability = recent_weight * recent + (1-recent_weight) * (0.72*season + 0.28*prior)
-        # Kalman-style smoothing: do not allow a single refresh to jump too far.
-        ability = 0.70 * ability + 0.30 * old_proj
-
-        # 2) Minutes/rotation engine with workload confidence.
-        mins = _v36_num(row, ["MIN Proj"], _v36_num(br,["MinutesProjectionBase","MIN_avg"], np.nan))
-        min_l5 = _v36_num(br,["MIN_l5"], _v36_num(row,["L5 Minutes"], mins))
-        min_l10 = _v36_num(br,["MIN_l10"], _v36_num(row,["L10 Minutes"], mins))
-        min_season = _v36_num(br,["MIN_avg"], _v36_num(row,["Season Minutes"], mins))
-        min_vals = [v for v in [min_l5,min_l10,min_season] if pd.notna(v)]
-        min_sd = float(np.std(min_vals)) if len(min_vals) >= 2 else 3.0
-        rotation_conf = _bounded_score(94 - 7.2*min_sd)
-        starter = _v36_text(row,["Lineup Status","Starter Status","Role"],"").upper()
-        if "BENCH" in starter: rotation_conf -= 8
-        if "CONFIRMED" in starter or "START" in starter: rotation_conf += 4
-        rotation_conf = _bounded_score(rotation_conf)
-
-        # 3) Opportunity engine (volume first, efficiency second).
-        fga = _v36_num(row,["Projected FGA","FGA Proj"], _v36_num(br,["FGA_l5","FGA_avg"], np.nan))
-        tpa = _v36_num(row,["Projected 3PA","3PA Proj"], _v36_num(br,["3PA_l5","3PA_avg"], np.nan))
-        fta = _v36_num(row,["Projected FTA","FTA Proj"], _v36_num(br,["FTA_l5","FTA_avg"], np.nan))
-        usg = _v36_num(row,["Usage Proxy","Usage","USG%"], _v36_num(br,["USG_l5","USG_avg"], np.nan))
-        pot_ast = _v36_num(row,["Potential Assists","Potential AST"], _v36_num(br,["PotentialAssists_l5","PotentialAssists_avg"], np.nan))
-        reb_ch = _v36_num(row,["Rebound Chances","REB Chances"], _v36_num(br,["ReboundChances_l5","ReboundChances_avg"], np.nan))
-        opportunity_known = sum(pd.notna(v) for v in [fga,tpa,fta,usg,pot_ast,reb_ch])
-        opp_conf = _bounded_score(58 + opportunity_known*6 + (6 if pd.notna(mins) else 0))
-
-        # 4) Injury/availability redistribution — only when actual flags/context exist.
-        inj = " ".join(_v36_text(row,[c],"") for c in ["Injury Status","Health Status","Status","Team Injury Context","Injury Ripple Note"]).upper()
-        injury_adj = _v36_num(row,["Injury Ripple Adjustment","Injury Adjustment"], 0.0)
-        health_conf = 100.0
-        if any(x in inj for x in ["QUESTIONABLE","GTD","DOUBTFUL","LIMIT"]): health_conf = 55.0
-        if any(x in inj for x in ["OUT","INACTIVE"]): health_conf = 10.0
-        # Hard cap prevents fake usage bumps from overwhelming the baseline.
-        injury_adj = float(np.clip(injury_adj, -0.08*old_proj, 0.10*old_proj))
-
-        # 5) Matchup/pace/possessions.
-        pace = _v36_num(row,["Expected Pace","Opponent Pace","Game Pace"], np.nan)
-        league_pace = _v36_num(row,["League Pace"], 99.0)
-        pace_factor = float(np.clip(pace/league_pace, 0.95, 1.05)) if pd.notna(pace) and league_pace > 0 else 1.0
-        matchup_delta = _v36_num(row,["Matchup Projection Adjustment","Opponent Matchup Adjustment"], 0.0)
-        matchup_delta = float(np.clip(matchup_delta, -0.045*old_proj, 0.045*old_proj))
-
-        # 6) Market/game context: spread, total, home/away, rest, travel, blowout.
-        spread = abs(_v36_num(row,["Spread","Game Spread","Vegas Spread"], 0.0))
-        game_total = _v36_num(row,["Game Total","Vegas Total","Total"], np.nan)
-        rest_days = _v36_num(row,["Rest Days"], np.nan)
-        travel = _v36_num(row,["Travel Miles"], 0.0)
-        blowout_prob = 1/(1+np.exp(-(spread-8.0)/2.2)) if spread > 0 else 0.12
-        blowout_min_loss = max(0.0, blowout_prob-0.28) * (2.8 if mins and mins >= 28 else 1.4)
-        rest_factor = 1.0
-        if pd.notna(rest_days):
-            if rest_days <= 0: rest_factor -= 0.018
-            elif rest_days >= 3: rest_factor += 0.006
-        if travel >= 1200: rest_factor -= 0.008
-        context_factor = float(np.clip(rest_factor * (1 - blowout_min_loss/max(mins or 30, 20)), 0.94, 1.025))
-
-        # 7) Foul risk / referee environment where available.
-        foul_rate = _v36_num(row,["Fouls Per Minute","PF Per Minute","Foul Rate"], _v36_num(br,["PF_per_min"], np.nan))
-        foul_penalty = 1.0
-        if pd.notna(foul_rate): foul_penalty -= float(np.clip((foul_rate-0.09)*0.16, 0, 0.025))
-        ref_adj = _v36_num(row,["Referee Projection Adjustment"], 0.0)
-        ref_adj = float(np.clip(ref_adj, -0.015*old_proj, 0.015*old_proj))
-
-        # 8) Build mathematically bounded mean. Opportunity/role lead; matchup is small.
-        mean = ability * pace_factor * context_factor * foul_penalty + injury_adj + matchup_delta + ref_adj
-        # Pull toward market slightly only when consensus/line movement is known.
-        opening = _v36_num(row,["Opening Line","Open Line"], np.nan)
-        current = line
-        market_move = current-opening if pd.notna(opening) and pd.notna(current) else 0.0
-        market_adj = float(np.clip(market_move*0.10, -0.35, 0.35))
-        mean += market_adj
-        # Sanity: maximum deviation from a robust baseline without verified role change.
-        robust = np.nanmedian([v for v in [season,l10,l5,old_proj] if pd.notna(v)])
-        max_jump = 0.30 if role_change >= 3 or abs(injury_adj) > 0 else 0.19
-        mean = float(np.clip(mean, max(0, robust*(1-max_jump)), robust*(1+max_jump)))
-
-        # 9) Dynamic variance + Monte Carlo probability/range.
-        recent_std = _row_recent_std(row, market)
-        sd = _v36_market_sd(market, mean, recent_std, rotation_conf)
-        seed = stable_seed(f"v36|{row.get('Player')}|{row.get('Opponent')}|{market}|{line}|{mode}")
-        rng = np.random.default_rng(seed)
-        sims = rng.normal(mean, sd, 30000)
-        sims = np.clip(sims, 0, None)
-        # Rare game-state branches.
-        if len(sims):
-            blow_mask = rng.random(len(sims)) < blowout_prob*0.22
-            sims[blow_mask] *= rng.uniform(0.78,0.93,blow_mask.sum())
-            foul_mask = rng.random(len(sims)) < (0.035 if pd.isna(foul_rate) else np.clip(foul_rate*0.25,0.02,0.09))
-            sims[foul_mask] *= rng.uniform(0.72,0.92,foul_mask.sum())
-            ot_mask = rng.random(len(sims)) < 0.055
-            sims[ot_mask] *= rng.uniform(1.05,1.14,ot_mask.sum())
-        median = float(np.median(sims)); p20=float(np.quantile(sims,.20)); p80=float(np.quantile(sims,.80))
-        overp = float((sims > line).mean()*100) if pd.notna(line) else 50.0
-        underp = 100-overp
-        lean = "OVER" if pd.notna(line) and median > line else "UNDER"
-        edge = median-line if pd.notna(line) else np.nan
-
-        # 10) Calibration and player/market learning (bounded).
-        # learning_adjustment requires the current base edge and returns
-        # (numeric adjustment, explanation, Bayesian win-rate estimate).
-        # The previous two-argument call crashed Railway at runtime.
-        if 'learning_adjustment' in globals():
-            try:
-                learned_result = learning_adjustment(
-                    row.get("Player"),
-                    market,
-                    safe_float(edge, 0.0),
-                )
-                if isinstance(learned_result, (tuple, list)):
-                    learned = safe_float(learned_result[0], 0.0)
-                    learning_note = str(learned_result[1]) if len(learned_result) > 1 else ""
-                    learning_bayes = safe_float(learned_result[2], 50.0) if len(learned_result) > 2 else 50.0
-                else:
-                    learned = safe_float(learned_result, 0.0)
-                    learning_note = ""
-                    learning_bayes = 50.0
-            except Exception as exc:
-                learned = 0.0
-                learning_note = f"Learning fallback: {type(exc).__name__}"
-                learning_bayes = 50.0
-        else:
-            learned = 0.0
-            learning_note = "Learning unavailable"
-            learning_bayes = 50.0
-        learned = float(np.clip(learned, -0.65, 0.65))
-        median += learned; mean += learned
-        if pd.notna(line):
-            edge = median-line
-            overp = float((sims+learned > line).mean()*100); underp=100-overp
-            lean = "OVER" if median > line else "UNDER"
-
-        # 11) Confidence/official filter: data completeness and repeatability.
-        opponent = _v36_text(row,["Opponent"],"")
-        matchup_conf = 92 if opponent else 28
-        market_conf = 86 if pd.notna(opening) else 70
-        data_completeness = _bounded_score(42 + 7*sum(pd.notna(v) for v in [mins,season,l10,line]) + 4*opportunity_known + (10 if opponent else 0))
-        final_conf = _bounded_score(0.28*rotation_conf + 0.22*opp_conf + 0.16*matchup_conf + 0.14*health_conf + 0.10*market_conf + 0.10*data_completeness)
-        hit_prob = max(overp,underp)
-        edge_need = {"PTS":1.5,"REB":0.8,"AST":0.7,"PRA":2.0}.get(market,1.0)
-        official_ok = (opponent and health_conf>=55 and rotation_conf>=70 and final_conf>=76 and hit_prob>=60 and abs(edge)>=edge_need and str(row.get("Projection Sanity","PASS")).upper()!="FAIL")
-
-        # 12) Explainability + diagnostics + CLV-ready fields.
-        row["Projection"] = round(median,2)
-        row["Projection Mean"] = round(mean,2)
-        row["Learning Adjustment"] = round(learned, 3)
-        row["Learning Note"] = learning_note
-        row["Learning Bayesian %"] = round(learning_bayes, 1)
-        row["Projection Median"] = round(median,2)
-        row["Projection Floor"] = round(p20,2)
-        row["Projection Ceiling"] = round(p80,2)
-        row["Simulation SD"] = round(sd,2)
-        row["Over %"] = round(overp,1); row["Under %"] = round(underp,1)
-        row["Lean"] = lean
-        row["Edge"] = round(edge,2) if pd.notna(edge) else np.nan
-        row["Projected Possessions Factor"] = round(pace_factor,3)
-        row["Blowout Probability"] = round(blowout_prob*100,1)
-        row["Rotation Confidence"] = round(rotation_conf,1)
-        row["Opportunity Confidence"] = round(opp_conf,1)
-        row["Health Confidence"] = round(health_conf,1)
-        row["Market Confidence"] = round(market_conf,1)
-        row["Data Completeness"] = round(data_completeness,1)
-        row["Final Projection Confidence"] = round(final_conf,1)
-        row["Opening Line"] = opening
-        row["Line Movement"] = round(market_move,2)
-        row["CLV Ready"] = "YES" if pd.notna(opening) else "WAITING"
-        row["Opportunity Inputs"] = f"FGA {fga:.1f}" if pd.notna(fga) else f"{opportunity_known}/6 live opportunity inputs"
-        row["Projection Explainability"] = (
-            f"Ability {ability:.2f}; pace {pace_factor:.3f}; game/rest {context_factor:.3f}; "
-            f"injury {injury_adj:+.2f}; matchup {matchup_delta:+.2f}; market {market_adj:+.2f}; "
-            f"learning {learned:+.2f}; median {median:.2f}."
-        )
-        row["Risk Flags"] = " · ".join(x for x in [
-            "unverified opponent" if not opponent else "",
-            "rotation volatility" if rotation_conf < 70 else "",
-            "injury uncertainty" if health_conf < 70 else "",
-            "blowout risk" if blowout_prob > .55 else "",
-            "limited opportunity data" if opportunity_known < 2 else ""
-        ] if x) or "none"
-        row["Hit Score"] = round(_bounded_score(0.52*hit_prob + 0.28*final_conf + 0.20*rotation_conf),1)
-        if official_ok:
-            row["Official"] = lean
-            row["PASS Reason"] = "Qualified by v3.6 12-layer gate"
-        else:
-            row["Official"] = "PASS"
-            row["PASS Reason"] = f"Track only · prob {hit_prob:.1f}% · edge {abs(edge):.2f} · confidence {final_conf:.0f}% · {row['Risk Flags']}"
-        enhanced.append(row)
-    return pd.DataFrame(enhanced)
-
-
-_make_projection_board_v35 = make_projection_board
-
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
-    board = _make_projection_board_v35(lines, logs, base, mode)
-    board = _v36_projection_engine(board, base, mode or "Today")
-    if board is not None and not board.empty:
-        save_dataset("projection_board", board)
-    return board
-
-
-# ============================================================
-# v3.7 FINAL 1-3 UPGRADE
-# 1) bounded auto-calibration from graded history
-# 2) live data-health dashboard / hard projection readiness gate
-# 3) minutes + injury-role reliability correction
-# ============================================================
-APP_VERSION = "WNBA v3.7 — Auto Calibration + Data Health + Role Reliability"
-AUTO_CALIBRATION_FILE = LOCAL_DIR / "wnba_auto_calibration.json"
-
-
-def _normal_side_probability(mean: float, line: float, sd: float, side: str) -> float:
-    """Normal-CDF fallback used only to refresh probability after a small calibration shift."""
-    if pd.isna(mean) or pd.isna(line) or pd.isna(sd) or sd <= 0:
-        return 50.0
-    z = (line - mean) / (sd * (2.0 ** 0.5))
-    cdf = 0.5 * (1.0 + math.erf(z))
-    over = 100.0 * (1.0 - cdf)
-    return float(over if str(side).upper() == "OVER" else 100.0 - over)
-
-
-def build_auto_calibration_profile(min_market_samples: int = 12, min_global_samples: int = 30) -> Dict[str, Any]:
-    """Create conservative market/player corrections from actual graded errors.
-
-    Corrections are intentionally shrunk and capped. The engine never learns from
-    pending plays, pushes, rows missing projection/actual, or tiny samples.
-    """
-    learn = pd.DataFrame(load_json(LEARNING_LOG, []))
-    profile: Dict[str, Any] = {
-        "updated_at": now_iso(), "eligible_rows": 0, "global": {},
-        "markets": {}, "players": {}, "minutes": {}, "status": "insufficient"
-    }
-    if learn.empty:
-        save_json(AUTO_CALIBRATION_FILE, profile)
-        return profile
-    for c in ["Projection", "Actual", "MIN Proj", "Actual Minutes", "MinutesActual", "MIN"]:
-        if c in learn.columns:
-            learn[c] = pd.to_numeric(learn[c], errors="coerce")
-    if "Result" in learn.columns:
-        learn = learn[learn["Result"].astype(str).str.upper().isin(["WIN", "LOSS", "PUSH"])]
-    learn = learn.dropna(subset=["Projection", "Actual"])
-    profile["eligible_rows"] = int(len(learn))
-    if learn.empty:
-        save_json(AUTO_CALIBRATION_FILE, profile)
-        return profile
-    learn["Error"] = learn["Projection"] - learn["Actual"]
-    learn["Abs Error"] = learn["Error"].abs()
-    n = len(learn)
-    gbias = float(learn["Error"].mean())
-    gmae = float(learn["Abs Error"].mean())
-    global_weight = min(1.0, n / max(min_global_samples, 1))
-    profile["global"] = {
-        "n": int(n), "bias": round(gbias, 4), "mae": round(gmae, 4),
-        "correction": round(float(np.clip(-gbias * 0.20 * global_weight, -0.30, 0.30)), 4)
-    }
-    market_caps = {"PTS": 0.75, "REB": 0.40, "AST": 0.35, "PRA": 1.00}
-    if "Market" not in learn.columns:
-        learn["Market"] = "UNKNOWN"
-    for market, g in learn.groupby(learn["Market"].astype(str).str.upper()):
-        nn = len(g); bias = float(g["Error"].mean()); mae = float(g["Abs Error"].mean())
-        reliability = min(1.0, nn / max(min_market_samples * 2, 1))
-        shrink = 0.55 * reliability
-        cap = market_caps.get(market, 0.35)
-        corr = float(np.clip(-bias * shrink, -cap, cap)) if nn >= min_market_samples else 0.0
-        profile["markets"][market] = {
-            "n": int(nn), "bias": round(bias, 4), "mae": round(mae, 4),
-            "correction": round(corr, 4), "active": bool(nn >= min_market_samples)
-        }
-    if "Player" in learn.columns:
-        for player, g in learn.groupby(learn["Player"].astype(str)):
-            if len(g) < 10:
-                continue
-            bias = float(g["Error"].mean())
-            # Tiny player-specific nudge; capped so it never overrides tonight's role.
-            corr = float(np.clip(-bias * min(0.25, len(g)/80.0), -0.35, 0.35))
-            profile["players"][normalize_name(player)] = {"n": int(len(g)), "bias": round(bias,4), "correction": round(corr,4)}
-    # Minutes bias, when grading logs contain both expected and actual minutes.
-    actual_col = next((c for c in ["Actual Minutes", "MinutesActual", "ActualMIN"] if c in learn.columns), None)
-    proj_col = next((c for c in ["MIN Proj", "Projected Minutes", "MinutesProjection"] if c in learn.columns), None)
-    if actual_col and proj_col:
-        mm = learn.dropna(subset=[actual_col, proj_col]).copy()
-        if len(mm) >= 12:
-            mbias = float((mm[proj_col] - mm[actual_col]).mean())
-            profile["minutes"] = {
-                "n": int(len(mm)), "bias": round(mbias,4),
-                "correction": round(float(np.clip(-mbias * 0.45, -1.25, 1.25)),4),
-                "active": True
-            }
-    profile["status"] = "active" if n >= min_global_samples else "building"
-    save_json(AUTO_CALIBRATION_FILE, profile)
-    return profile
-
-
-def load_or_build_auto_calibration() -> Dict[str, Any]:
-    profile = load_json(AUTO_CALIBRATION_FILE, {})
-    learn = load_json(LEARNING_LOG, [])
-    # Rebuild when file missing or graded sample count changed.
-    if not profile or int(profile.get("eligible_rows", -1)) != len([r for r in learn if str(r.get("Result","")).upper() in {"WIN","LOSS","PUSH"}]):
-        profile = build_auto_calibration_profile()
-    return profile
-
-
-def apply_auto_calibration_and_role_gate(board: pd.DataFrame) -> pd.DataFrame:
-    if board is None or board.empty:
-        return board
-    profile = load_or_build_auto_calibration()
-    rows = []
-    for _, rr in board.iterrows():
-        row = rr.to_dict()
-        market = str(row.get("Market", "")).upper()
-        player_key = normalize_name(row.get("Player", ""))
-        market_adj = safe_float(profile.get("markets", {}).get(market, {}).get("correction"), 0.0)
-        player_adj = safe_float(profile.get("players", {}).get(player_key, {}).get("correction"), 0.0)
-        global_adj = safe_float(profile.get("global", {}).get("correction"), 0.0)
-        # Market is primary; global and player nudges are deliberately smaller.
-        total_adj = float(np.clip(market_adj + 0.35*player_adj + 0.25*global_adj, -1.10, 1.10))
-        old_proj = safe_float(row.get("Projection"), np.nan)
-        line = safe_float(row.get("Line"), np.nan)
-        if pd.notna(old_proj):
-            new_proj = max(0.0, old_proj + total_adj)
-            row["Pre-Calibration Projection"] = round(old_proj, 2)
-            row["Auto Calibration Adjustment"] = round(total_adj, 2)
-            row["Projection"] = round(new_proj, 2)
-            row["Projection Median"] = round(new_proj, 2)
-            if pd.notna(safe_float(row.get("Projection Mean"), np.nan)):
-                row["Projection Mean"] = round(safe_float(row.get("Projection Mean"), old_proj) + total_adj, 2)
-            if pd.notna(line):
-                edge = new_proj - line
-                row["Edge"] = round(edge, 2)
-                row["Lean"] = "OVER" if edge > 0 else "UNDER"
-                sd = safe_float(row.get("Simulation SD"), np.nan)
-                overp = _normal_side_probability(new_proj, line, sd, "OVER")
-                row["Over %"] = round(overp, 1); row["Under %"] = round(100-overp, 1)
-        # Minutes reliability and availability gate.
-        min_corr = safe_float(profile.get("minutes", {}).get("correction"), 0.0)
-        min_proj = safe_float(row.get("MIN Proj"), np.nan)
-        if pd.notna(min_proj) and profile.get("minutes", {}).get("active"):
-            row["MIN Proj Calibrated"] = round(float(np.clip(min_proj + min_corr, 0, 40)), 2)
-            row["Minutes Calibration Adjustment"] = round(min_corr, 2)
-        injury_text = " ".join(str(row.get(c, "") or "") for c in ["Injury Status","Health Status","Status","Injury Context Note","Injury Ripple Note"]).upper()
-        opp_ok = bool(str(row.get("Opponent", "") or "").strip())
-        lineup_text = " ".join(str(row.get(c, "") or "") for c in ["Lineup Status","Starter Status","LineupSource","Lineup Confidence"]).upper()
-        availability = "VERIFIED"
-        if any(x in injury_text for x in ["OUT", "INACTIVE", "DOUBTFUL"]):
-            availability = "BLOCKED"
-        elif any(x in injury_text for x in ["QUESTIONABLE", "GTD", "LIMIT"]):
-            availability = "UNCERTAIN"
-        elif not opp_ok or not lineup_text.strip():
-            availability = "LIMITED"
-        row["Availability Gate"] = availability
-        row["Calibration Sample"] = int(profile.get("markets", {}).get(market, {}).get("n", 0))
-        row["Calibration Status"] = profile.get("status", "building")
-        # Never let an unresolved availability state remain an official play.
-        if availability in {"BLOCKED", "UNCERTAIN"}:
-            row["Official"] = "PASS"
-            row["PASS Reason"] = f"Availability gate: {availability.lower()}"
-            row["Official Play Score"] = round(max(0, safe_float(row.get("Official Play Score"),0)-18),1)
-        elif availability == "LIMITED" and str(row.get("Official", "PASS")).upper() != "PASS":
-            row["Official"] = "PASS"
-            row["PASS Reason"] = "Availability gate: opponent/lineup not fully verified"
-            row["Official Play Score"] = round(max(0, safe_float(row.get("Official Play Score"),0)-10),1)
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-_make_projection_board_v36_final = make_projection_board
-
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
-    board = _make_projection_board_v36_final(lines, logs, base, mode)
-    board = apply_auto_calibration_and_role_gate(board)
-    if board is not None and not board.empty:
-        save_dataset("projection_board", board)
-    return board
-
-
-def data_health_report(mode: str = "Today") -> pd.DataFrame:
-    """One-row-per-source readiness report. No network call is forced here."""
-    checks = []
-    def add(name, ok, rows=0, detail="", critical=True):
-        checks.append({"Component":name, "Status":"READY" if ok else "MISSING", "Rows":int(rows or 0), "Critical":critical, "Detail":detail})
-    logs = load_dataset("player_game_logs")
-    master = load_dataset("master_features")
-    board = load_dataset("projection_board")
-    schedule = schedule_for_slate(mode)
-    lines = st.session_state.get("wnba_lines_all", pd.DataFrame())
-    injuries = load_automated_injury_table(mode, force=False)
-    add("Player game logs", logs is not None and not logs.empty, 0 if logs is None else len(logs), "Latest completed games and rolling rates")
-    add("Master player features", master is not None and not master.empty, 0 if master is None else len(master), "Minutes, rates, role, and opportunity features")
-    add("Slate schedule", schedule is not None and not schedule.empty, 0 if schedule is None else len(schedule), f"Opponent resolver for {mode}")
-    add("Sportsbook lines", lines is not None and not lines.empty, 0 if lines is None else len(lines), "Underdog/manual current lines")
-    add("Projection board", board is not None and not board.empty, 0 if board is None else len(board), "Current calculated projections")
-    opp_verified = 0
-    if board is not None and not board.empty and "Opponent" in board.columns:
-        opp_verified = int(board["Opponent"].fillna("").astype(str).str.len().gt(0).sum())
-    add("Opponent matching", board is not None and not board.empty and opp_verified == len(board), opp_verified, f"{opp_verified}/{0 if board is None else len(board)} rows resolved")
-    add("Injury/availability feed", injuries is not None and not injuries.empty, 0 if injuries is None else len(injuries), "Missing feed lowers confidence; does not invent statuses", critical=False)
-    profile = load_or_build_auto_calibration()
-    add("Auto calibration", profile.get("status") == "active", profile.get("eligible_rows",0), f"Status {profile.get('status','building')}; needs graded history", critical=False)
-    return pd.DataFrame(checks)
-
-
-def projection_readiness_score(mode: str = "Today") -> Tuple[float, str]:
-    h = data_health_report(mode)
-    if h.empty: return 0.0, "NOT READY"
-    weights = np.where(h["Critical"].astype(bool), 2.0, 1.0)
-    ready = (h["Status"] == "READY").astype(float)
-    score = float((ready * weights).sum() / weights.sum() * 100)
-    label = "READY" if score >= 90 else "LIMITED" if score >= 70 else "NOT READY"
-    return round(score,1), label
 
 
 with st.sidebar:
@@ -9328,7 +8749,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-tabs = st.tabs(["Player Cards", "Best Bets", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports", "Data Health"])
+tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
 
 with tabs[0]:
     st.markdown("<div class='section-title'>PLAYER CARDS / Grouped Markets</div>", unsafe_allow_html=True)
@@ -9373,6 +8794,10 @@ with tabs[1]:
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
 with tabs[2]:
+    tracker_board = load_dataset("projection_board")
+    render_slate_tracker(tracker_board, "main_slate_tracker")
+
+with tabs[3]:
     st.subheader("Official + Grade")
     st.caption("Save official plays before games. Grade after results are imported. The Results tab shows ✅/❌ by player and market so you can quickly see what cleared the line.")
     grade_tabs = st.tabs(["Save / Grade", "After Game Results ✅❌", "Raw Logs"])
@@ -9449,10 +8874,10 @@ with tabs[2]:
             st.dataframe(learning.tail(300), use_container_width=True)
             st.download_button("Download learning log CSV", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
 
-with tabs[3]:
+with tabs[4]:
     render_data_manager_tab()
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("Debug / Status")
     st.caption("Diagnostics only. Heavy imports/rebuilds are in Data Manager and never run automatically.")
     st.markdown("### Data status")
@@ -9496,7 +8921,7 @@ with tabs[4]:
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
     st.caption("This page keeps the main UI clean while giving you the same deeper review tools: line movement, closing-line value, projection calibration, and historical model testing.")
 
@@ -9569,41 +8994,3 @@ with tabs[5]:
         with st.expander("Backtest rows", expanded=False):
             st.dataframe(bt.tail(1000), use_container_width=True)
             st.download_button("Download full backtest rows CSV", bt.to_csv(index=False), "wnba_backtest_rows.csv", "text/csv")
-
-
-with tabs[6]:
-    st.subheader("Data Health + Auto Calibration")
-    st.caption("The board is only considered projection-ready when critical live inputs are present. Missing inputs lower confidence or block official plays instead of silently using invented values.")
-    mode_health = st.selectbox("Health check slate", ["Today", "Tomorrow", "All Lines"], key="health_mode")
-    score, readiness = projection_readiness_score(mode_health)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Projection readiness", f"{score:.1f}%")
-    c2.metric("Status", readiness)
-    profile = load_or_build_auto_calibration()
-    c3.metric("Graded calibration rows", int(profile.get("eligible_rows", 0)))
-    health = data_health_report(mode_health)
-    st.dataframe(health, use_container_width=True)
-    if readiness != "READY":
-        st.warning("Official plays are restricted while critical data is missing. Use Refresh Today — All-in-One, then confirm schedule/opponents, lines, and player logs.")
-    else:
-        st.success("Critical projection inputs are ready.")
-
-    st.markdown("### Auto Calibration Engine")
-    st.write("Corrections are based on actual graded projection error, shrunk toward zero, and capped by market. Tiny samples never receive an active correction.")
-    if st.button("Rebuild auto calibration from graded history", use_container_width=True):
-        profile = build_auto_calibration_profile()
-        st.success(f"Calibration rebuilt from {profile.get('eligible_rows',0)} eligible graded rows.")
-    market_rows = []
-    for market, vals in profile.get("markets", {}).items():
-        market_rows.append({"Market":market, **vals})
-    if market_rows:
-        st.dataframe(pd.DataFrame(market_rows), use_container_width=True)
-    else:
-        st.info("No market calibration is active yet. Grade more saved plays first.")
-    st.markdown("### Minutes + Availability Reliability")
-    minp = profile.get("minutes", {})
-    if minp:
-        st.json(minp)
-    else:
-        st.info("Minutes calibration activates after graded rows contain both projected and actual minutes.")
-    st.caption("OUT/INACTIVE/DOUBTFUL players are blocked. QUESTIONABLE/GTD/minutes-limit players remain trackable but cannot become official until availability is resolved.")
