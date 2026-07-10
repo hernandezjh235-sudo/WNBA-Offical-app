@@ -7062,6 +7062,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     proj_df = enrich_board_with_matchups(proj_df, mode)
     proj_df = apply_matchup_context_to_board(proj_df)
     proj_df = apply_daily_team_context_v2_to_board(proj_df)
+    proj_df = _v345_post_context_finalizer(proj_df, master_global)
     CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
     proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
 
@@ -7903,6 +7904,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
                 st.rerun()
         with bc3:
             st.caption("Saved boards stay available after closing/reopening the app as long as Streamlit keeps the app files/cache.")
+        saved_df = _v345_post_context_finalizer(saved_df, master_global)
         return _render_grouped_projection_df(saved_df, mode, f"saved_group_search_{mode}", f"saved_group_max_{mode}", f"saved_group_official_only_{mode}", saved_view=True)
 
     lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, False, False, "")
@@ -7936,6 +7938,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     proj_df = enrich_board_with_matchups(proj_df, mode)
     proj_df = apply_matchup_context_to_board(proj_df)
     proj_df = apply_daily_team_context_v2_to_board(proj_df)
+    proj_df = _v345_post_context_finalizer(proj_df, master_global)
     CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
     proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
 
@@ -9379,6 +9382,213 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     elif summary:
         st.caption(f"Slate direction: {summary.get('overs',0)} overs / {summary.get('unders',0)} unders / {summary.get('neutrals',0)} neutral-no plays.")
 
+
+
+
+# ================================================================
+# v3.4.7 DOUBLE-CHECKED FINAL-SIDE PIPELINE + SLATE TRACKER
+# The previous calibrated board was being modified again by downstream
+# matchup/team-context enrichers. This finalizer runs LAST, after all
+# enrichments, and is the only authority for Projection/Lean/Probability.
+# ================================================================
+
+def _v345_num(v, default=np.nan):
+    try:
+        x = float(v)
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _v345_norm_over(line: float, mean: float, sd: float) -> float:
+    if pd.isna(line) or pd.isna(mean) or pd.isna(sd) or sd <= 0:
+        return 50.0
+    try:
+        from math import erf, sqrt
+        z = ((line + 0.15) - mean) / max(0.25, sd)
+        return float(np.clip(100.0 * 0.5 * (1.0 - erf(z / sqrt(2.0))), 1.0, 99.0))
+    except Exception:
+        return 50.0
+
+
+def _v345_market_sd(row: pd.Series, market: str, final_proj: float) -> float:
+    defaults = {"PTS": 4.8, "REB": 2.35, "AST": 2.15, "PRA": 6.6}
+    floors = {"PTS": 3.8, "REB": 1.70, "AST": 1.60, "PRA": 5.2}
+    caps = {"PTS": 7.8, "REB": 4.4, "AST": 4.1, "PRA": 11.0}
+    vals = [_v345_num(row.get(c)) for c in ["L5 Avg", "L10 Avg", "L20 Avg", "Season Avg"]]
+    vals = [x for x in vals if pd.notna(x)]
+    dispersion = float(np.std(vals)) if len(vals) >= 2 else 0.0
+    sd = max(defaults.get(market, 4.0), dispersion * 1.35)
+    if str(row.get("Data Integrity", "LIMITED")).upper() != "VERIFIED":
+        sd *= 1.12
+    return float(np.clip(sd, floors.get(market, 2.0), caps.get(market, 8.0)))
+
+
+def _v345_sustainable_projection(row: pd.Series) -> float:
+    market = str(row.get("Market", "PTS")).upper()
+    l5 = _v345_num(row.get("L5 Avg"))
+    l10 = _v345_num(row.get("L10 Avg"))
+    l20 = _v345_num(row.get("L20 Avg"))
+    season = _v345_num(row.get("Season Avg"))
+    raw_source = row.get("Projection Before Final Side Fix") if "Projection Before Final Side Fix" in row.index else row.get("Projection")
+    raw = _v345_num(raw_source)
+    if pd.isna(raw):
+        raw = _v345_num(row.get("Projection"))
+    available = [x for x in [l5, l10, l20, season, raw] if pd.notna(x)]
+    if not available:
+        return np.nan
+    med = float(np.median(available))
+    l5 = med if pd.isna(l5) else l5
+    l10 = med if pd.isna(l10) else l10
+    l20 = l10 if pd.isna(l20) else l20
+    season = med if pd.isna(season) else season
+    raw = med if pd.isna(raw) else raw
+
+    # Long-term opportunity is the anchor. L5 can move the number, but cannot
+    # dominate it. The upstream model remains a small signal for real role news.
+    if market == "PTS":
+        baseline = 0.14*l5 + 0.34*l10 + 0.16*l20 + 0.36*season
+    elif market in {"REB", "AST"}:
+        baseline = 0.12*l5 + 0.32*l10 + 0.16*l20 + 0.40*season
+    else:  # PRA fallback when components are not all listed
+        baseline = 0.14*l5 + 0.34*l10 + 0.16*l20 + 0.36*season
+
+    role_text = " ".join(str(row.get(c, "")) for c in [
+        "Injury Status", "Role", "Starter Status", "Lineup Status", "Availability",
+        "Injury Context Note", "Projected Rotation Note"
+    ]).upper()
+    verified_role_change = any(t in role_text for t in [
+        "CONFIRMED START", "NEW STARTER", "ROLE CHANGE", "STARTING IN PLACE"
+    ]) and "QUESTIONABLE" not in role_text
+    raw_weight = 0.30 if verified_role_change else 0.15
+    final = (1.0-raw_weight)*baseline + raw_weight*raw
+
+    # Apply opponent context exactly once here. The move is deliberately small.
+    integrity = str(row.get("Data Integrity", "LIMITED")).upper()
+    score = _v345_num(row.get("Opponent Matchup Score"), 50.0)
+    opp = str(row.get("Opponent", "")).strip().lower()
+    verified = integrity == "VERIFIED" and opp not in {"", "nan", "none", "opponent unavailable"}
+    matchup_move = 0.0
+    if verified:
+        matchup_move = float(np.clip((score-50.0)/50.0 * 0.010, -0.010, 0.010))
+    final *= (1.0 + matchup_move)
+
+    # Robust cap around L10/season protects against duplicated upstream boosts.
+    center = 0.55*l10 + 0.45*season
+    width = {"PTS": 3.0, "REB": 1.30, "AST": 1.20, "PRA": 4.4}.get(market, 2.5)
+    final = float(np.clip(final, max(0.0, center-width), center+width))
+    return final
+
+
+def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    out["Projection Before Final Side Fix"] = pd.to_numeric(out.get("Projection"), errors="coerce")
+    out["Projection"] = out.apply(_v345_sustainable_projection, axis=1)
+
+    # PRA must equal the final displayed PTS + REB + AST whenever all components
+    # are available for that player/team/opponent slate.
+    group_cols = [c for c in ["Player", "Matched Player", "Team", "Opponent", "Slate", "SlateDate"] if c in out.columns]
+    player_col = "Matched Player" if "Matched Player" in out.columns else "Player"
+    group_cols = [player_col] + [c for c in ["Team", "Opponent", "Slate", "SlateDate"] if c in out.columns]
+    for _, idx in out.groupby(group_cols, dropna=False).groups.items():
+        sub = out.loc[idx]
+        comp = {}
+        for m in ["PTS", "REB", "AST"]:
+            vals = pd.to_numeric(sub.loc[sub["Market"].astype(str).str.upper()==m, "Projection"], errors="coerce").dropna()
+            if not vals.empty:
+                comp[m] = float(vals.iloc[0])
+        if len(comp) == 3:
+            pra_idx = sub.index[sub["Market"].astype(str).str.upper()=="PRA"]
+            if len(pra_idx):
+                out.loc[pra_idx, "Projection"] = comp["PTS"] + comp["REB"] + comp["AST"]
+                out.loc[pra_idx, "PRA Component PTS"] = comp["PTS"]
+                out.loc[pra_idx, "PRA Component REB"] = comp["REB"]
+                out.loc[pra_idx, "PRA Component AST"] = comp["AST"]
+                out.loc[pra_idx, "PRA Component Sum"] = comp["PTS"] + comp["REB"] + comp["AST"]
+                out.loc[pra_idx, "PRA Identity Check"] = True
+
+    rows = []
+    for _, rr in out.iterrows():
+        row = rr.copy()
+        market = str(row.get("Market", "PTS")).upper()
+        proj = _v345_num(row.get("Projection"))
+        line = _v345_num(row.get("Line"))
+        edge = proj-line if pd.notna(proj) and pd.notna(line) else np.nan
+        sd = _v345_market_sd(row, market, proj)
+        overp = _v345_norm_over(line, proj, sd)
+        underp = 100.0-overp
+
+        neutral_edge = {"PTS":0.90,"REB":0.50,"AST":0.50,"PRA":1.50}.get(market,0.90)
+        min_prob = 54.0
+        if pd.isna(edge):
+            lean = "PASS"
+        elif edge >= neutral_edge and overp >= min_prob:
+            lean = "OVER"
+        elif edge <= -neutral_edge and underp >= min_prob:
+            lean = "UNDER"
+        else:
+            lean = "NEUTRAL"
+        sidep = overp if lean=="OVER" else underp if lean=="UNDER" else max(overp,underp)
+
+        integrity = str(row.get("Data Integrity", "LIMITED")).upper()
+        baseline_vals = [_v345_num(row.get(c)) for c in ["L5 Avg","L10 Avg","L20 Avg","Season Avg"]]
+        baseline_vals = [x for x in baseline_vals if pd.notna(x)]
+        votes = sum(1 for x in baseline_vals if pd.notna(line) and ((x>line)==(lean=="OVER"))) if lean in {"OVER","UNDER"} else 0
+        edge_score = float(np.clip(50 + abs(edge if pd.notna(edge) else 0)*{"PTS":7.0,"REB":12.0,"AST":12.0,"PRA":4.0}.get(market,7.0), 0, 100))
+        data_score = 92.0 if integrity=="VERIFIED" else 62.0
+        hit_score = float(np.clip(0.52*sidep + 0.20*edge_score + 0.16*data_score + 0.12*(40+votes*14), 0, 100))
+
+        official_edge = {"PTS":1.60,"REB":0.85,"AST":0.85,"PRA":2.40}.get(market,1.50)
+        official_prob = {"PTS":59.0,"REB":58.5,"AST":58.5,"PRA":59.0}.get(market,59.0)
+        reasons=[]
+        availability_text = " ".join(str(row.get(c, "")) for c in ["Injury Status","Availability","Lineup Status","Starter Status"]).upper()
+        unavailable_player = any(tag in availability_text for tag in ["OUT","INACTIVE","DOUBTFUL","SUSPENDED"])
+        if unavailable_player:
+            lean = "PASS"
+            sidep = max(overp, underp)
+            reasons.append("player unavailable or doubtful")
+        if lean not in {"OVER","UNDER"}: reasons.append("inside neutral/no-play zone")
+        if integrity!="VERIFIED": reasons.append("data/opponent context not verified")
+        if pd.isna(edge) or abs(edge)<official_edge: reasons.append("edge below official threshold")
+        if sidep<official_prob: reasons.append("probability below official threshold")
+        if votes<2: reasons.append("recent/season support is weak")
+        official = "PASS" if reasons else ("🔥 OVER" if lean=="OVER" else "⚠️ UNDER")
+
+        row["Projection"] = round(proj,2) if pd.notna(proj) else np.nan
+        row["Edge"] = round(edge,2) if pd.notna(edge) else np.nan
+        row["Lean"] = lean
+        row["Over %"] = round(overp,1)
+        row["Under %"] = round(underp,1)
+        row["Simulation SD"] = round(sd,2)
+        row["Hit Score"] = round(hit_score,1)
+        row["Official Play Score"] = round(hit_score,1)
+        row["Official"] = official
+        row["Tier"] = "S" if official!="PASS" and hit_score>=86 else "A" if official!="PASS" and hit_score>=78 else "B" if official!="PASS" else "TRACK"
+        row["PASS Reason"] = " · ".join(dict.fromkeys(reasons))
+        row["Finalizer Version"] = "v3.4.7-double-checked-tracker"
+        row["Projection Audit"] = "sustainable L5/L10/L20/season baseline + small role-aware model signal + verified matchup once (max ±1%) + final neutral side gate"
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    actionable = out[out["Lean"].isin(["OVER","UNDER"])]
+    overs = int((actionable["Lean"]=="OVER").sum())
+    unders = int((actionable["Lean"]=="UNDER").sum())
+    neutrals = int((out["Lean"]=="NEUTRAL").sum())
+    total = len(actionable)
+    rate = overs/max(1,total)
+    warning = "BALANCED"
+    if total>=8 and rate>=0.75:
+        warning=f"OVER-SKEW WARNING: {overs}/{total} actionable. Review raw baselines; sides were not force-balanced."
+    elif total>=8 and rate<=0.25:
+        warning=f"UNDER-SKEW WARNING: {unders}/{total} actionable. Review raw baselines; sides were not force-balanced."
+    st.session_state["wnba_slate_bias_summary"]={"overs":overs,"unders":unders,"neutrals":neutrals,"total":total,"over_rate":rate,"warning":warning}
+    out["Slate Over Count"]=overs
+    out["Slate Under Count"]=unders
+    out["Slate Neutral Count"]=neutrals
+    out["Slate Bias Warning"]=warning
+    return out.sort_values(["Official Play Score","Hit Score","Edge"], ascending=[False,False,False])
 
 
 tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
