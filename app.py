@@ -7804,104 +7804,6 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
 
 
 
-# -----------------------------------------------------------------------------
-# Copy / Paste Slate Tracker
-# -----------------------------------------------------------------------------
-def _slate_side_and_icon(row: pd.Series) -> tuple[str, str]:
-    lean = str(row.get("Lean", "")).upper()
-    official = str(row.get("Official", "")).upper()
-    score = safe_float(row.get("Official Play Score"), 0)
-    side_prob = safe_float(row.get("Over %"), 0) if "OVER" in f"{lean} {official}" else safe_float(row.get("Under %"), 0)
-    if "OVER" in f"{lean} {official}":
-        side = "O"
-    elif "UNDER" in f"{lean} {official}":
-        side = "U"
-    else:
-        side = "O" if safe_float(row.get("Edge"), 0) >= 0 else "U"
-    if score >= 82 and side_prob >= 64:
-        icon = "🔥"
-    elif score >= 70 and side_prob >= 58:
-        icon = "⚠️"
-    else:
-        icon = ""
-    return side, icon
-
-
-def _slate_matchup_label(row: pd.Series) -> str:
-    matchup = str(row.get("Matchup", "") or row.get("Projection Matchup Used", "")).strip()
-    if matchup and matchup.lower() not in {"nan", "none", "unknown"}:
-        return matchup.replace(" vs ", " @ ").replace(" VS ", " @ ")
-    team = str(row.get("Team", "")).strip().upper()
-    opp = str(row.get("Opponent", "")).strip().upper()
-    homeaway = str(row.get("HomeAway", "")).upper()
-    if team and opp:
-        return f"{team} @ {opp}" if homeaway == "AWAY" else f"{opp} @ {team}" if homeaway == "HOME" else f"{team} vs {opp}"
-    return team or opp or "WNBA SLATE"
-
-
-def build_copy_paste_slate(df: pd.DataFrame, best_only: bool = False, max_rows: int = 0) -> str:
-    """Create a clean matchup-grouped tracking slate from every real line."""
-    if df is None or df.empty:
-        return "No projections available."
-    work = df.copy()
-    for c in ["Line", "Projection", "Edge", "Official Play Score", "Over %", "Under %", "MIN Proj"]:
-        if c in work.columns:
-            work[c] = pd.to_numeric(work[c], errors="coerce")
-    work = work[work.get("Line", pd.Series(index=work.index, dtype=float)).notna() & work.get("Projection", pd.Series(index=work.index, dtype=float)).notna()].copy()
-    if "Source" in work.columns:
-        bad = work["Source"].astype(str).str.upper().str.contains("NO LINE|TRACKED ONLY|MISSING", na=False)
-        work = work[~bad]
-    if work.empty:
-        return "No real-line projections available."
-    work["_matchup"] = work.apply(_slate_matchup_label, axis=1)
-    work["_abs_edge"] = pd.to_numeric(work.get("Edge", 0), errors="coerce").abs()
-    work["_score"] = pd.to_numeric(work.get("Official Play Score", 0), errors="coerce").fillna(0)
-    if best_only:
-        official_mask = work.get("Official", pd.Series(index=work.index, dtype=str)).astype(str).str.contains("OVER|UNDER", case=False, na=False)
-        strong = work[official_mask | ((work["_score"] >= 70) & (work["_abs_edge"] >= 1.5))].copy()
-        if not strong.empty:
-            work = strong
-        else:
-            work = work.sort_values(["_score", "_abs_edge"], ascending=False).head(12)
-    work = work.sort_values(["_matchup", "_score", "_abs_edge"], ascending=[True, False, False])
-    if max_rows and max_rows > 0:
-        work = work.head(max_rows)
-    blocks = []
-    for matchup, group in work.groupby("_matchup", sort=False):
-        lines = [str(matchup)]
-        for _, r in group.iterrows():
-            side, icon = _slate_side_and_icon(r)
-            player = str(r.get("Player", "Player"))
-            market = str(r.get("Market", "PROP")).upper()
-            line = _fmt_num_compact(r.get("Line"), 1)
-            proj = _fmt_num_compact(r.get("Projection"), 2)
-            mins = _fmt_num_compact(r.get("MIN Proj"), 2)
-            icon_txt = f"{icon} " if icon else ""
-            minute_txt = f" — MIN {mins}" if mins != "—" else ""
-            lines.append(f"• {player} — {icon_txt}{side} {line} {market} — {proj} PROJ{minute_txt}")
-        blocks.append("\n".join(lines))
-    return "\n\n".join(blocks)
-
-
-def render_slate_tracker(board_df: pd.DataFrame, key_prefix: str = "slate_tracker"):
-    st.subheader("Copy/Paste Slate — All WNBA Projections")
-    st.caption("Tracking list grouped by matchup. It shows every real-line projection and keeps Best Slate separate from the full board.")
-    if board_df is None or board_df.empty:
-        st.warning("No projection board cached yet. Refresh Today or All Lines first.")
-        return
-    c1, c2 = st.columns(2)
-    with c1:
-        best_text = build_copy_paste_slate(board_df, best_only=True)
-        st.markdown("#### Best slate")
-        st.text_area("Best projections slate", best_text, height=320, key=f"{key_prefix}_best_text")
-        st.download_button("Download best slate.txt", best_text, "wnba_best_slate.txt", "text/plain", key=f"{key_prefix}_best_dl")
-    with c2:
-        all_text = build_copy_paste_slate(board_df, best_only=False)
-        st.markdown("#### All projections slate")
-        st.text_area("All projections slate", all_text, height=320, key=f"{key_prefix}_all_text")
-        st.download_button("Download all projections.txt", all_text, "wnba_all_projections.txt", "text/plain", key=f"{key_prefix}_all_dl")
-    st.info("Save Before tracks the real-line rows for grading. The text slate is for copy/paste and quick tracking; it does not replace the saved official log.")
-
 def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: str, max_key: str, official_key: str, saved_view: bool = False) -> pd.DataFrame:
     """Render an already-built projection board with fast table / card toggle."""
     key_prefix = f"saved_group_{mode}" if saved_view else f"live_group_{mode}"
@@ -9015,8 +8917,33 @@ def _v36_projection_engine(board: pd.DataFrame, base: pd.DataFrame, mode: str = 
         edge = median-line if pd.notna(line) else np.nan
 
         # 10) Calibration and player/market learning (bounded).
-        learned = learning_adjustment(row.get("Player"), market) if 'learning_adjustment' in globals() else 0.0
-        learned = float(np.clip(safe_float(learned,0), -0.65, 0.65))
+        # learning_adjustment requires the current base edge and returns
+        # (numeric adjustment, explanation, Bayesian win-rate estimate).
+        # The previous two-argument call crashed Railway at runtime.
+        if 'learning_adjustment' in globals():
+            try:
+                learned_result = learning_adjustment(
+                    row.get("Player"),
+                    market,
+                    safe_float(edge, 0.0),
+                )
+                if isinstance(learned_result, (tuple, list)):
+                    learned = safe_float(learned_result[0], 0.0)
+                    learning_note = str(learned_result[1]) if len(learned_result) > 1 else ""
+                    learning_bayes = safe_float(learned_result[2], 50.0) if len(learned_result) > 2 else 50.0
+                else:
+                    learned = safe_float(learned_result, 0.0)
+                    learning_note = ""
+                    learning_bayes = 50.0
+            except Exception as exc:
+                learned = 0.0
+                learning_note = f"Learning fallback: {type(exc).__name__}"
+                learning_bayes = 50.0
+        else:
+            learned = 0.0
+            learning_note = "Learning unavailable"
+            learning_bayes = 50.0
+        learned = float(np.clip(learned, -0.65, 0.65))
         median += learned; mean += learned
         if pd.notna(line):
             edge = median-line
@@ -9036,6 +8963,9 @@ def _v36_projection_engine(board: pd.DataFrame, base: pd.DataFrame, mode: str = 
         # 12) Explainability + diagnostics + CLV-ready fields.
         row["Projection"] = round(median,2)
         row["Projection Mean"] = round(mean,2)
+        row["Learning Adjustment"] = round(learned, 3)
+        row["Learning Note"] = learning_note
+        row["Learning Bayesian %"] = round(learning_bayes, 1)
         row["Projection Median"] = round(median,2)
         row["Projection Floor"] = round(p20,2)
         row["Projection Ceiling"] = round(p80,2)
@@ -9398,7 +9328,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports", "Data Health"])
+tabs = st.tabs(["Player Cards", "Best Bets", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports", "Data Health"])
 
 with tabs[0]:
     st.markdown("<div class='section-title'>PLAYER CARDS / Grouped Markets</div>", unsafe_allow_html=True)
@@ -9443,10 +9373,6 @@ with tabs[1]:
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
 with tabs[2]:
-    tracker_board = load_dataset("projection_board")
-    render_slate_tracker(tracker_board, "main_slate_tracker")
-
-with tabs[3]:
     st.subheader("Official + Grade")
     st.caption("Save official plays before games. Grade after results are imported. The Results tab shows ✅/❌ by player and market so you can quickly see what cleared the line.")
     grade_tabs = st.tabs(["Save / Grade", "After Game Results ✅❌", "Raw Logs"])
@@ -9523,10 +9449,10 @@ with tabs[3]:
             st.dataframe(learning.tail(300), use_container_width=True)
             st.download_button("Download learning log CSV", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
 
-with tabs[4]:
+with tabs[3]:
     render_data_manager_tab()
 
-with tabs[5]:
+with tabs[4]:
     st.subheader("Debug / Status")
     st.caption("Diagnostics only. Heavy imports/rebuilds are in Data Manager and never run automatically.")
     st.markdown("### Data status")
@@ -9570,7 +9496,7 @@ with tabs[5]:
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
 
-with tabs[6]:
+with tabs[5]:
     st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
     st.caption("This page keeps the main UI clean while giving you the same deeper review tools: line movement, closing-line value, projection calibration, and historical model testing.")
 
@@ -9645,7 +9571,7 @@ with tabs[6]:
             st.download_button("Download full backtest rows CSV", bt.to_csv(index=False), "wnba_backtest_rows.csv", "text/csv")
 
 
-with tabs[7]:
+with tabs[6]:
     st.subheader("Data Health + Auto Calibration")
     st.caption("The board is only considered projection-ready when critical live inputs are present. Missing inputs lower confidence or block official plays instead of silently using invented values.")
     mode_health = st.selectbox("Health check slate", ["Today", "Tomorrow", "All Lines"], key="health_mode")
