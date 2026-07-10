@@ -9284,6 +9284,214 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
         st.caption(f"Slate direction check: {summary.get('overs',0)} overs / {summary.get('unders',0)} unders — no severe directional bias detected.")
 
 
+
+
+# ============================================================================
+# v3.4.3 — TRUE TEAM OFFENSE/DEFENSE + MARKET OPPORTUNITY VALIDATION
+# Adds only source-backed context. Missing inputs remain neutral and reduce
+# confidence; no synthetic matchup data or duplicate projection boosts.
+# ============================================================================
+_make_projection_board_v343_input = make_projection_board
+
+
+def _v343_num(row, keys, default=np.nan):
+    for k in keys:
+        try:
+            v = safe_float(row.get(k), np.nan)
+            if pd.notna(v) and np.isfinite(v):
+                return float(v)
+        except Exception:
+            pass
+    return default
+
+
+def _v343_position_group(row, br=None):
+    raw = str(row.get("Position", row.get("Pos", ""))).upper().strip()
+    if br is not None:
+        raw = raw or str(br.get("Position", br.get("Pos", ""))).upper().strip()
+    if any(x in raw for x in ["PG", "SG", "GUARD", " G"]):
+        return "GUARD"
+    if any(x in raw for x in ["PF", "C", "CENTER", "POST", "BIG"]):
+        return "BIG"
+    if any(x in raw for x in ["SF", "WING", "FORWARD", " F"]):
+        return "WING"
+    # Role-based fallback is safer than blindly assigning roster position.
+    astp = _v343_num(br if br is not None else row, ["AST%", "AST_PCT"], np.nan)
+    trbp = _v343_num(br if br is not None else row, ["TRB%", "REB%", "REB_PCT"], np.nan)
+    if pd.notna(astp) and astp >= 22:
+        return "GUARD"
+    if pd.notna(trbp) and trbp >= 14:
+        return "BIG"
+    return "WING"
+
+
+def _v343_context_inputs(row, br=None):
+    own_ortg = _v343_num(br if br is not None else row, ["Team_ORtg_Official", "Team_ORtg", "Team ORtg"], np.nan)
+    own_pace = _v343_num(br if br is not None else row, ["Team_Pace_Official", "Team_Pace", "Team Pace"], np.nan)
+    own_efg = _v343_num(br if br is not None else row, ["Team_eFG_Official", "Team_eFG", "Team eFG"], np.nan)
+    opp_drtg = _v343_num(row, ["Opponent DRtg", "Opp DRtg", "Opp_Team_DRtg_Official"], np.nan)
+    opp_pace = _v343_num(row, ["Opponent Pace", "Opp Pace", "Opp_Team_Pace_Official"], np.nan)
+    opp_efg = _v343_num(row, ["Opponent eFG Allowed", "Opp eFG Allowed", "Opp_Team_eFG_Official", "Opp_Adv_EFG_PCT"], np.nan)
+    implied = _v343_num(row, ["Team Implied Total", "Implied Team Total", "Team Total", "Vegas Team Total"], np.nan)
+    spread = _v343_num(row, ["Spread", "Vegas Spread", "Game Spread"], np.nan)
+    return own_ortg, own_pace, own_efg, opp_drtg, opp_pace, opp_efg, implied, spread
+
+
+def _v343_market_factor(row, br, market):
+    """Return a small source-backed multiplier and audit text.
+
+    The final factor is tightly bounded. This is a single contextual correction,
+    not a replacement for the player/minutes baseline.
+    """
+    own_ortg, own_pace, own_efg, opp_drtg, opp_pace, opp_efg, implied, spread = _v343_context_inputs(row, br)
+    factors=[]; notes=[]
+    # Pace/possession environment: compare game pace with a stable WNBA baseline.
+    pace_vals=[x for x in [own_pace, opp_pace] if pd.notna(x)]
+    if pace_vals:
+        game_pace=float(np.mean(pace_vals))
+        factors.append(np.clip((game_pace-78.5)/78.5, -0.025, 0.025))
+        notes.append(f"pace {game_pace:.1f}")
+    # Team offense versus opponent defense matters most for scoring and assists.
+    if market in ["PTS","AST"] and pd.notna(own_ortg) and pd.notna(opp_drtg):
+        net=(own_ortg-100.0 + opp_drtg-100.0)/2.0
+        factors.append(np.clip(net/100.0, -0.020, 0.020))
+        notes.append(f"ORtg {own_ortg:.1f} vs DRtg {opp_drtg:.1f}")
+    if market=="PTS" and pd.notna(own_efg) and pd.notna(opp_efg):
+        # Percentages may be stored as decimals or whole percents.
+        a=own_efg/100.0 if own_efg>1.5 else own_efg
+        b=opp_efg/100.0 if opp_efg>1.5 else opp_efg
+        factors.append(np.clip((a-b)*0.30, -0.012, 0.012))
+        notes.append("shot-quality context")
+    if market=="REB":
+        # Rebound opportunity comes from misses, not DRtg alone. Higher opponent
+        # eFG means fewer available rebounds; lower eFG means more.
+        if pd.notna(opp_efg):
+            b=opp_efg/100.0 if opp_efg>1.5 else opp_efg
+            factors.append(np.clip((0.505-b)*0.22, -0.018, 0.018))
+            notes.append(f"opp miss environment {1-b:.1%}")
+        trbp=_v343_num(br if br is not None else row,["TRB%","REB%","REB_PCT"],np.nan)
+        if pd.notna(trbp):
+            t=trbp/100.0 if trbp>1.5 else trbp
+            factors.append(np.clip((t-0.11)*0.08,-0.010,0.010))
+            notes.append("player rebound share")
+    if market=="AST":
+        astp=_v343_num(br if br is not None else row,["AST%","AST_PCT"],np.nan)
+        if pd.notna(astp):
+            a=astp/100.0 if astp>1.5 else astp
+            factors.append(np.clip((a-0.18)*0.06,-0.010,0.010))
+            notes.append("creator role")
+        if pd.notna(own_efg):
+            a=own_efg/100.0 if own_efg>1.5 else own_efg
+            factors.append(np.clip((a-0.50)*0.10,-0.008,0.008))
+            notes.append("teammate conversion proxy")
+    # Vegas environment is useful only when actually available.
+    if pd.notna(implied):
+        factors.append(np.clip((implied-80.0)/80.0*0.025,-0.015,0.015))
+        notes.append(f"implied {implied:.1f}")
+    if pd.notna(spread) and abs(spread)>=9:
+        factors.append(-min(0.012,(abs(spread)-8)*0.002))
+        notes.append("blowout risk")
+    total=float(np.sum(factors)) if factors else 0.0
+    return float(np.clip(1.0+total,0.965,1.035)), "; ".join(notes) if notes else "neutral: source-backed market context unavailable"
+
+
+def _v343_freshness_status(row):
+    refresh = st.session_state.get("wnba_last_refresh", "")
+    ts = pd.to_datetime(refresh, errors="coerce", utc=True)
+    if pd.isna(ts):
+        return "UNKNOWN", np.nan
+    now = pd.Timestamp.now(tz="UTC")
+    hrs=max(0.0,(now-ts).total_seconds()/3600.0)
+    return ("FRESH" if hrs<=8 else "STALE"), hrs
+
+
+def _v343_apply(board: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
+    if board is None or board.empty:
+        return board
+    lookup=_v342_player_lookup(base)
+    rows=[]
+    component_map={}
+    for _, rr in board.iterrows():
+        row=rr.copy()
+        key=normalize_name(row.get("Matched Player") or row.get("Player"))
+        br=lookup.loc[key] if (not lookup.empty and key in lookup.index) else None
+        market=str(row.get("Market","PTS")).upper()
+        pos=_v343_position_group(row,br)
+        factor,note=_v343_market_factor(row,br,market)
+        base_proj=safe_float(row.get("Projection"),np.nan)
+        # Remove the prior generic matchup multiplier before applying the
+        # market-specific factor, preventing duplicate context boosts.
+        old_match=safe_float(row.get("Matchup Multiplier Applied"),1.0)
+        neutralized=base_proj/old_match if pd.notna(base_proj) and old_match not in [0,np.nan] else base_proj
+        final=neutralized*factor if pd.notna(neutralized) else np.nan
+        # Preserve existing robust baseline caps.
+        _,vals=_v342_baseline_values(row,br,market)
+        final=_v342_cap_projection(final,vals,market)
+        cache=(key,str(row.get("Team","")),str(row.get("Opponent","")))
+        component_map.setdefault(cache,{})[market]=final
+        row["Projection Before Team Context"] = round(base_proj,2) if pd.notna(base_proj) else np.nan
+        row["Team Matchup Multiplier"] = round(factor,4)
+        row["Team Matchup Audit"] = note
+        row["Position Group Used"] = pos
+        fresh,hrs=_v343_freshness_status(row)
+        row["Data Freshness Status"] = fresh
+        row["Data Age Hours"] = round(hrs,2) if pd.notna(hrs) else np.nan
+        row["Projection"] = round(final,2) if pd.notna(final) else np.nan
+        rows.append(row)
+    out=pd.DataFrame(rows)
+    # Make PRA exactly equal to the final PTS+REB+AST component projections.
+    for idx,row in out.iterrows():
+        if str(row.get("Market","")).upper()!="PRA":
+            continue
+        cache=(normalize_name(row.get("Matched Player") or row.get("Player")),str(row.get("Team","")),str(row.get("Opponent","")))
+        comps=component_map.get(cache,{})
+        if all(pd.notna(comps.get(m,np.nan)) for m in ["PTS","REB","AST"]):
+            out.at[idx,"Projection"]=round(comps["PTS"]+comps["REB"]+comps["AST"],2)
+            out.at[idx,"PRA Component PTS"]=round(comps["PTS"],2)
+            out.at[idx,"PRA Component REB"]=round(comps["REB"],2)
+            out.at[idx,"PRA Component AST"]=round(comps["AST"],2)
+            out.at[idx,"PRA Component Sum"]=round(comps["PTS"]+comps["REB"]+comps["AST"],2)
+    # Recalculate betting side and probabilities from the final projections.
+    for idx,row in out.iterrows():
+        proj=safe_float(row.get("Projection"),np.nan); line=safe_float(row.get("Line"),np.nan)
+        market=str(row.get("Market","PTS")).upper()
+        edge=proj-line if pd.notna(proj) and pd.notna(line) else np.nan
+        lean="OVER" if pd.notna(edge) and edge>0 else "UNDER" if pd.notna(edge) and edge<0 else "PASS"
+        key=normalize_name(row.get("Matched Player") or row.get("Player")); br=lookup.loc[key] if (not lookup.empty and key in lookup.index) else None
+        sd=_v342_sd(br,market,proj)
+        overp=_normal_over_probability(line,proj,sd); underp=100-overp
+        out.at[idx,"Edge"]=round(edge,2) if pd.notna(edge) else np.nan
+        out.at[idx,"Lean"]=lean; out.at[idx,"Over %"]=round(overp,1); out.at[idx,"Under %"]=round(underp,1)
+        # Verified means current refresh + opponent core metrics + market rank.
+        core_ok=bool(str(row.get("Opponent","")).strip()) and pd.notna(_v343_num(row,["Opponent DRtg"],np.nan)) and pd.notna(_v343_num(row,["Opponent Pace"],np.nan)) and pd.notna(_v343_num(row,["Opponent Market Rank"],np.nan))
+        fresh=str(row.get("Data Freshness Status",""))=="FRESH"
+        out.at[idx,"Data Integrity"]="VERIFIED" if core_ok and fresh else "LIMITED"
+        if not core_ok:
+            out.at[idx,"PASS Reason"]="Missing opponent DRtg, pace, or market rank"
+            out.at[idx,"Official"]="PASS"
+        elif not fresh:
+            out.at[idx,"PASS Reason"]="Data refresh is stale or not confirmed this session"
+            out.at[idx,"Official"]="PASS"
+    # Historical validation diagnostics from graded rows, when available.
+    hist=load_dataset("official_history")
+    if hist is not None and not hist.empty:
+        h=hist.copy(); h["Projection"]=pd.to_numeric(h.get("Projection"),errors="coerce"); h["Actual"]=pd.to_numeric(h.get("Actual"),errors="coerce")
+        h=h.dropna(subset=["Projection","Actual"])
+        if not h.empty:
+            h["AbsError"]=(h["Actual"]-h["Projection"]).abs()
+            mae_map=h.groupby(h.get("Market",pd.Series("ALL",index=h.index)).astype(str).str.upper())["AbsError"].mean().to_dict()
+            n_map=h.groupby(h.get("Market",pd.Series("ALL",index=h.index)).astype(str).str.upper()).size().to_dict()
+            out["Historical Market MAE"]=out["Market"].astype(str).str.upper().map(mae_map)
+            out["Historical Market Samples"]=out["Market"].astype(str).str.upper().map(n_map).fillna(0).astype(int)
+    save_dataset("projection_board",out)
+    return out
+
+
+def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+    board=_make_projection_board_v343_input(lines,logs,base,mode)
+    return _v343_apply(board,base)
+
+
 tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
 
 with tabs[0]:
