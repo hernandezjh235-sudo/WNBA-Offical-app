@@ -9046,19 +9046,32 @@ st.markdown("""
 
 
 # ============================================================================
-# v3.4.2 — TRUE MATCHUP / DUPLICATE-BOOST / SLATE-BIAS CORRECTION
-# This final layer deliberately rebuilds the betting projection from verified
-# player baselines and applies opponent context once, with a hard cap. It does
-# not force a 50/50 slate; it only removes systematic inflation and reports bias.
+# v3.4.4 — CALIBRATED TRUE-SIDE ENGINE
+# Goals:
+#   • no duplicate pace/matchup/role boosts
+#   • robust player baseline with conservative recent-form weighting
+#   • market-aware Bayesian shrinkage (small, confidence-dependent)
+#   • PRA equals corrected PTS + REB + AST exactly
+#   • calibrated probabilities with uncertainty inflation
+#   • NEUTRAL/NO-PLAY zone for edges too small to be meaningful
+#   • slate bias is diagnosed, never artificially forced to 50/50
 # ============================================================================
-_make_projection_board_v342_input = make_projection_board
+_make_projection_board_v344_input = make_projection_board
 
 
-def _v342_numeric(values):
-    return [float(x) for x in values if pd.notna(x) and np.isfinite(float(x))]
+def _v344_numeric(values):
+    out = []
+    for x in values:
+        try:
+            x = float(x)
+            if np.isfinite(x):
+                out.append(x)
+        except Exception:
+            pass
+    return out
 
 
-def _v342_player_lookup(base: pd.DataFrame) -> pd.DataFrame:
+def _v344_player_lookup(base: pd.DataFrame) -> pd.DataFrame:
     if base is None or base.empty:
         return pd.DataFrame()
     b = base.copy()
@@ -9067,429 +9080,305 @@ def _v342_player_lookup(base: pd.DataFrame) -> pd.DataFrame:
     return b.drop_duplicates("NameKey").set_index("NameKey")
 
 
-def _v342_baseline_values(row: pd.Series, br: Optional[pd.Series], market: str):
+def _v344_value(br, row, names, fallback=np.nan):
+    for name in names:
+        try:
+            if br is not None and name in br.index:
+                v = safe_float(br.get(name), np.nan)
+                if pd.notna(v):
+                    return v
+        except Exception:
+            pass
+        try:
+            v = safe_float(row.get(name), np.nan)
+            if pd.notna(v):
+                return v
+        except Exception:
+            pass
+    return fallback
+
+
+def _v344_baseline(row: pd.Series, br: Optional[pd.Series], market: str):
     vals = {
-        "l5": safe_float(row.get("L5 Avg"), np.nan),
-        "l10": safe_float(row.get("L10 Avg"), np.nan),
-        "season": safe_float(row.get("Season Avg"), np.nan),
-        "prior": np.nan,
+        "l5": _v344_value(br, row, [f"{market}_l5", "L5 Avg"]),
+        "l10": _v344_value(br, row, [f"{market}_l10", "L10 Avg"]),
+        "l20": _v344_value(br, row, [f"{market}_l20", "L20 Avg"]),
+        "season": _v344_value(br, row, [f"{market}_avg", "Season Avg"]),
+        "prior": _v344_value(br, row, [f"{market}_prior"]),
     }
-    if br is not None:
-        vals["l5"] = safe_float(br.get(f"{market}_l5"), vals["l5"])
-        vals["l10"] = safe_float(br.get(f"{market}_l10"), vals["l10"])
-        vals["season"] = safe_float(br.get(f"{market}_avg"), vals["season"])
-        vals["prior"] = safe_float(br.get(f"{market}_prior"), vals["season"])
-    available = _v342_numeric(vals.values())
-    fallback = safe_float(row.get("Projection"), np.nan)
+    available = _v344_numeric(vals.values())
     if not available:
-        return fallback, vals
-    # Stable shrinkage: L10/season drive the center; L5 can move it but cannot
-    # dominate; prior protects rookies/small samples from extreme projections.
-    l5 = vals["l5"] if pd.notna(vals["l5"]) else np.nanmedian(available)
-    l10 = vals["l10"] if pd.notna(vals["l10"]) else np.nanmedian(available)
-    season = vals["season"] if pd.notna(vals["season"]) else np.nanmedian(available)
-    prior = vals["prior"] if pd.notna(vals["prior"]) else season
-    anchor = 0.24*l5 + 0.34*l10 + 0.34*season + 0.08*prior
-    return float(anchor), vals
+        return safe_float(row.get("Projection"), np.nan), vals
+    med = float(np.median(available))
+    for k in vals:
+        if pd.isna(vals[k]):
+            vals[k] = med
+    # L5 is intentionally capped in influence. L10/L20/season establish the
+    # sustainable level; prior protects small samples and rookies.
+    anchor = (
+        0.16 * vals["l5"]
+        + 0.26 * vals["l10"]
+        + 0.22 * vals["l20"]
+        + 0.29 * vals["season"]
+        + 0.07 * vals["prior"]
+    )
+    # Winsorize the anchor around the robust center of all windows.
+    mad = float(np.median(np.abs(np.asarray(available) - med))) if available else 0.0
+    width = max({"PTS": 2.8, "REB": 1.25, "AST": 1.15, "PRA": 4.2}.get(market, 2.0), 2.5 * mad)
+    anchor = float(np.clip(anchor, max(0.0, med - width), med + width))
+    return anchor, vals
 
 
-def _v342_minutes_multiplier(row: pd.Series, br: Optional[pd.Series]) -> float:
+def _v344_minutes_multiplier(row: pd.Series, br: Optional[pd.Series]) -> tuple:
     projected = safe_float(row.get("MIN Proj"), np.nan)
-    if br is None:
-        return 1.0
-    established = safe_float(br.get("MIN_avg"), np.nan)
-    recent = np.nanmedian(_v342_numeric([br.get("MIN_l5"), br.get("MIN_l10"), established]))
-    denominator = recent if pd.notna(recent) and recent > 0 else established
-    if pd.isna(projected) or pd.isna(denominator) or denominator <= 0:
-        return 1.0
-    # Workload matters, but a noisy minutes estimate cannot create a giant edge.
-    return float(np.clip(projected / denominator, 0.92, 1.08))
+    l5 = _v344_value(br, row, ["MIN_l5"])
+    l10 = _v344_value(br, row, ["MIN_l10"])
+    season = _v344_value(br, row, ["MIN_avg", "MIN"])
+    recent = _v344_numeric([l5, l10, season])
+    if pd.isna(projected) or not recent:
+        return 1.0, 55.0
+    baseline = 0.35*(l5 if pd.notna(l5) else np.median(recent)) + 0.40*(l10 if pd.notna(l10) else np.median(recent)) + 0.25*(season if pd.notna(season) else np.median(recent))
+    if baseline <= 0:
+        return 1.0, 55.0
+    raw = projected / baseline
+    dispersion = float(np.std(recent)) if len(recent) >= 2 else 2.5
+    confidence = float(np.clip(96.0 - dispersion*8.0 - abs(projected-baseline)*2.2, 45.0, 96.0))
+    # Only a verified role change may move the projection by more than 4%.
+    role_text = " ".join(str(row.get(c, "")) for c in ["Injury Status", "Role", "Starter Status", "Lineup Status", "Availability"] ).upper()
+    verified_change = any(t in role_text for t in ["CONFIRMED START", "STARTER", "OUT", "INACTIVE", "ROLE CHANGE"])
+    cap = 0.06 if verified_change and confidence >= 75 else 0.04
+    return float(np.clip(raw, 1-cap, 1+cap)), confidence
 
 
-def _v342_verified_matchup_multiplier(row: pd.Series) -> float:
-    if str(row.get("Data Integrity", "")).upper() != "VERIFIED":
-        return 1.0
-    score = safe_float(row.get("Opponent Matchup Score"), 50.0)
+def _v344_matchup_multiplier(row: pd.Series) -> tuple:
+    integrity = str(row.get("Data Integrity", "LIMITED")).upper()
+    opp = str(row.get("Opponent", "")).strip()
+    drtg = safe_float(row.get("Opponent DRtg"), np.nan)
+    pace = safe_float(row.get("Opponent Pace"), np.nan)
     rank = safe_float(row.get("Opponent Market Rank"), np.nan)
     teams = safe_float(row.get("Opponent Market Rank Teams"), np.nan)
-    # Matchup score already incorporates DRtg, pace and position defense.
-    # Apply it ONCE, with a maximum impact of +/-2.5%.
-    score_move = np.clip((score - 50.0) / 50.0 * 0.025, -0.025, 0.025)
-    # Rank is only a small confirmation, not another full adjustment.
+    score = safe_float(row.get("Opponent Matchup Score"), 50.0)
+    verified = integrity == "VERIFIED" and opp and opp.lower() not in {"nan", "none", "opponent unavailable"} and pd.notna(drtg) and pd.notna(pace) and pd.notna(rank)
+    if not verified:
+        return 1.0, "Unknown", 35.0
+    # The upstream matchup score already combines pace/DRtg/position context.
+    # Apply one small bounded move only. Rank is used as confirmation, not a
+    # second boost.
+    score_move = float(np.clip((score - 50.0) / 50.0 * 0.0125, -0.0125, 0.0125))
     rank_move = 0.0
-    if pd.notna(rank) and pd.notna(teams) and teams >= 6:
-        percentile = (rank - 1.0) / max(1.0, teams - 1.0)
-        rank_move = np.clip((percentile - 0.5) * 0.010, -0.005, 0.005)
-    return float(np.clip(1.0 + score_move + rank_move, 0.97, 1.03))
+    if pd.notna(teams) and teams >= 6:
+        pct = (rank - 1.0) / max(1.0, teams - 1.0)
+        rank_move = float(np.clip((pct - 0.5) * 0.005, -0.0025, 0.0025))
+    mult = float(np.clip(1.0 + score_move + rank_move, 0.985, 1.015))
+    grade = "Favorable" if score >= 58 else "Tough" if score <= 42 else "Neutral"
+    confidence = float(np.clip(70 + min(20, teams if pd.notna(teams) else 0), 70, 92))
+    return mult, grade, confidence
 
 
-def _v342_cap_projection(value: float, vals: dict, market: str) -> float:
-    available = _v342_numeric(vals.values())
-    if not available or pd.isna(value):
-        return value
-    center = float(np.median(available))
-    spread = {
-        "PTS": max(2.25, abs(center)*0.17),
-        "REB": max(1.15, abs(center)*0.22),
-        "AST": max(1.05, abs(center)*0.24),
-        "PRA": max(4.0, abs(center)*0.15),
-    }.get(market, max(1.5, abs(center)*0.18))
-    # Do not let one hot/cold window create an impossible number.
-    low = max(0.0, min(available) - spread*0.35)
-    high = max(0.0, max(available) + spread*0.35)
-    # Also remain near the robust center.
-    low = max(low, center - spread)
-    high = min(high, center + spread)
-    if high < low:
-        low, high = min(available), max(available)
-    return float(np.clip(value, low, high))
+def _v344_market_shrink(proj: float, line: float, integrity: str, sample_quality: float) -> tuple:
+    if pd.isna(proj) or pd.isna(line):
+        return proj, 0.0
+    # Sportsbook consensus is informative but never replaces the model.
+    # Verified/high-sample projections receive less market shrinkage.
+    base_w = 0.12 if integrity == "VERIFIED" else 0.22
+    w = float(np.clip(base_w + (1.0-sample_quality)*0.10, 0.10, 0.30))
+    return float((1.0-w)*proj + w*line), w
 
 
-def _v342_component_projection(row: pd.Series, br: Optional[pd.Series], market: str) -> tuple:
-    anchor, vals = _v342_baseline_values(row, br, market)
+def _v344_component_projection(row: pd.Series, br: Optional[pd.Series], market: str):
+    anchor, vals = _v344_baseline(row, br, market)
     if pd.isna(anchor):
-        return np.nan, vals, 1.0, 1.0
-    minutes_mult = _v342_minutes_multiplier(row, br)
-    matchup_mult = _v342_verified_matchup_multiplier(row)
-    projection = anchor * minutes_mult * matchup_mult
-    projection = _v342_cap_projection(projection, vals, market)
-    return projection, vals, minutes_mult, matchup_mult
+        return np.nan, vals, {}
+    min_mult, min_conf = _v344_minutes_multiplier(row, br)
+    matchup_mult, matchup_grade, matchup_conf = _v344_matchup_multiplier(row)
+    raw = anchor * min_mult * matchup_mult
+    # Robust sanity cap around L10/L20/season; this is not a market cap.
+    stable = _v344_numeric([vals.get("l10"), vals.get("l20"), vals.get("season"), vals.get("prior")])
+    if stable:
+        center = float(np.median(stable))
+        sd_proxy = float(np.std(stable)) if len(stable) >= 2 else 0.0
+        width = max({"PTS":3.2,"REB":1.45,"AST":1.35,"PRA":4.8}.get(market,2.5), 2.25*sd_proxy)
+        raw = float(np.clip(raw, max(0.0, center-width), center+width))
+    line = safe_float(row.get("Line"), np.nan)
+    sample_n = safe_float(_v344_value(br, row, [f"{market}_Games", "Games", "GP"]), 15.0)
+    sample_quality = float(np.clip(sample_n/25.0, 0.35, 1.0))
+    integrity = str(row.get("Data Integrity", "LIMITED")).upper()
+    final, market_w = _v344_market_shrink(raw, line, integrity, sample_quality)
+    meta = {
+        "anchor": anchor, "minutes_mult": min_mult, "minutes_conf": min_conf,
+        "matchup_mult": matchup_mult, "matchup_grade": matchup_grade,
+        "matchup_conf": matchup_conf, "market_weight": market_w,
+        "sample_quality": sample_quality,
+    }
+    return final, vals, meta
 
 
-def _v342_sd(br: Optional[pd.Series], market: str, anchor: float) -> float:
-    default = {"PTS":4.8, "REB":2.4, "AST":2.2, "PRA":6.6}.get(market, 4.0)
-    sd = safe_float(br.get(f"{market}_Std20"), default) if br is not None else default
-    floor = {"PTS":3.3, "REB":1.55, "AST":1.45, "PRA":4.8}.get(market, 2.0)
-    ceiling = {"PTS":7.5, "REB":4.3, "AST":4.0, "PRA":11.0}.get(market, 8.0)
-    return float(np.clip(sd, floor, ceiling))
+def _v344_sd(br: Optional[pd.Series], market: str, projection: float, data_conf: float) -> float:
+    default = {"PTS":4.9,"REB":2.45,"AST":2.25,"PRA":6.8}.get(market,4.0)
+    sd = _v344_value(br, pd.Series(dtype=object), [f"{market}_Std20", f"{market}_std"], default)
+    floor = {"PTS":3.6,"REB":1.65,"AST":1.55,"PRA":5.1}.get(market,2.2)
+    ceiling = {"PTS":7.8,"REB":4.5,"AST":4.2,"PRA":11.5}.get(market,8.0)
+    # Missing/limited data increases uncertainty rather than shifting the mean.
+    uncertainty = 1.0 + max(0.0, 82.0-data_conf)/100.0
+    return float(np.clip(sd*uncertainty, floor, ceiling))
 
 
-def _v342_rebuild_board(board: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
+def _v344_probability(line: float, mean: float, sd: float) -> float:
+    if pd.isna(line) or pd.isna(mean) or pd.isna(sd) or sd <= 0:
+        return 50.0
+    # Half-point continuity correction prevents tiny edges from looking too strong.
+    return float(np.clip(_normal_over_probability(line + 0.15, mean, sd), 1.0, 99.0))
+
+
+def _v344_rebuild_board(board: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
     if board is None or board.empty:
         return board
-    lookup = _v342_player_lookup(base)
+    lookup = _v344_player_lookup(base)
     rows = []
-    # Cache corrected components so PRA is always exactly PTS + REB + AST.
     component_cache = {}
     for _, rr in board.iterrows():
         row = rr.copy()
         key = normalize_name(row.get("Matched Player") or row.get("Player"))
         br = lookup.loc[key] if (not lookup.empty and key in lookup.index) else None
         market = str(row.get("Market", "PTS")).upper()
-        cache_key = (key, str(row.get("Team", "")), str(row.get("Opponent", "")))
+        cache_key = (key, str(row.get("Team", "")), str(row.get("Opponent", "")), safe_float(row.get("MIN Proj"), np.nan))
         if cache_key not in component_cache:
-            comps = {}
-            meta = {}
-            for m in ["PTS", "REB", "AST"]:
-                p, v, mm, xm = _v342_component_projection(row, br, m)
-                comps[m] = p
-                meta[m] = (v, mm, xm)
-            component_cache[cache_key] = (comps, meta)
-        comps, meta = component_cache[cache_key]
-        if market == "PRA" and all(pd.notna(comps[m]) for m in ["PTS", "REB", "AST"]):
+            comps, values, metas = {}, {}, {}
+            for m in ["PTS","REB","AST"]:
+                p, v, meta = _v344_component_projection(row, br, m)
+                comps[m], values[m], metas[m] = p, v, meta
+            component_cache[cache_key] = (comps, values, metas)
+        comps, values, metas = component_cache[cache_key]
+
+        if market == "PRA" and all(pd.notna(comps.get(m)) for m in ["PTS","REB","AST"]):
+            # Exact component identity: no second PRA matchup, pace, minutes or cap.
             final_proj = float(comps["PTS"] + comps["REB"] + comps["AST"])
-            anchor, vals = _v342_baseline_values(row, br, "PRA")
-            # PRA is component sum; a conservative aggregate cap only catches
-            # data corruption, not legitimate component movement.
-            final_proj = _v342_cap_projection(final_proj, vals, "PRA")
-            minutes_mult = float(np.mean([meta[m][1] for m in meta]))
-            matchup_mult = float(np.mean([meta[m][2] for m in meta]))
+            vals = {k: sum(safe_float(values[m].get(k),0.0) for m in ["PTS","REB","AST"]) for k in ["l5","l10","l20","season","prior"]}
+            meta = {
+                "anchor": sum(safe_float(metas[m].get("anchor"),0.0) for m in metas),
+                "minutes_mult": float(np.mean([metas[m].get("minutes_mult",1.0) for m in metas])),
+                "minutes_conf": float(np.mean([metas[m].get("minutes_conf",55.0) for m in metas])),
+                "matchup_mult": float(np.mean([metas[m].get("matchup_mult",1.0) for m in metas])),
+                "matchup_grade": metas["PTS"].get("matchup_grade","Unknown"),
+                "matchup_conf": float(np.mean([metas[m].get("matchup_conf",35.0) for m in metas])),
+                "market_weight": float(np.mean([metas[m].get("market_weight",0.0) for m in metas])),
+                "sample_quality": float(np.mean([metas[m].get("sample_quality",0.5) for m in metas])),
+            }
         else:
             final_proj = comps.get(market, np.nan)
-            vals, minutes_mult, matchup_mult = meta.get(market, ({}, 1.0, 1.0))
-            anchor, _ = _v342_baseline_values(row, br, market)
+            vals = values.get(market, {})
+            meta = metas.get(market, {})
+
         line = safe_float(row.get("Line"), np.nan)
-        edge = final_proj - line if pd.notna(final_proj) and pd.notna(line) else np.nan
-        lean = "OVER" if pd.notna(edge) and edge > 0 else "UNDER" if pd.notna(edge) and edge < 0 else "PASS"
-        sd = _v342_sd(br, market, final_proj)
-        overp = _normal_over_probability(line, final_proj, sd)
-        underp = 100.0 - overp
-        sidep = overp if lean == "OVER" else underp if lean == "UNDER" else 50.0
-        # Recent agreement prevents a tiny model edge from being labeled elite.
-        baselines = _v342_numeric(vals.values()) if isinstance(vals, dict) else []
-        recent_votes = 0
-        if pd.notna(line) and baselines:
-            recent_votes = sum(1 for x in baselines[:3] if (x > line) == (lean == "OVER"))
+        edge = final_proj-line if pd.notna(final_proj) and pd.notna(line) else np.nan
         integrity = str(row.get("Data Integrity", "LIMITED")).upper()
-        integrity_score = 94.0 if integrity == "VERIFIED" else 62.0
-        edge_strength = np.clip(50 + abs(edge if pd.notna(edge) else 0) * {"PTS":8,"REB":14,"AST":14,"PRA":5}.get(market,8), 0, 100)
-        hit_score = float(np.clip(0.48*sidep + 0.18*integrity_score + 0.18*edge_strength + 0.16*(40 + recent_votes*18), 0, 100))
-        min_edge = {"PTS":1.5,"REB":0.8,"AST":0.8,"PRA":2.2}.get(market,1.2)
-        official = "PASS"
-        reason_bits = []
-        if integrity != "VERIFIED": reason_bits.append("matchup data not verified")
-        if pd.isna(edge) or abs(edge) < min_edge: reason_bits.append("edge below market threshold")
-        if sidep < 60.0: reason_bits.append("simulation probability below 60%")
-        if recent_votes < 2: reason_bits.append("recent/season baselines do not agree")
-        if not reason_bits:
-            official = "🔥 OVER" if lean == "OVER" else "⚠️ UNDER"
-        row["Projection Before Bias Fix"] = safe_float(row.get("Projection"), np.nan)
-        row["Projection"] = round(final_proj, 2) if pd.notna(final_proj) else np.nan
-        row["Edge"] = round(edge, 2) if pd.notna(edge) else np.nan
+        data_conf = 94.0 if integrity == "VERIFIED" else 64.0
+        final_conf = float(np.clip(0.36*data_conf + 0.32*meta.get("minutes_conf",55) + 0.18*meta.get("matchup_conf",35) + 0.14*(meta.get("sample_quality",.5)*100), 35, 96))
+        sd = _v344_sd(br, market, final_proj, final_conf)
+        overp = _v344_probability(line, final_proj, sd)
+        underp = 100.0-overp
+
+        # Meaningful direction thresholds. A tiny positive projection difference is
+        # NEUTRAL, not an OVER. These are roughly 0.15–0.25 SD by market.
+        neutral_edge = {"PTS":0.75,"REB":0.40,"AST":0.40,"PRA":1.25}.get(market,0.75)
+        min_prob = 54.5
+        if pd.isna(edge):
+            lean = "PASS"
+        elif edge >= neutral_edge and overp >= min_prob:
+            lean = "OVER"
+        elif edge <= -neutral_edge and underp >= min_prob:
+            lean = "UNDER"
+        else:
+            lean = "NEUTRAL"
+        sidep = overp if lean == "OVER" else underp if lean == "UNDER" else max(overp, underp)
+
+        baseline_list = _v344_numeric([vals.get("l5"),vals.get("l10"),vals.get("l20"),vals.get("season")]) if isinstance(vals,dict) else []
+        recent_votes = 0
+        if pd.notna(line) and lean in {"OVER","UNDER"}:
+            recent_votes = sum(1 for x in baseline_list if (x>line)==(lean=="OVER"))
+
+        edge_scale = {"PTS":6.0,"REB":11.0,"AST":11.0,"PRA":3.8}.get(market,6.0)
+        edge_score = float(np.clip(50 + abs(edge if pd.notna(edge) else 0)*edge_scale, 0, 100))
+        hit_score = float(np.clip(0.46*sidep + 0.24*final_conf + 0.16*edge_score + 0.14*(40+recent_votes*13), 0, 100))
+
+        official_edge = {"PTS":1.50,"REB":0.75,"AST":0.75,"PRA":2.25}.get(market,1.25)
+        official_prob = {"PTS":60.0,"REB":59.0,"AST":59.0,"PRA":60.0}.get(market,60.0)
+        reasons = []
+        if lean not in {"OVER","UNDER"}: reasons.append("edge inside neutral/no-play zone")
+        if integrity != "VERIFIED": reasons.append("opponent/data context not fully verified")
+        if pd.isna(edge) or abs(edge) < official_edge: reasons.append("edge below official threshold")
+        if sidep < official_prob: reasons.append("calibrated probability below official threshold")
+        if recent_votes < 2: reasons.append("recent/season support is weak")
+        if final_conf < 78: reasons.append("projection confidence below 78%")
+        official = "PASS" if reasons else ("🔥 OVER" if lean=="OVER" else "⚠️ UNDER")
+
+        row["Projection Before Calibration"] = safe_float(row.get("Projection"), np.nan)
+        row["Projection"] = round(final_proj,2) if pd.notna(final_proj) else np.nan
+        row["Edge"] = round(edge,2) if pd.notna(edge) else np.nan
         row["Lean"] = lean
-        row["Over %"] = round(overp, 1)
-        row["Under %"] = round(underp, 1)
-        row["Hit Score"] = round(hit_score, 1)
-        row["Official Play Score"] = round(hit_score, 1)
+        row["Over %"] = round(overp,1)
+        row["Under %"] = round(underp,1)
+        row["Hit Score"] = round(hit_score,1)
+        row["Official Play Score"] = round(hit_score,1)
         row["Official"] = official
-        row["Tier"] = "S" if official != "PASS" and hit_score >= 86 else "A" if official != "PASS" and hit_score >= 78 else "B" if official != "PASS" else "TRACK"
-        row["PASS Reason"] = " · ".join(reason_bits)
-        row["Matchup Multiplier Applied"] = round(matchup_mult, 4)
-        row["Minutes Multiplier Applied"] = round(minutes_mult, 4)
-        row["Projection Audit"] = "Robust L5/L10/season baseline → bounded minutes → verified matchup once (max ±3%) → cap → simulation"
+        row["Tier"] = "S" if official!="PASS" and hit_score>=86 else "A" if official!="PASS" and hit_score>=78 else "B" if official!="PASS" else "TRACK"
+        row["PASS Reason"] = " · ".join(dict.fromkeys(reasons))
+        row["Opponent Matchup Grade"] = meta.get("matchup_grade","Unknown")
+        row["Matchup Multiplier Applied"] = round(meta.get("matchup_mult",1.0),4)
+        row["Minutes Multiplier Applied"] = round(meta.get("minutes_mult",1.0),4)
+        row["Minutes Confidence"] = round(meta.get("minutes_conf",55.0),1)
+        row["Matchup Confidence"] = round(meta.get("matchup_conf",35.0),1)
+        row["Final Projection Confidence"] = round(final_conf,1)
+        row["Market Shrink Weight"] = round(meta.get("market_weight",0.0),3)
+        row["Simulation SD"] = round(sd,2)
+        row["Projection Audit"] = "L10/L20/season-led Bayesian baseline → bounded minutes once → verified matchup once (max ±1.5%) → small market shrink → uncertainty-calibrated simulation → neutral zone"
         if market == "PRA":
-            row["PRA Component PTS"] = round(comps["PTS"], 2)
-            row["PRA Component REB"] = round(comps["REB"], 2)
-            row["PRA Component AST"] = round(comps["AST"], 2)
-            row["PRA Component Sum"] = round(comps["PTS"] + comps["REB"] + comps["AST"], 2)
+            row["PRA Component PTS"] = round(comps["PTS"],2)
+            row["PRA Component REB"] = round(comps["REB"],2)
+            row["PRA Component AST"] = round(comps["AST"],2)
+            row["PRA Component Sum"] = round(comps["PTS"]+comps["REB"]+comps["AST"],2)
+            row["PRA Identity Check"] = abs(final_proj-(comps["PTS"]+comps["REB"]+comps["AST"])) < 0.005
         rows.append(row)
+
     out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    # Slate-level diagnostic only. Never force sides to balance artificially.
-    valid = out[out["Lean"].isin(["OVER", "UNDER"])]
-    overs = int((valid["Lean"] == "OVER").sum())
-    unders = int((valid["Lean"] == "UNDER").sum())
-    total = max(1, len(valid))
-    over_rate = overs / total
+    actionable = out[out["Lean"].isin(["OVER","UNDER"])]
+    overs = int((actionable["Lean"]=="OVER").sum())
+    unders = int((actionable["Lean"]=="UNDER").sum())
+    neutrals = int((out["Lean"]=="NEUTRAL").sum())
+    total = len(actionable)
+    over_rate = overs/max(1,total)
     warning = "BALANCED"
-    if len(valid) >= 8 and over_rate >= 0.70:
-        warning = f"OVER BIAS WARNING: {overs}/{len(valid)} ({over_rate:.0%}) projections lean over. Review baselines/lines before betting."
-    elif len(valid) >= 8 and over_rate <= 0.30:
-        warning = f"UNDER BIAS WARNING: {unders}/{len(valid)} ({1-over_rate:.0%}) projections lean under. Review baselines/lines before betting."
-    summary = {"overs": overs, "unders": unders, "total": len(valid), "over_rate": over_rate, "warning": warning}
+    if total >= 8 and over_rate >= .75:
+        warning = f"OVER-SKEW WARNING: {overs}/{total} actionable projections lean over. This is a diagnostic—not an automatic side reversal."
+    elif total >= 8 and over_rate <= .25:
+        warning = f"UNDER-SKEW WARNING: {unders}/{total} actionable projections lean under. This is a diagnostic—not an automatic side reversal."
+    summary = {"overs":overs,"unders":unders,"neutrals":neutrals,"total":total,"over_rate":over_rate,"warning":warning}
     st.session_state["wnba_slate_bias_summary"] = summary
     out["Slate Over Count"] = overs
     out["Slate Under Count"] = unders
+    out["Slate Neutral Count"] = neutrals
     out["Slate Bias Warning"] = warning
-    out = out.sort_values(["Hit Score", "Official Play Score", "Edge"], ascending=[False, False, False])
+    out = out.sort_values(["Official Play Score","Hit Score","Edge"], ascending=[False,False,False])
     save_dataset("projection_board", out)
     return out
 
 
 def make_projection_board(lines, logs, base, mode: Optional[str] = None):
-    board = _make_projection_board_v342_input(lines, logs, base, mode)
-    return _v342_rebuild_board(board, base)
+    board = _make_projection_board_v344_input(lines, logs, base, mode)
+    return _v344_rebuild_board(board, base)
 
 
-_render_grouped_player_board_v342_input = render_grouped_player_board
+_render_grouped_player_board_v344_input = render_grouped_player_board
 
 def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame):
-    _render_grouped_player_board_v342_input(mode, use_ud_flag, logs_global, master_global)
+    _render_grouped_player_board_v344_input(mode, use_ud_flag, logs_global, master_global)
     summary = st.session_state.get("wnba_slate_bias_summary", {})
     warning = str(summary.get("warning", ""))
     if warning and warning != "BALANCED":
         st.warning(warning)
     elif summary:
-        st.caption(f"Slate direction check: {summary.get('overs',0)} overs / {summary.get('unders',0)} unders — no severe directional bias detected.")
+        st.caption(f"Slate direction: {summary.get('overs',0)} overs / {summary.get('unders',0)} unders / {summary.get('neutrals',0)} neutral-no plays.")
 
-
-
-
-# ============================================================================
-# v3.4.3 — TRUE TEAM OFFENSE/DEFENSE + MARKET OPPORTUNITY VALIDATION
-# Adds only source-backed context. Missing inputs remain neutral and reduce
-# confidence; no synthetic matchup data or duplicate projection boosts.
-# ============================================================================
-_make_projection_board_v343_input = make_projection_board
-
-
-def _v343_num(row, keys, default=np.nan):
-    for k in keys:
-        try:
-            v = safe_float(row.get(k), np.nan)
-            if pd.notna(v) and np.isfinite(v):
-                return float(v)
-        except Exception:
-            pass
-    return default
-
-
-def _v343_position_group(row, br=None):
-    raw = str(row.get("Position", row.get("Pos", ""))).upper().strip()
-    if br is not None:
-        raw = raw or str(br.get("Position", br.get("Pos", ""))).upper().strip()
-    if any(x in raw for x in ["PG", "SG", "GUARD", " G"]):
-        return "GUARD"
-    if any(x in raw for x in ["PF", "C", "CENTER", "POST", "BIG"]):
-        return "BIG"
-    if any(x in raw for x in ["SF", "WING", "FORWARD", " F"]):
-        return "WING"
-    # Role-based fallback is safer than blindly assigning roster position.
-    astp = _v343_num(br if br is not None else row, ["AST%", "AST_PCT"], np.nan)
-    trbp = _v343_num(br if br is not None else row, ["TRB%", "REB%", "REB_PCT"], np.nan)
-    if pd.notna(astp) and astp >= 22:
-        return "GUARD"
-    if pd.notna(trbp) and trbp >= 14:
-        return "BIG"
-    return "WING"
-
-
-def _v343_context_inputs(row, br=None):
-    own_ortg = _v343_num(br if br is not None else row, ["Team_ORtg_Official", "Team_ORtg", "Team ORtg"], np.nan)
-    own_pace = _v343_num(br if br is not None else row, ["Team_Pace_Official", "Team_Pace", "Team Pace"], np.nan)
-    own_efg = _v343_num(br if br is not None else row, ["Team_eFG_Official", "Team_eFG", "Team eFG"], np.nan)
-    opp_drtg = _v343_num(row, ["Opponent DRtg", "Opp DRtg", "Opp_Team_DRtg_Official"], np.nan)
-    opp_pace = _v343_num(row, ["Opponent Pace", "Opp Pace", "Opp_Team_Pace_Official"], np.nan)
-    opp_efg = _v343_num(row, ["Opponent eFG Allowed", "Opp eFG Allowed", "Opp_Team_eFG_Official", "Opp_Adv_EFG_PCT"], np.nan)
-    implied = _v343_num(row, ["Team Implied Total", "Implied Team Total", "Team Total", "Vegas Team Total"], np.nan)
-    spread = _v343_num(row, ["Spread", "Vegas Spread", "Game Spread"], np.nan)
-    return own_ortg, own_pace, own_efg, opp_drtg, opp_pace, opp_efg, implied, spread
-
-
-def _v343_market_factor(row, br, market):
-    """Return a small source-backed multiplier and audit text.
-
-    The final factor is tightly bounded. This is a single contextual correction,
-    not a replacement for the player/minutes baseline.
-    """
-    own_ortg, own_pace, own_efg, opp_drtg, opp_pace, opp_efg, implied, spread = _v343_context_inputs(row, br)
-    factors=[]; notes=[]
-    # Pace/possession environment: compare game pace with a stable WNBA baseline.
-    pace_vals=[x for x in [own_pace, opp_pace] if pd.notna(x)]
-    if pace_vals:
-        game_pace=float(np.mean(pace_vals))
-        factors.append(np.clip((game_pace-78.5)/78.5, -0.025, 0.025))
-        notes.append(f"pace {game_pace:.1f}")
-    # Team offense versus opponent defense matters most for scoring and assists.
-    if market in ["PTS","AST"] and pd.notna(own_ortg) and pd.notna(opp_drtg):
-        net=(own_ortg-100.0 + opp_drtg-100.0)/2.0
-        factors.append(np.clip(net/100.0, -0.020, 0.020))
-        notes.append(f"ORtg {own_ortg:.1f} vs DRtg {opp_drtg:.1f}")
-    if market=="PTS" and pd.notna(own_efg) and pd.notna(opp_efg):
-        # Percentages may be stored as decimals or whole percents.
-        a=own_efg/100.0 if own_efg>1.5 else own_efg
-        b=opp_efg/100.0 if opp_efg>1.5 else opp_efg
-        factors.append(np.clip((a-b)*0.30, -0.012, 0.012))
-        notes.append("shot-quality context")
-    if market=="REB":
-        # Rebound opportunity comes from misses, not DRtg alone. Higher opponent
-        # eFG means fewer available rebounds; lower eFG means more.
-        if pd.notna(opp_efg):
-            b=opp_efg/100.0 if opp_efg>1.5 else opp_efg
-            factors.append(np.clip((0.505-b)*0.22, -0.018, 0.018))
-            notes.append(f"opp miss environment {1-b:.1%}")
-        trbp=_v343_num(br if br is not None else row,["TRB%","REB%","REB_PCT"],np.nan)
-        if pd.notna(trbp):
-            t=trbp/100.0 if trbp>1.5 else trbp
-            factors.append(np.clip((t-0.11)*0.08,-0.010,0.010))
-            notes.append("player rebound share")
-    if market=="AST":
-        astp=_v343_num(br if br is not None else row,["AST%","AST_PCT"],np.nan)
-        if pd.notna(astp):
-            a=astp/100.0 if astp>1.5 else astp
-            factors.append(np.clip((a-0.18)*0.06,-0.010,0.010))
-            notes.append("creator role")
-        if pd.notna(own_efg):
-            a=own_efg/100.0 if own_efg>1.5 else own_efg
-            factors.append(np.clip((a-0.50)*0.10,-0.008,0.008))
-            notes.append("teammate conversion proxy")
-    # Vegas environment is useful only when actually available.
-    if pd.notna(implied):
-        factors.append(np.clip((implied-80.0)/80.0*0.025,-0.015,0.015))
-        notes.append(f"implied {implied:.1f}")
-    if pd.notna(spread) and abs(spread)>=9:
-        factors.append(-min(0.012,(abs(spread)-8)*0.002))
-        notes.append("blowout risk")
-    total=float(np.sum(factors)) if factors else 0.0
-    return float(np.clip(1.0+total,0.965,1.035)), "; ".join(notes) if notes else "neutral: source-backed market context unavailable"
-
-
-def _v343_freshness_status(row):
-    refresh = st.session_state.get("wnba_last_refresh", "")
-    ts = pd.to_datetime(refresh, errors="coerce", utc=True)
-    if pd.isna(ts):
-        return "UNKNOWN", np.nan
-    now = pd.Timestamp.now(tz="UTC")
-    hrs=max(0.0,(now-ts).total_seconds()/3600.0)
-    return ("FRESH" if hrs<=8 else "STALE"), hrs
-
-
-def _v343_apply(board: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
-    if board is None or board.empty:
-        return board
-    lookup=_v342_player_lookup(base)
-    rows=[]
-    component_map={}
-    for _, rr in board.iterrows():
-        row=rr.copy()
-        key=normalize_name(row.get("Matched Player") or row.get("Player"))
-        br=lookup.loc[key] if (not lookup.empty and key in lookup.index) else None
-        market=str(row.get("Market","PTS")).upper()
-        pos=_v343_position_group(row,br)
-        factor,note=_v343_market_factor(row,br,market)
-        base_proj=safe_float(row.get("Projection"),np.nan)
-        # Remove the prior generic matchup multiplier before applying the
-        # market-specific factor, preventing duplicate context boosts.
-        old_match=safe_float(row.get("Matchup Multiplier Applied"),1.0)
-        neutralized=base_proj/old_match if pd.notna(base_proj) and old_match not in [0,np.nan] else base_proj
-        final=neutralized*factor if pd.notna(neutralized) else np.nan
-        # Preserve existing robust baseline caps.
-        _,vals=_v342_baseline_values(row,br,market)
-        final=_v342_cap_projection(final,vals,market)
-        cache=(key,str(row.get("Team","")),str(row.get("Opponent","")))
-        component_map.setdefault(cache,{})[market]=final
-        row["Projection Before Team Context"] = round(base_proj,2) if pd.notna(base_proj) else np.nan
-        row["Team Matchup Multiplier"] = round(factor,4)
-        row["Team Matchup Audit"] = note
-        row["Position Group Used"] = pos
-        fresh,hrs=_v343_freshness_status(row)
-        row["Data Freshness Status"] = fresh
-        row["Data Age Hours"] = round(hrs,2) if pd.notna(hrs) else np.nan
-        row["Projection"] = round(final,2) if pd.notna(final) else np.nan
-        rows.append(row)
-    out=pd.DataFrame(rows)
-    # Make PRA exactly equal to the final PTS+REB+AST component projections.
-    for idx,row in out.iterrows():
-        if str(row.get("Market","")).upper()!="PRA":
-            continue
-        cache=(normalize_name(row.get("Matched Player") or row.get("Player")),str(row.get("Team","")),str(row.get("Opponent","")))
-        comps=component_map.get(cache,{})
-        if all(pd.notna(comps.get(m,np.nan)) for m in ["PTS","REB","AST"]):
-            out.at[idx,"Projection"]=round(comps["PTS"]+comps["REB"]+comps["AST"],2)
-            out.at[idx,"PRA Component PTS"]=round(comps["PTS"],2)
-            out.at[idx,"PRA Component REB"]=round(comps["REB"],2)
-            out.at[idx,"PRA Component AST"]=round(comps["AST"],2)
-            out.at[idx,"PRA Component Sum"]=round(comps["PTS"]+comps["REB"]+comps["AST"],2)
-    # Recalculate betting side and probabilities from the final projections.
-    for idx,row in out.iterrows():
-        proj=safe_float(row.get("Projection"),np.nan); line=safe_float(row.get("Line"),np.nan)
-        market=str(row.get("Market","PTS")).upper()
-        edge=proj-line if pd.notna(proj) and pd.notna(line) else np.nan
-        lean="OVER" if pd.notna(edge) and edge>0 else "UNDER" if pd.notna(edge) and edge<0 else "PASS"
-        key=normalize_name(row.get("Matched Player") or row.get("Player")); br=lookup.loc[key] if (not lookup.empty and key in lookup.index) else None
-        sd=_v342_sd(br,market,proj)
-        overp=_normal_over_probability(line,proj,sd); underp=100-overp
-        out.at[idx,"Edge"]=round(edge,2) if pd.notna(edge) else np.nan
-        out.at[idx,"Lean"]=lean; out.at[idx,"Over %"]=round(overp,1); out.at[idx,"Under %"]=round(underp,1)
-        # Verified means current refresh + opponent core metrics + market rank.
-        core_ok=bool(str(row.get("Opponent","")).strip()) and pd.notna(_v343_num(row,["Opponent DRtg"],np.nan)) and pd.notna(_v343_num(row,["Opponent Pace"],np.nan)) and pd.notna(_v343_num(row,["Opponent Market Rank"],np.nan))
-        fresh=str(row.get("Data Freshness Status",""))=="FRESH"
-        out.at[idx,"Data Integrity"]="VERIFIED" if core_ok and fresh else "LIMITED"
-        if not core_ok:
-            out.at[idx,"PASS Reason"]="Missing opponent DRtg, pace, or market rank"
-            out.at[idx,"Official"]="PASS"
-        elif not fresh:
-            out.at[idx,"PASS Reason"]="Data refresh is stale or not confirmed this session"
-            out.at[idx,"Official"]="PASS"
-    # Historical validation diagnostics from graded rows, when available.
-    hist=load_dataset("official_history")
-    if hist is not None and not hist.empty:
-        h=hist.copy(); h["Projection"]=pd.to_numeric(h.get("Projection"),errors="coerce"); h["Actual"]=pd.to_numeric(h.get("Actual"),errors="coerce")
-        h=h.dropna(subset=["Projection","Actual"])
-        if not h.empty:
-            h["AbsError"]=(h["Actual"]-h["Projection"]).abs()
-            mae_map=h.groupby(h.get("Market",pd.Series("ALL",index=h.index)).astype(str).str.upper())["AbsError"].mean().to_dict()
-            n_map=h.groupby(h.get("Market",pd.Series("ALL",index=h.index)).astype(str).str.upper()).size().to_dict()
-            out["Historical Market MAE"]=out["Market"].astype(str).str.upper().map(mae_map)
-            out["Historical Market Samples"]=out["Market"].astype(str).str.upper().map(n_map).fillna(0).astype(int)
-    save_dataset("projection_board",out)
-    return out
-
-
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
-    board=_make_projection_board_v343_input(lines,logs,base,mode)
-    return _v343_apply(board,base)
 
 
 tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
