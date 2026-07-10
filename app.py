@@ -8569,25 +8569,47 @@ def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
     for idx, rr in out.iterrows():
         market = str(rr.get("Market", "PTS")).upper()
         opponent = _first_text_value(rr, ["Opponent", "Opp", "Opponent Team"], "")
-        pace = _first_numeric_value(rr, ["Opponent Pace", "Opp Pace", "Opp_Pace", "Game Pace Projection", "Projected Pace", "Team_Pace_Official"])
-        drtg = _first_numeric_value(rr, ["Opponent DRtg", "Opp DRtg", "Opp_DRtg", "Opponent Defensive Rating", "Team_DRtg_Official"])
+        unresolved_tokens = {"", "opponent unavailable", "unavailable", "unknown", "none", "nan", "tbd", "not verified"}
+        opponent_verified = str(opponent).strip().lower() not in unresolved_tokens
+
+        pace = _first_numeric_value(rr, ["Opponent Pace", "Opp Pace", "Opp_Pace", "Game Pace Projection", "Projected Pace"])
+        drtg = _first_numeric_value(rr, ["Opponent DRtg", "Opp DRtg", "Opp_DRtg", "Opponent Defensive Rating"])
         net = _first_numeric_value(rr, ["Opponent NetRtg", "Opp NetRtg", "Opp_NetRtg"])
         pos_factor = _first_numeric_value(rr, ["Position Defense Factor", "Market Defense Factor"], 1.0)
         market_rank = _first_numeric_value(rr, [f"{market} Allowed Rank", "Opponent Market Rank", "Defense Rank", "Opp Def Rank"])
         pace_rank = _first_numeric_value(rr, ["Pace Rank", "Opponent Pace Rank"])
+
+        # Zero, negative, or out-of-range matchup values are missing data—not real ranks/ratings.
+        # WNBA rank convention in this app: Rank 1 = toughest; higher rank = easier.
+        if (not opponent_verified) or pd.isna(market_rank) or market_rank <= 0 or market_rank > 15:
+            market_rank = np.nan
+        if (not opponent_verified) or pd.isna(drtg) or drtg <= 0:
+            drtg = np.nan
+        if (not opponent_verified) or pd.isna(pace) or pace <= 0:
+            pace = np.nan
+        if (not opponent_verified) or pd.isna(net):
+            net = np.nan
+        if not opponent_verified:
+            pos_factor = 1.0
+
         context_score = _first_numeric_value(rr, ["Game Context Score", "Opponent Matchup Score", "Matchup Score"], 50)
-        if pd.notna(pos_factor):
-            context_score += float(np.clip((pos_factor - 1.0) * 180, -12, 12))
-        if pd.notna(drtg):
-            context_score += float(np.clip((drtg - 100) * .6, -8, 8))
-        context_score = float(np.clip(context_score, 0, 100))
-        grade = "Favorable" if context_score >= 58 else "Tough" if context_score <= 42 else "Neutral"
+        if opponent_verified:
+            if pd.notna(pos_factor):
+                context_score += float(np.clip((pos_factor - 1.0) * 180, -12, 12))
+            if pd.notna(drtg):
+                context_score += float(np.clip((drtg - 100) * .6, -8, 8))
+            context_score = float(np.clip(context_score, 0, 100))
+            grade = "Favorable" if context_score >= 58 else "Tough" if context_score <= 42 else "Neutral"
+        else:
+            context_score = 50.0
+            grade = "Unknown"
+
         rank_label = _rank_label(market_rank)
-        note_parts = [f"{opponent or 'Opponent unavailable'}", f"{market} matchup: {grade}"]
-        if pd.notna(market_rank): note_parts.append(f"def rank {market_rank:.0f} ({rank_label})")
+        note_parts = [f"{opponent if opponent_verified else 'Opponent not verified'}", f"{market} matchup: {grade}"]
+        if pd.notna(market_rank): note_parts.append(f"def rank {market_rank:.0f}/15 ({rank_label}; 1 toughest)")
         if pd.notna(pace): note_parts.append(f"pace {pace:.1f}")
         if pd.notna(drtg): note_parts.append(f"DRtg {drtg:.1f}")
-        if pd.notna(pos_factor): note_parts.append(f"position factor {pos_factor:.3f}")
+        note_parts.append(f"position factor {pos_factor:.3f}" + (" neutral" if not opponent_verified else ""))
         out.at[idx, "Opponent Matchup Score"] = round(context_score, 1)
         out.at[idx, "Opponent Matchup Grade"] = grade
         out.at[idx, "Opponent Market Rank"] = round(market_rank, 0) if pd.notna(market_rank) else np.nan
@@ -8597,10 +8619,10 @@ def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
         out.at[idx, "Opponent Matchup Note"] = " · ".join(note_parts)
         # Opponent is required for an official play. The projection can still be
         # displayed on All Lines, but it is not promoted when matchup resolution fails.
-        if not opponent:
+        if not opponent_verified:
             out.at[idx, "Official"] = "PASS"
             out.at[idx, "Data Integrity"] = "LIMITED"
-            out.at[idx, "PASS Reason"] = "Opponent could not be verified from today's schedule."
+            out.at[idx, "PASS Reason"] = "Opponent could not be verified from today's schedule; neutral matchup used."
     return out
 
 
