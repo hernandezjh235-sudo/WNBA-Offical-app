@@ -8569,47 +8569,25 @@ def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
     for idx, rr in out.iterrows():
         market = str(rr.get("Market", "PTS")).upper()
         opponent = _first_text_value(rr, ["Opponent", "Opp", "Opponent Team"], "")
-        unresolved_tokens = {"", "opponent unavailable", "unavailable", "unknown", "none", "nan", "tbd", "not verified"}
-        opponent_verified = str(opponent).strip().lower() not in unresolved_tokens
-
-        pace = _first_numeric_value(rr, ["Opponent Pace", "Opp Pace", "Opp_Pace", "Game Pace Projection", "Projected Pace"])
-        drtg = _first_numeric_value(rr, ["Opponent DRtg", "Opp DRtg", "Opp_DRtg", "Opponent Defensive Rating"])
+        pace = _first_numeric_value(rr, ["Opponent Pace", "Opp Pace", "Opp_Pace", "Game Pace Projection", "Projected Pace", "Team_Pace_Official"])
+        drtg = _first_numeric_value(rr, ["Opponent DRtg", "Opp DRtg", "Opp_DRtg", "Opponent Defensive Rating", "Team_DRtg_Official"])
         net = _first_numeric_value(rr, ["Opponent NetRtg", "Opp NetRtg", "Opp_NetRtg"])
         pos_factor = _first_numeric_value(rr, ["Position Defense Factor", "Market Defense Factor"], 1.0)
         market_rank = _first_numeric_value(rr, [f"{market} Allowed Rank", "Opponent Market Rank", "Defense Rank", "Opp Def Rank"])
         pace_rank = _first_numeric_value(rr, ["Pace Rank", "Opponent Pace Rank"])
-
-        # Zero, negative, or out-of-range matchup values are missing data—not real ranks/ratings.
-        # WNBA rank convention in this app: Rank 1 = toughest; higher rank = easier.
-        if (not opponent_verified) or pd.isna(market_rank) or market_rank <= 0 or market_rank > 15:
-            market_rank = np.nan
-        if (not opponent_verified) or pd.isna(drtg) or drtg <= 0:
-            drtg = np.nan
-        if (not opponent_verified) or pd.isna(pace) or pace <= 0:
-            pace = np.nan
-        if (not opponent_verified) or pd.isna(net):
-            net = np.nan
-        if not opponent_verified:
-            pos_factor = 1.0
-
         context_score = _first_numeric_value(rr, ["Game Context Score", "Opponent Matchup Score", "Matchup Score"], 50)
-        if opponent_verified:
-            if pd.notna(pos_factor):
-                context_score += float(np.clip((pos_factor - 1.0) * 180, -12, 12))
-            if pd.notna(drtg):
-                context_score += float(np.clip((drtg - 100) * .6, -8, 8))
-            context_score = float(np.clip(context_score, 0, 100))
-            grade = "Favorable" if context_score >= 58 else "Tough" if context_score <= 42 else "Neutral"
-        else:
-            context_score = 50.0
-            grade = "Unknown"
-
+        if pd.notna(pos_factor):
+            context_score += float(np.clip((pos_factor - 1.0) * 180, -12, 12))
+        if pd.notna(drtg):
+            context_score += float(np.clip((drtg - 100) * .6, -8, 8))
+        context_score = float(np.clip(context_score, 0, 100))
+        grade = "Favorable" if context_score >= 58 else "Tough" if context_score <= 42 else "Neutral"
         rank_label = _rank_label(market_rank)
-        note_parts = [f"{opponent if opponent_verified else 'Opponent not verified'}", f"{market} matchup: {grade}"]
-        if pd.notna(market_rank): note_parts.append(f"def rank {market_rank:.0f}/15 ({rank_label}; 1 toughest)")
+        note_parts = [f"{opponent or 'Opponent unavailable'}", f"{market} matchup: {grade}"]
+        if pd.notna(market_rank): note_parts.append(f"def rank {market_rank:.0f} ({rank_label})")
         if pd.notna(pace): note_parts.append(f"pace {pace:.1f}")
         if pd.notna(drtg): note_parts.append(f"DRtg {drtg:.1f}")
-        note_parts.append(f"position factor {pos_factor:.3f}" + (" neutral" if not opponent_verified else ""))
+        if pd.notna(pos_factor): note_parts.append(f"position factor {pos_factor:.3f}")
         out.at[idx, "Opponent Matchup Score"] = round(context_score, 1)
         out.at[idx, "Opponent Matchup Grade"] = grade
         out.at[idx, "Opponent Market Rank"] = round(market_rank, 0) if pd.notna(market_rank) else np.nan
@@ -8619,10 +8597,10 @@ def apply_matchup_context_to_board(proj_df: pd.DataFrame) -> pd.DataFrame:
         out.at[idx, "Opponent Matchup Note"] = " · ".join(note_parts)
         # Opponent is required for an official play. The projection can still be
         # displayed on All Lines, but it is not promoted when matchup resolution fails.
-        if not opponent_verified:
+        if not opponent:
             out.at[idx, "Official"] = "PASS"
             out.at[idx, "Data Integrity"] = "LIMITED"
-            out.at[idx, "PASS Reason"] = "Opponent could not be verified from today's schedule; neutral matchup used."
+            out.at[idx, "PASS Reason"] = "Opponent could not be verified from today's schedule."
     return out
 
 
@@ -8670,6 +8648,300 @@ def grouped_board_table_view(proj_df: pd.DataFrame) -> pd.DataFrame:
         if c in out.columns: out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
     return out
 
+
+
+# ============================================================
+# FINAL VERIFIED OPPONENT CONTEXT FIX (v3.4.1)
+# Resolves opponent from live line events first, then ESPN schedule/cache;
+# populates real DRtg, pace, market rank, position matchup and VERIFIED status.
+# This layer does not alter the underlying player projection unless an existing
+# matchup factor was already part of the core engine.
+# ============================================================
+
+def _v341_nonempty_text(value: Any) -> str:
+    s = str(value or "").strip()
+    return "" if s.lower() in {"", "nan", "none", "null"} else s
+
+
+def _v341_line_matchup_map(lines: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    mapping: Dict[str, Dict[str, str]] = {}
+    if lines is None or lines.empty:
+        return mapping
+    for _, r in lines.iterrows():
+        team = _team_key_for_matchup(r.get("Team"))
+        away = _team_key_for_matchup(r.get("EventAway") or r.get("Away"))
+        home = _team_key_for_matchup(r.get("EventHome") or r.get("Home"))
+        source = "line event columns"
+        if not away or not home:
+            for col in ["Raw", "Event", "Game", "Matchup", "Description"]:
+                raw = _v341_nonempty_text(r.get(col))
+                if not raw:
+                    continue
+                aa, hh = _parse_event_teams_from_text(raw)
+                if aa and hh:
+                    away, home, source = aa, hh, f"line {col}"
+                    break
+        if away and home:
+            matchup = f"{away} @ {home}"
+            mapping[away] = {"Opponent": home, "HomeAway": "AWAY", "Matchup": matchup, "Matchup Source": source}
+            mapping[home] = {"Opponent": away, "HomeAway": "HOME", "Matchup": matchup, "Matchup Source": source}
+        elif team:
+            # Preserve team presence for schedule fallback.
+            mapping.setdefault(team, {})
+    return mapping
+
+
+def _v341_schedule_matchup_map(mode: str) -> Dict[str, Dict[str, str]]:
+    mapping: Dict[str, Dict[str, str]] = {}
+    frames = []
+    try:
+        espn, _ = pull_espn_wnba_scoreboard_context(mode, force=False)
+        if espn is not None and not espn.empty:
+            frames.append(espn)
+    except Exception:
+        pass
+    try:
+        target = slate_target_date(mode)
+        if target is not None:
+            espn2, _ = fetch_espn_wnba_schedule_for_date(target)
+            if espn2 is not None and not espn2.empty:
+                frames.append(espn2)
+    except Exception:
+        pass
+    try:
+        cached = schedule_for_slate(mode)
+        if cached is not None and not cached.empty:
+            frames.append(standardize_schedules(cached))
+    except Exception:
+        pass
+    for df in frames:
+        for _, g in df.iterrows():
+            away = _team_key_for_matchup(g.get("Away"))
+            home = _team_key_for_matchup(g.get("Home"))
+            if not away or not home:
+                # ESPN context can expose Matchup even if aliases differ.
+                aa, hh = _parse_event_teams_from_text(g.get("Matchup"))
+                away, home = away or aa, home or hh
+            if not away or not home:
+                continue
+            matchup = f"{away} @ {home}"
+            src = _v341_nonempty_text(g.get("Source")) or "schedule"
+            mapping[away] = {"Opponent": home, "HomeAway": "AWAY", "Matchup": matchup, "Matchup Source": src}
+            mapping[home] = {"Opponent": away, "HomeAway": "HOME", "Matchup": matchup, "Matchup Source": src}
+    return mapping
+
+
+def _v341_team_context_rows() -> pd.DataFrame:
+    frames = []
+    try:
+        tc = _team_context_table(force_official=False)
+        if tc is not None and not tc.empty:
+            frames.append(tc.copy())
+    except Exception:
+        pass
+    try:
+        tr = load_dataset("team_ranks")
+        if tr is not None and not tr.empty:
+            frames.append(tr.copy())
+    except Exception:
+        pass
+    try:
+        derived = build_team_context_from_logs_and_schedule()
+        if derived is not None and not derived.empty:
+            frames.append(derived.copy())
+    except Exception:
+        pass
+    rows=[]
+    for df in frames:
+        for _, r in df.iterrows():
+            team = _team_key_for_matchup(r.get("Team") or r.get("team") or r.get("TEAM"))
+            if not team:
+                continue
+            pace = _first_numeric_value(r, ["Team_Pace_Official","Official_Pace","Pace","Team_Pace","Ctx_Pace"])
+            drtg = _first_numeric_value(r, ["Team_DRtg_Official","Official_DRtg","DRtg","Team_DRtg","Adv_DEF_RATING","DEF_RATING","Ctx_DRtg"])
+            net = _first_numeric_value(r, ["Team_NetRtg_Official","Official_NetRtg","NetRtg","Team_NetRtg","Ctx_NetRtg"])
+            season = _first_numeric_value(r, ["Season","season"], np.nan)
+            quality = int(pd.notna(pace)) + int(pd.notna(drtg)) + int(pd.notna(net))
+            rows.append({"Team":team,"Pace":pace,"DRtg":drtg,"NetRtg":net,"Season":season,"_quality":quality})
+    if not rows:
+        return pd.DataFrame(columns=["Team","Pace","DRtg","NetRtg"])
+    d=pd.DataFrame(rows)
+    d=d.sort_values(["Team","_quality","Season"], ascending=[True,False,False], na_position="last")
+    # Merge best non-null values per team instead of discarding complementary sources.
+    out=[]
+    for team, g in d.groupby("Team", sort=False):
+        rec={"Team":team}
+        for c in ["Pace","DRtg","NetRtg"]:
+            vals=pd.to_numeric(g[c], errors="coerce").dropna()
+            rec[c]=float(vals.iloc[0]) if not vals.empty else np.nan
+        out.append(rec)
+    return pd.DataFrame(out)
+
+
+def _v341_position_group_for_row(row: pd.Series, base: pd.DataFrame) -> str:
+    direct = _v341_nonempty_text(row.get("PositionGroup") or row.get("Position"))
+    if direct:
+        return direct
+    if base is not None and not base.empty:
+        nk=normalize_name(row.get("Player"))
+        b=base.copy()
+        if "NameKey" not in b.columns and "Player" in b.columns:
+            b["NameKey"]=b["Player"].map(normalize_name)
+        hit=b[b.get("NameKey", pd.Series(index=b.index,dtype=str))==nk]
+        if not hit.empty:
+            for c in ["PositionGroup","Position","Pos"]:
+                if c in hit.columns:
+                    v=_v341_nonempty_text(hit.iloc[0].get(c))
+                    if v:
+                        return v
+    return "ALL"
+
+
+def _v341_market_defense_table() -> pd.DataFrame:
+    try:
+        d=build_position_defense_by_market(force=False)
+        if d is not None and not d.empty:
+            x=d.copy()
+            x["OpponentKey"]=x.get("Opponent","").map(_team_key_for_matchup)
+            x["MarketKey"]=x.get("Market","").astype(str).str.upper()
+            x["PositionKey"]=x.get("PositionGroup","ALL").fillna("ALL").astype(str).str.upper()
+            x["DefenseFactorNum"]=pd.to_numeric(x.get("DefenseFactor"), errors="coerce")
+            x["AllowedAvgNum"]=pd.to_numeric(x.get("AllowedAvg"), errors="coerce")
+            return x
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _v341_market_context(opp: str, market: str, pos: str, defense: pd.DataFrame, team_ctx: pd.DataFrame) -> Dict[str, Any]:
+    result={"factor":1.0,"rank":np.nan,"teams":np.nan,"note":"No position-market sample; team defense used."}
+    market=str(market or "").upper(); pos=str(pos or "ALL").upper(); opp=_team_key_for_matchup(opp)
+    if defense is not None and not defense.empty and opp and market:
+        pool=defense[defense["MarketKey"]==market].copy()
+        exact=pool[pool["PositionKey"]==pos]
+        if exact.empty:
+            exact=pool[pool["PositionKey"]=="ALL"]
+        ranked=exact.dropna(subset=["OpponentKey"]).copy()
+        # Toughest rank 1 = lowest allowed/factor.
+        rank_metric="AllowedAvgNum" if ranked["AllowedAvgNum"].notna().sum() >= 4 else "DefenseFactorNum"
+        ranked=ranked.dropna(subset=[rank_metric]).sort_values(rank_metric, ascending=True)
+        ranked=ranked.drop_duplicates("OpponentKey", keep="first")
+        if not ranked.empty:
+            ranked["_rank"]=range(1,len(ranked)+1)
+            hit=ranked[ranked["OpponentKey"]==opp]
+            if not hit.empty:
+                result["rank"]=float(hit.iloc[0]["_rank"])
+                result["teams"]=float(len(ranked))
+                result["factor"]=safe_float(hit.iloc[0].get("DefenseFactorNum"),1.0)
+                result["note"]=_v341_nonempty_text(hit.iloc[0].get("Source")) or "position-market logs"
+                return result
+    # DRtg fallback still supplies a mathematically real market rank across teams.
+    if team_ctx is not None and not team_ctx.empty and opp:
+        ranked=team_ctx.dropna(subset=["DRtg"]).drop_duplicates("Team").sort_values("DRtg", ascending=True).copy()
+        if not ranked.empty:
+            ranked["_rank"]=range(1,len(ranked)+1)
+            hit=ranked[ranked["Team"]==opp]
+            if not hit.empty:
+                result["rank"]=float(hit.iloc[0]["_rank"])
+                result["teams"]=float(len(ranked))
+                drtg=float(hit.iloc[0]["DRtg"])
+                result["factor"]=float(np.clip(1+(drtg-ranked["DRtg"].median())/900.0,0.94,1.06))
+                result["note"]="team DRtg fallback"
+    return result
+
+
+_make_projection_board_v341_base = make_projection_board
+
+def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+    board=_make_projection_board_v341_base(lines, logs, base, mode)
+    if board is None or board.empty:
+        return board
+    out=board.copy()
+    line_map=_v341_line_matchup_map(lines)
+    schedule_map=_v341_schedule_matchup_map(mode or "Today")
+    team_ctx=_v341_team_context_rows()
+    defense=_v341_market_defense_table()
+    for idx,row in out.iterrows():
+        team=_team_key_for_matchup(row.get("Team"))
+        existing=_team_key_for_matchup(row.get("Opponent"))
+        resolved={}
+        if existing and existing != team:
+            resolved={"Opponent":existing,"HomeAway":_v341_nonempty_text(row.get("HomeAway")),"Matchup":_v341_nonempty_text(row.get("Matchup")),"Matchup Source":_v341_nonempty_text(row.get("Matchup Source")) or "existing"}
+        elif team in line_map and line_map.get(team,{}).get("Opponent"):
+            resolved=line_map[team]
+        elif team in schedule_map:
+            resolved=schedule_map[team]
+        if resolved:
+            for k,v in resolved.items():
+                out.at[idx,k]=v
+        opp=_team_key_for_matchup(out.at[idx,"Opponent"] if "Opponent" in out.columns else "")
+        market=str(row.get("Market","")).upper()
+        pos=_v341_position_group_for_row(row,base)
+        pace=drtg=net=np.nan
+        if opp and team_ctx is not None and not team_ctx.empty:
+            hit=team_ctx[team_ctx["Team"]==opp]
+            if not hit.empty:
+                pace=safe_float(hit.iloc[0].get("Pace"),np.nan)
+                drtg=safe_float(hit.iloc[0].get("DRtg"),np.nan)
+                net=safe_float(hit.iloc[0].get("NetRtg"),np.nan)
+        mc=_v341_market_context(opp,market,pos,defense,team_ctx)
+        factor=safe_float(mc.get("factor"),1.0)
+        rank=safe_float(mc.get("rank"),np.nan)
+        teams=safe_float(mc.get("teams"),np.nan)
+        # Grade uses actual opponent context. Unknown never displays as Favorable.
+        score=50.0
+        if pd.notna(drtg) and team_ctx is not None and not team_ctx.empty and team_ctx["DRtg"].notna().any():
+            med=float(team_ctx["DRtg"].median())
+            score += float(np.clip((drtg-med)*2.0,-15,15))
+        score += float(np.clip((factor-1.0)*220,-15,15))
+        if pd.notna(pace) and team_ctx is not None and not team_ctx.empty and team_ctx["Pace"].notna().any():
+            score += float(np.clip((pace-float(team_ctx["Pace"].median()))*1.5,-10,10))
+        score=float(np.clip(score,0,100))
+        verified=bool(opp and pd.notna(drtg) and pd.notna(pace) and pd.notna(rank) and pd.notna(teams))
+        grade="Favorable" if verified and score>=58 else "Tough" if verified and score<=42 else "Neutral" if verified else "Unknown"
+        out.at[idx,"Opponent"]=opp
+        out.at[idx,"Opponent Pace"]=round(pace,2) if pd.notna(pace) else np.nan
+        out.at[idx,"Opponent DRtg"]=round(drtg,2) if pd.notna(drtg) else np.nan
+        out.at[idx,"Opponent NetRtg"]=round(net,2) if pd.notna(net) else np.nan
+        out.at[idx,"Opponent Market Rank"]=round(rank,0) if pd.notna(rank) else np.nan
+        out.at[idx,"Opponent Market Rank Teams"]=round(teams,0) if pd.notna(teams) else np.nan
+        out.at[idx,"Position Matchup"]=f"{opp} vs {pos} {market}" if opp else "Unknown"
+        out.at[idx,"Position Defense Factor"]=round(factor,4)
+        out.at[idx,"Opponent Matchup Score"]=round(score,1) if verified else 50.0
+        out.at[idx,"Opponent Matchup Grade"]=grade
+        out.at[idx,"Opponent Matchup Note"]=(
+            f"{opp} · {market} matchup: {grade} · market rank {int(rank)}/{int(teams)} (1 toughest) · "
+            f"DRtg {drtg:.1f} · pace {pace:.1f} · {pos} factor {factor:.3f}"
+            if verified else
+            "Opponent/context not fully verified; neutral matchup only."
+        )
+        if verified:
+            out.at[idx,"Data Integrity"]="VERIFIED"
+            out.at[idx,"Data Integrity Score"]=max(90.0,safe_float(out.at[idx,"Data Integrity Score"] if "Data Integrity Score" in out.columns else 0,0))
+            # Do not force a betting signal; only remove the missing-opponent blocker.
+            old_reason=_v341_nonempty_text(out.at[idx,"PASS Reason"] if "PASS Reason" in out.columns else "")
+            if "Opponent could not be verified" in old_reason or "Missing opponent" in old_reason:
+                out.at[idx,"PASS Reason"]=""
+        else:
+            out.at[idx,"Data Integrity"]="LIMITED"
+            out.at[idx,"Official"]="PASS"
+            out.at[idx,"PASS Reason"]="Missing verified opponent DRtg, pace, or market-rank context."
+    save_dataset("projection_board",out)
+    return out
+
+
+# Ensure cards/tables show team count and explicit position matchup.
+_grouped_market_html_v341_base = _grouped_market_html
+
+def _grouped_market_html(r: pd.Series) -> str:
+    html=_grouped_market_html_v341_base(r)
+    rank=_fmt_num_compact(r.get("Opponent Market Rank"),0)
+    teams=_fmt_num_compact(r.get("Opponent Market Rank Teams"),0)
+    drtg=_fmt_num_compact(r.get("Opponent DRtg"),1)
+    pace=_fmt_num_compact(r.get("Opponent Pace"),1)
+    pos=_v341_nonempty_text(r.get("Position Matchup")) or "Unknown"
+    extra=f"<br/><b>Market defense:</b> Rank {rank}/{teams} (1 toughest) · DRtg {drtg} · Pace {pace}<br/><b>Position matchup:</b> {pos}"
+    return html.replace("<br/><b>Workload:</b>",extra+"<br/><b>Workload:</b>")
 
 with st.sidebar:
     st.header("Setup")
