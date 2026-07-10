@@ -312,10 +312,36 @@ def load_json(path: Path, default):
     return default
 
 
+def _json_safe(value):
+    """Convert pandas/numpy values so snapshots always save on Streamlit/Railway."""
+    if value is None:
+        return None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return None if not np.isfinite(value) else float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return str(value)
+
+
 def save_json(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False, default=_json_safe, allow_nan=False)
+    tmp.replace(path)
 
 
 def save_board_snapshot(board_df: pd.DataFrame, lines_df: Optional[pd.DataFrame] = None, mode: str = "Today") -> int:
@@ -3681,21 +3707,77 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
 # ============================================================
 # Logs / backup tools
 # ============================================================
-def save_officials(df):
-    plays = df[df["Official"].astype(str).str.contains("OVER|UNDER", na=False)].copy() if df is not None and not df.empty else pd.DataFrame()
-    if plays.empty:
+def save_officials(df, save_all_real_lines: bool = True):
+    """Save a before-game snapshot reliably.
+
+    Primary behavior: save official-gate plays. If the strict gate produced zero
+    plays, save every valid real-line projection as TRACKED so the entire slate
+    can still be graded and used for calibration. This fixes the old "Saved 0"
+    behavior while preserving which rows actually passed the official gate.
+    """
+    if df is None or getattr(df, "empty", True):
         return 0
+    work = df.copy()
+    if "Line" not in work.columns or "Projection" not in work.columns:
+        return 0
+    work["Line"] = pd.to_numeric(work["Line"], errors="coerce")
+    work["Projection"] = pd.to_numeric(work["Projection"], errors="coerce")
+    valid = work[work["Line"].notna() & work["Projection"].notna()].copy()
+    if "Source" in valid.columns:
+        src = valid["Source"].astype(str).str.upper()
+        valid = valid[~src.str.contains("NO LINE|TRACKED ONLY|MISSING", na=False)]
+    if valid.empty:
+        return 0
+
+    official_mask = pd.Series(False, index=valid.index)
+    if "Official" in valid.columns:
+        official_mask = valid["Official"].astype(str).str.upper().str.contains(r"OVER|UNDER", regex=True, na=False)
+    plays = valid[official_mask].copy()
+    fallback_used = False
+    if plays.empty and save_all_real_lines:
+        plays = valid.copy()
+        fallback_used = True
+
     log = load_json(OFFICIAL_LOG, [])
+    if not isinstance(log, list):
+        log = []
     stamp = now_iso()
+    existing = set()
+    for item in log:
+        key = (str(item.get("SlateDate", "")), normalize_name(item.get("Player", "")), str(item.get("Market", "")).upper(), str(item.get("Line", "")), str(item.get("SavedAt", ""))[:10])
+        existing.add(key)
+
+    saved = 0
     for _, r in plays.iterrows():
-        row = r.to_dict(); row["SavedAt"] = stamp; row["Result"] = "PENDING"; row["Actual"] = None
+        row = {k: _json_safe(v) if not isinstance(v, (dict, list)) else v for k, v in r.to_dict().items()}
+        row["SavedAt"] = stamp
+        row["Result"] = "PENDING"
+        row["Actual"] = None
+        row["SnapshotType"] = "TRACKED_REAL_LINE" if fallback_used or not bool(official_mask.get(r.name, False)) else "OFFICIAL_GATE"
+        row["WasOfficialAtSave"] = bool(official_mask.get(r.name, False))
+        if not row.get("Lean"):
+            edge = safe_float(row.get("Edge"), 0)
+            row["Lean"] = "OVER" if edge >= 0 else "UNDER"
+        slate_date = str(row.get("SlateDate") or row.get("GameDate") or row.get("Start") or "")[:10]
+        key = (slate_date, normalize_name(row.get("Player", "")), str(row.get("Market", "")).upper(), str(row.get("Line", "")), stamp[:10])
+        if key in existing:
+            continue
         log.append(row)
+        existing.add(key)
+        saved += 1
     save_json(OFFICIAL_LOG, log)
+
     hist = load_json(LINE_HISTORY_FILE, [])
-    for _, r in df.iterrows():
-        hist.append({"SavedAt": stamp, "Player": r.get("Player"), "Market": r.get("Market"), "Line": r.get("Line"), "Source": r.get("Source"), "Projection": r.get("Projection")})
+    if not isinstance(hist, list):
+        hist = []
+    for _, r in valid.iterrows():
+        hist.append({
+            "SavedAt": stamp, "Player": _json_safe(r.get("Player")),
+            "Market": _json_safe(r.get("Market")), "Line": _json_safe(r.get("Line")),
+            "Source": _json_safe(r.get("Source")), "Projection": _json_safe(r.get("Projection"))
+        })
     save_json(LINE_HISTORY_FILE, hist)
-    return len(plays)
+    return saved
 
 
 def latest_closing_line_for_pick(player: str, market: str, saved_at: str = "", source: str = "") -> float:
@@ -5035,7 +5117,7 @@ def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, stron
     st.markdown("""
     <div class='owp-hero'>
       <div class='owp-title'>💜 WNBA PROP ENGINE v1.6<br/>ONE-CLICK REFRESH + CONTEXT ENGINE</div>
-      <div class='owp-subtitle'>Strict WNBA-only prop line lock → One-click Refresh Today → Save → Grade</div>
+      <div class='owp-subtitle'>Railway-safe load → One-click automatic online refresh → Save every real-line projection → Grade</div>
     </div>
     """, unsafe_allow_html=True)
     c1, c2 = st.columns(2)
@@ -5050,7 +5132,7 @@ def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, stron
                 try:
                     board_cache = pd.read_csv(board_path)
                     n = save_officials(board_cache)
-                    st.success(f"Saved {n} official plays from the current board.")
+                    st.success(f"Saved {n} before-game real-line projections. Rows that passed the official gate are marked OFFICIAL_GATE; the rest are tracked for grading/calibration.")
                 except Exception as e:
                     st.error(f"Save failed: {e}")
             else:
@@ -7437,11 +7519,63 @@ def get_team_logo_src(team: Any) -> str:
 st.markdown("<style>.owp-logo{display:none!important}.owp-card-main{gap:10px!important}</style>", unsafe_allow_html=True)
 
 
+st.markdown("""<style>
+.owp-market-tier.tracked,.owp-pill-track{color:#ffe86a!important;border:1px solid #ffe86a!important;background:rgba(255,232,106,.10)!important;font-weight:900!important}
+.owp-market-tier.official{color:#42f59e!important;border:1px solid #42f59e!important;background:rgba(66,245,158,.10)!important;font-weight:900!important}
+</style>""", unsafe_allow_html=True)
+
+
 
 
 # -----------------------------------------------------------------------------
 # Grouped Player Cards Board (single-player card with PTS/REB/AST/PRA rows)
 # -----------------------------------------------------------------------------
+
+def apply_saved_tracking_status(df: pd.DataFrame) -> pd.DataFrame:
+    """Mark board rows that were saved with Save Before.
+
+    TRACKED is a display state, not a model recommendation. It means the exact
+    player/market/line has been saved and is waiting to be graded. Rows that
+    passed the official gate at save time display OFFICIAL; all other saved
+    real-line rows display TRACK.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out["Tracking Status"] = ""
+    try:
+        raw = load_json(OFFICIAL_LOG, [])
+        if not isinstance(raw, list) or not raw:
+            return out
+        log = pd.DataFrame(raw)
+        if log.empty:
+            return out
+        # Only pending/current before-game records should light up the cards.
+        if "Result" in log.columns:
+            log = log[log["Result"].astype(str).str.upper().isin(["PENDING", "", "NAN", "NONE"])].copy()
+        if log.empty:
+            return out
+        log["_name"] = log.get("Player", "").map(normalize_name)
+        log["_market"] = log.get("Market", "").astype(str).str.upper().str.strip()
+        log["_line"] = pd.to_numeric(log.get("Line"), errors="coerce").round(2)
+        log["_status"] = np.where(
+            log.get("SnapshotType", "").astype(str).str.upper().eq("OFFICIAL_GATE"),
+            "OFFICIAL", "TRACK"
+        )
+        # Keep the latest state for duplicate historical saves.
+        if "SavedAt" in log.columns:
+            log = log.sort_values("SavedAt").drop_duplicates(["_name", "_market", "_line"], keep="last")
+        else:
+            log = log.drop_duplicates(["_name", "_market", "_line"], keep="last")
+        idx = {(r["_name"], r["_market"], r["_line"]): r["_status"] for _, r in log.iterrows() if pd.notna(r["_line"])}
+        names = out.get("Player", pd.Series(index=out.index, dtype=str)).map(normalize_name)
+        mkts = out.get("Market", pd.Series(index=out.index, dtype=str)).astype(str).str.upper().str.strip()
+        lines = pd.to_numeric(out.get("Line"), errors="coerce").round(2)
+        out["Tracking Status"] = [idx.get((n, m, l), "") if pd.notna(l) else "" for n, m, l in zip(names, mkts, lines)]
+    except Exception:
+        pass
+    return out
+
 def _fmt_num_compact(x, dec=1, default="—"):
     try:
         v = safe_float(x, np.nan)
@@ -7468,6 +7602,9 @@ def _grouped_market_html(r: pd.Series) -> str:
     fill = max(0, min(100, fill))
     conf = _fmt_num_compact(r.get("Official Play Score"), 0)
     tier = str(r.get("Tier", ""))
+    tracking_status = str(r.get("Tracking Status", "") or "").upper()
+    track_badge = tracking_status if tracking_status in {"TRACK", "OFFICIAL"} else tier
+    track_cls = "official" if tracking_status == "OFFICIAL" else "tracked" if tracking_status == "TRACK" else ""
     vol = str(r.get("Volatility", "NA"))
     note = str(r.get("Biggest Positive", "") or r.get("Projection Explanation", ""))[:130]
     edge_cls = "pos" if pd.notna(edge_v) and edge_v > 0 else "neg" if pd.notna(edge_v) and edge_v < 0 else "flat"
@@ -7482,7 +7619,7 @@ def _grouped_market_html(r: pd.Series) -> str:
         <div class='owp-market-main'>
           <span class='owp-market-proj'>{proj}</span>
           <span class='owp-market-edge {edge_cls}'>{edge} vs {line}</span>
-          <span class='owp-market-tier'>{tier}</span>
+          <span class='owp-market-tier {track_cls}'>{track_badge}</span>
         </div>
         <div class='owp-prob-track owp-market-track'><div class='owp-prob-fill' style='width:{fill:.0f}%'></div></div>
         <div class='owp-market-sub'><span>OVER {_fmt_num_compact(overp,0)}%</span><span>UNDER {_fmt_num_compact(underp,0)}%</span></div>
@@ -7514,6 +7651,8 @@ def render_grouped_player_card(player_df: pd.DataFrame):
     best_mkt = str(best.get("Market", "PROP"))
     best_side = "OVER" if "OVER" in str(best.get("Lean", "")).upper() else "UNDER" if "UNDER" in str(best.get("Lean", "")).upper() else "TRACK"
     market_html = "".join(_grouped_market_html(r) for _, r in player_df.iterrows())
+    tracked_n = int(player_df.get("Tracking Status", pd.Series(dtype=str)).astype(str).str.upper().isin(["TRACK", "OFFICIAL"]).sum())
+    tracking_pill = f"<span class='owp-pill owp-pill-track'>TRACKED {tracked_n}/{len(player_df)}</span>" if tracked_n else ""
     st.markdown(f"""
     <div class='owp-group-card'>
       <div class='owp-group-top'>
@@ -7523,6 +7662,7 @@ def render_grouped_player_card(player_df: pd.DataFrame):
           <span class='owp-pill owp-pill-source'>{source_count or 'Lines'}</span>
           <span class='owp-pill owp-pill-role'>Lineup/Role {role}</span>
           <span class='owp-pill owp-pill-score'>Data {data_score}/100</span>
+          {tracking_pill}
         </div>
         <div class='owp-group-best'>Best: {best_mkt} {best_side}<br><span>Min {min_proj}</span></div>
       </div>
@@ -7547,7 +7687,7 @@ def grouped_board_table_view(proj_df: pd.DataFrame) -> pd.DataFrame:
     keep = [c for c in [
         "Player", "Team", "Opponent", "Matchup", "Market", "Projection", "Line", "Edge",
         "Lean", "Over %", "Under %", "Official Play Score", "Tier", "Volatility",
-        "MIN Proj", "FallbackLineupRole", "Source"
+        "MIN Proj", "FallbackLineupRole", "Tracking Status", "Source"
     ] if c in df.columns]
     if not keep:
         return df
@@ -7564,7 +7704,7 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
         return pd.DataFrame()
     search = st.text_input("Search player", key=f"{key_prefix}_search")
     official_only = st.toggle("Official / strong signals only", value=False, key=f"{key_prefix}_official")
-    view_df = proj_df.copy()
+    view_df = apply_saved_tracking_status(proj_df.copy())
     if search and "Player" in view_df.columns:
         view_df = view_df[view_df["Player"].astype(str).str.contains(search, case=False, na=False)]
     if official_only and "Official" in view_df.columns:
@@ -7588,7 +7728,7 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
     ac1, ac2, ac3 = st.columns([1.2,1.2,1.4])
     with ac1:
         if st.button(f"✅ Save {mode} Official Before", key=f"{key_prefix}_save_before", use_container_width=True):
-            n = save_officials(view_df); st.success(f"Saved {n} official plays for {mode}.")
+            n = save_officials(view_df); st.success(f"Saved {n} real-line projections for {mode} tracking and grading.")
     with ac2:
         if st.button(f"📊 Grade After Results", key=f"{key_prefix}_grade_after", use_container_width=True):
             n = grade_pending(load_dataset("player_game_logs"), mode); st.success(f"Graded {n} pending plays for {mode} only.")
@@ -7615,6 +7755,106 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
     for player in player_order:
         render_grouped_player_card(view_df[view_df["Player"] == player])
     return view_df
+
+
+
+# -----------------------------------------------------------------------------
+# Copy / Paste Slate Tracker
+# -----------------------------------------------------------------------------
+def _slate_side_and_icon(row: pd.Series) -> tuple[str, str]:
+    lean = str(row.get("Lean", "")).upper()
+    official = str(row.get("Official", "")).upper()
+    score = safe_float(row.get("Official Play Score"), 0)
+    side_prob = safe_float(row.get("Over %"), 0) if "OVER" in f"{lean} {official}" else safe_float(row.get("Under %"), 0)
+    if "OVER" in f"{lean} {official}":
+        side = "O"
+    elif "UNDER" in f"{lean} {official}":
+        side = "U"
+    else:
+        side = "O" if safe_float(row.get("Edge"), 0) >= 0 else "U"
+    if score >= 82 and side_prob >= 64:
+        icon = "🔥"
+    elif score >= 70 and side_prob >= 58:
+        icon = "⚠️"
+    else:
+        icon = ""
+    return side, icon
+
+
+def _slate_matchup_label(row: pd.Series) -> str:
+    matchup = str(row.get("Matchup", "") or row.get("Projection Matchup Used", "")).strip()
+    if matchup and matchup.lower() not in {"nan", "none", "unknown"}:
+        return matchup.replace(" vs ", " @ ").replace(" VS ", " @ ")
+    team = str(row.get("Team", "")).strip().upper()
+    opp = str(row.get("Opponent", "")).strip().upper()
+    homeaway = str(row.get("HomeAway", "")).upper()
+    if team and opp:
+        return f"{team} @ {opp}" if homeaway == "AWAY" else f"{opp} @ {team}" if homeaway == "HOME" else f"{team} vs {opp}"
+    return team or opp or "WNBA SLATE"
+
+
+def build_copy_paste_slate(df: pd.DataFrame, best_only: bool = False, max_rows: int = 0) -> str:
+    """Create a clean matchup-grouped tracking slate from every real line."""
+    if df is None or df.empty:
+        return "No projections available."
+    work = df.copy()
+    for c in ["Line", "Projection", "Edge", "Official Play Score", "Over %", "Under %", "MIN Proj"]:
+        if c in work.columns:
+            work[c] = pd.to_numeric(work[c], errors="coerce")
+    work = work[work.get("Line", pd.Series(index=work.index, dtype=float)).notna() & work.get("Projection", pd.Series(index=work.index, dtype=float)).notna()].copy()
+    if "Source" in work.columns:
+        bad = work["Source"].astype(str).str.upper().str.contains("NO LINE|TRACKED ONLY|MISSING", na=False)
+        work = work[~bad]
+    if work.empty:
+        return "No real-line projections available."
+    work["_matchup"] = work.apply(_slate_matchup_label, axis=1)
+    work["_abs_edge"] = pd.to_numeric(work.get("Edge", 0), errors="coerce").abs()
+    work["_score"] = pd.to_numeric(work.get("Official Play Score", 0), errors="coerce").fillna(0)
+    if best_only:
+        official_mask = work.get("Official", pd.Series(index=work.index, dtype=str)).astype(str).str.contains("OVER|UNDER", case=False, na=False)
+        strong = work[official_mask | ((work["_score"] >= 70) & (work["_abs_edge"] >= 1.5))].copy()
+        if not strong.empty:
+            work = strong
+        else:
+            work = work.sort_values(["_score", "_abs_edge"], ascending=False).head(12)
+    work = work.sort_values(["_matchup", "_score", "_abs_edge"], ascending=[True, False, False])
+    if max_rows and max_rows > 0:
+        work = work.head(max_rows)
+    blocks = []
+    for matchup, group in work.groupby("_matchup", sort=False):
+        lines = [str(matchup)]
+        for _, r in group.iterrows():
+            side, icon = _slate_side_and_icon(r)
+            player = str(r.get("Player", "Player"))
+            market = str(r.get("Market", "PROP")).upper()
+            line = _fmt_num_compact(r.get("Line"), 1)
+            proj = _fmt_num_compact(r.get("Projection"), 2)
+            mins = _fmt_num_compact(r.get("MIN Proj"), 2)
+            icon_txt = f"{icon} " if icon else ""
+            minute_txt = f" — MIN {mins}" if mins != "—" else ""
+            lines.append(f"• {player} — {icon_txt}{side} {line} {market} — {proj} PROJ{minute_txt}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def render_slate_tracker(board_df: pd.DataFrame, key_prefix: str = "slate_tracker"):
+    st.subheader("Copy/Paste Slate — All WNBA Projections")
+    st.caption("Tracking list grouped by matchup. It shows every real-line projection and keeps Best Slate separate from the full board.")
+    if board_df is None or board_df.empty:
+        st.warning("No projection board cached yet. Refresh Today or All Lines first.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        best_text = build_copy_paste_slate(board_df, best_only=True)
+        st.markdown("#### Best slate")
+        st.text_area("Best projections slate", best_text, height=320, key=f"{key_prefix}_best_text")
+        st.download_button("Download best slate.txt", best_text, "wnba_best_slate.txt", "text/plain", key=f"{key_prefix}_best_dl")
+    with c2:
+        all_text = build_copy_paste_slate(board_df, best_only=False)
+        st.markdown("#### All projections slate")
+        st.text_area("All projections slate", all_text, height=320, key=f"{key_prefix}_all_text")
+        st.download_button("Download all projections.txt", all_text, "wnba_all_projections.txt", "text/plain", key=f"{key_prefix}_all_dl")
+    st.info("Save Before tracks the real-line rows for grading. The text slate is for copy/paste and quick tracking; it does not replace the saved official log.")
 
 def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: str, max_key: str, official_key: str, saved_view: bool = False) -> pd.DataFrame:
     """Render an already-built projection board with fast table / card toggle."""
@@ -8145,7 +8385,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v3.1 — Auto Live + Opponent Matchup + Integrity Gates"
+APP_VERSION = "WNBA v3.2 — Railway Load + Before-Game Snapshot Fix"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -8429,7 +8669,7 @@ with st.sidebar:
     if st.button("🔄 Refresh Today — All-in-One", use_container_width=True):
         run_one_click_refresh_today("Today", use_ud)
         st.rerun()
-    st.caption("This one button refreshes schedule/context, rebuilds feature cache when logs exist, pulls Underdog/manual lines, and rebuilds the projection board.")
+    st.caption("Railway-safe: the page loads first, then this one button automatically pulls schedule, online stats, opponent context, Underdog/manual lines, and rebuilds every projection. Data Manager is not required.")
 
 @st.cache_data(show_spinner=False)
 def get_global_datasets() -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -8453,16 +8693,20 @@ def get_global_datasets() -> Tuple[pd.DataFrame, pd.DataFrame]:
 logs_global = pd.DataFrame()
 master_global = pd.DataFrame()
 
-# Automatic startup: online data, lines, and projections load without visiting Data Manager.
+# Railway-safe startup: render the app immediately from cache.
+# Heavy online pulls are intentionally run only by the one-click Refresh button;
+# this avoids Railway/Streamlit health-check timeouts and removes the old need
+# to visit Data Manager or install files manually.
 try:
-    with st.spinner("Automatically refreshing WNBA data, live lines, and projections..."):
-        automatic_live_bootstrap("Today", use_ud)
-        get_global_datasets.clear()
-        logs_global, master_global = get_global_datasets()
-        if master_global is None or master_global.empty or "PTS_true_recent_proj" not in master_global.columns:
-            master_global, _, _auto_dbg = ensure_online_wnba_master_features(force_official=False)
-except Exception as _auto_start_error:
-    st.session_state["wnba_auto_start_error"] = str(_auto_start_error)[:240]
+    logs_global, master_global = get_global_datasets()
+except Exception as _cache_start_error:
+    logs_global, master_global = pd.DataFrame(), pd.DataFrame()
+    st.session_state["wnba_auto_start_error"] = str(_cache_start_error)[:240]
+
+if master_global is None:
+    master_global = pd.DataFrame()
+if logs_global is None:
+    logs_global = pd.DataFrame()
     try:
         logs_global, master_global = get_global_datasets()
     except Exception:
@@ -8505,7 +8749,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-tabs = st.tabs(["Player Cards", "Best Bets", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
+tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
 
 with tabs[0]:
     st.markdown("<div class='section-title'>PLAYER CARDS / Grouped Markets</div>", unsafe_allow_html=True)
@@ -8550,6 +8794,10 @@ with tabs[1]:
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
 with tabs[2]:
+    tracker_board = load_dataset("projection_board")
+    render_slate_tracker(tracker_board, "main_slate_tracker")
+
+with tabs[3]:
     st.subheader("Official + Grade")
     st.caption("Save official plays before games. Grade after results are imported. The Results tab shows ✅/❌ by player and market so you can quickly see what cleared the line.")
     grade_tabs = st.tabs(["Save / Grade", "After Game Results ✅❌", "Raw Logs"])
@@ -8568,7 +8816,7 @@ with tabs[2]:
                     st.warning("No projection board cached yet. Refresh a market board first.")
                 else:
                     n = save_officials(board)
-                    st.success(f"Saved {n} official plays.")
+                    st.success(f"Saved {n} real-line projections for tracking and grading.")
         with c2:
             grade_scope = st.selectbox("Grade scope", ["Today", "Tomorrow", "All pending"], index=0, key="grade_scope_after_results")
             if st.button("📊 Grade pending after results", use_container_width=True):
@@ -8626,10 +8874,10 @@ with tabs[2]:
             st.dataframe(learning.tail(300), use_container_width=True)
             st.download_button("Download learning log CSV", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
 
-with tabs[3]:
+with tabs[4]:
     render_data_manager_tab()
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("Debug / Status")
     st.caption("Diagnostics only. Heavy imports/rebuilds are in Data Manager and never run automatically.")
     st.markdown("### Data status")
@@ -8673,7 +8921,7 @@ with tabs[4]:
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
     st.caption("This page keeps the main UI clean while giving you the same deeper review tools: line movement, closing-line value, projection calibration, and historical model testing.")
 
