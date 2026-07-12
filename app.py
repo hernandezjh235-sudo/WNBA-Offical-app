@@ -32,7 +32,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.4.9 — Automatic Final Results + Reliable Grading"
+APP_VERSION = "WNBA v3.5.0 — Full-Game Main-Line Guard + Automatic Grading"
+LINE_PARSER_VERSION = "UD_FULL_GAME_MAINLINE_V2"
 
 # ============================================================
 # Storage
@@ -357,6 +358,7 @@ def save_board_snapshot(board_df: pd.DataFrame, lines_df: Optional[pd.DataFrame]
         out = board_df.copy()
         out["SavedBoardAt"] = now_iso()
         out["SavedBoardMode"] = mode
+        out["LineParserVersion"] = LINE_PARSER_VERSION
         out.to_csv(SAVED_BOARD_FILE, index=False)
         # Keep the normal projection cache synced too.
         try:
@@ -367,6 +369,7 @@ def save_board_snapshot(board_df: pd.DataFrame, lines_df: Optional[pd.DataFrame]
             ldf = lines_df.copy()
             ldf["SavedBoardAt"] = out["SavedBoardAt"].iloc[0]
             ldf["SavedBoardMode"] = mode
+            ldf["LineParserVersion"] = LINE_PARSER_VERSION
             ldf.to_csv(SAVED_LINES_FILE, index=False)
         meta = {
             "SavedAt": out["SavedBoardAt"].iloc[0],
@@ -374,6 +377,7 @@ def save_board_snapshot(board_df: pd.DataFrame, lines_df: Optional[pd.DataFrame]
             "Rows": int(len(out)),
             "Players": int(out["Player"].nunique()) if "Player" in out.columns else int(len(out)),
             "Markets": sorted(out["Market"].astype(str).str.upper().dropna().unique().tolist()) if "Market" in out.columns else [],
+            "LineParserVersion": LINE_PARSER_VERSION,
         }
         save_json(SAVED_BOARD_META_FILE, meta)
         return int(len(out))
@@ -388,6 +392,12 @@ def load_board_snapshot(mode: str = "Today") -> pd.DataFrame:
             return pd.DataFrame()
         df = pd.read_csv(SAVED_BOARD_FILE)
         if df is None or df.empty:
+            return pd.DataFrame()
+        # Never reopen a board saved by the old lowest-line parser.
+        if "LineParserVersion" not in df.columns:
+            return pd.DataFrame()
+        parser_versions = set(df["LineParserVersion"].dropna().astype(str).unique().tolist())
+        if LINE_PARSER_VERSION not in parser_versions:
             return pd.DataFrame()
         if mode != "All Lines" and "Slate" in df.columns:
             dff = df[df["Slate"].astype(str).str.lower().eq(str(mode).lower())].copy()
@@ -408,7 +418,12 @@ def load_board_snapshot(mode: str = "Today") -> pd.DataFrame:
 def load_saved_lines_snapshot() -> pd.DataFrame:
     try:
         if SAVED_LINES_FILE.exists():
-            return pd.read_csv(SAVED_LINES_FILE)
+            df = pd.read_csv(SAVED_LINES_FILE)
+            if "LineParserVersion" not in df.columns:
+                return pd.DataFrame()
+            if LINE_PARSER_VERSION not in set(df["LineParserVersion"].dropna().astype(str).unique().tolist()):
+                return pd.DataFrame()
+            return df
     except Exception:
         pass
     return pd.DataFrame()
@@ -1603,6 +1618,41 @@ def fetch_underdog_board():
             seen_keys.add(k); pp.append(rec)
     player_pool = pp
 
+    # A sportsbook main line should be reasonably close to the player's full-game
+    # role. This reference is used only to choose among duplicate Underdog rows; it
+    # does not change the model projection or manufacture a line.
+    master_lookup = {}
+    if master is not None and not master.empty and "Player" in master.columns:
+        for _, mr in master.iterrows():
+            nk = normalize_name(mr.get("Player", ""))
+            if nk:
+                master_lookup[nk] = mr
+
+    def full_game_reference(player, market):
+        mr = master_lookup.get(normalize_name(player))
+        if mr is None:
+            return np.nan
+        market = str(market or "").upper()
+        weighted_cols = [
+            (f"{market}_avg", 0.34),
+            (f"{market}_l10", 0.29),
+            (f"{market}_l5", 0.25),
+            (f"{market}_l3", 0.12),
+        ]
+        vals = []
+        for col, weight in weighted_cols:
+            v = safe_float(mr.get(col), np.nan)
+            if pd.notna(v) and v >= 0:
+                vals.append((float(v), float(weight)))
+        if not vals and market == "PRA":
+            parts = [full_game_reference(player, m) for m in ["PTS", "REB", "AST"]]
+            parts = [v for v in parts if pd.notna(v)]
+            return float(sum(parts)) if len(parts) == 3 else np.nan
+        if not vals:
+            return np.nan
+        total_w = sum(w for _, w in vals)
+        return float(sum(v*w for v, w in vals) / total_w) if total_w > 0 else np.nan
+
     def active_schedule_teams():
         sched = load_dataset("schedules")
         teams = set()
@@ -1676,13 +1726,19 @@ def fetch_underdog_board():
                     ids.append(str(v))
         return list(dict.fromkeys(ids))
 
-    def object_text(obj, max_len=900):
+    def object_text(obj, max_len=1400):
         a = attr(obj)
         keys = [
             "title","display_title","name","display_name","full_name","first_name","last_name","player_name",
             "short_name","abbr_name","stat","stat_type","appearance_stat","display_stat","label","market",
             "market_name","description","league","league_name","sport","sport_name","team","team_abbreviation",
-            "home_team","away_team","match_title","event_title","game_title","scheduled_at","start_time"
+            "home_team","away_team","match_title","event_title","game_title","scheduled_at","start_time",
+            # Scope / period / main-line metadata. These fields became important after
+            # Underdog began returning full-game, period, alternate and promotional rows
+            # inside the same response.
+            "period","period_type","game_period","segment","segment_type","duration","scope","timeframe",
+            "market_type","line_type","option_type","pickem_type","live_event","live_event_stat","is_live",
+            "is_alternate","alternate","is_promo","promotion","flash","boost","status"
         ]
         vals = []
         for k in keys:
@@ -1690,11 +1746,17 @@ def fetch_underdog_board():
             if isinstance(v, dict):
                 vals += [str(v.get(kk)) for kk in keys if v.get(kk) not in [None, ""]]
             elif isinstance(v, list):
-                vals += [str(x) for x in v[:4] if x not in [None, ""]]
+                vals += [str(x) for x in v[:6] if x not in [None, ""]]
             elif v not in [None, ""]:
-                vals.append(str(v))
-        if not vals:
-            vals = [json.dumps(a, default=str)[:max_len]]
+                vals.append(f"{k}={v}")
+        # Keep a compact raw sample even when labeled values exist. Unknown schema
+        # changes can still expose first-half/quarter/alternate markers here.
+        try:
+            raw_json = json.dumps(a, default=str, ensure_ascii=False)[:900]
+            if raw_json:
+                vals.append(raw_json)
+        except Exception:
+            pass
         return " | ".join(vals)[:max_len]
 
     def candidate_text(*objs):
@@ -1702,7 +1764,69 @@ def fetch_underdog_board():
         for o in objs:
             if isinstance(o, dict):
                 parts.append(object_text(o))
-        return " | ".join([p for p in parts if p])[:2500]
+        return " | ".join([p for p in parts if p])[:4000]
+
+    def market_scope_flags(*objs):
+        """Classify full-game versus period/live/alternate rows.
+
+        This fails closed: an explicit half/quarter/minute/live marker can never
+        become the line used by the projection board.
+        """
+        txt = candidate_text(*objs)
+        low = txt.lower().replace("_", " ").replace("-", " ")
+        low = re.sub(r"\s+", " ", low)
+
+        segment_patterns = [
+            r"\b(first|1st|second|2nd)\s+half\b", r"\b[12]h\b", r"\bhalf time\b", r"\bhalftime\b",
+            r"\b(first|1st|second|2nd|third|3rd|fourth|4th)\s+quarter\b",
+            r"\bq[1-4]\b", r"\b[1-4]q\b",
+            r"\b(first|1st|opening)\s+(three|3|five|5|ten|10)\s+minutes?\b",
+            r"\b(first|1st)\s+(three|3|five|5|ten|10)\b",
+            r"\bthrough\s+(three|3|five|5|ten|10)\s+minutes?\b",
+        ]
+        segment = any(re.search(p, low, flags=re.I) for p in segment_patterns)
+
+        alt_patterns = [
+            r"\balternate\b", r"\balt\s+line\b", r"\bdiscount(ed)?\b", r"\bpromotion(al)?\b",
+            r"\bpromo\b", r"\bspecial\b", r"\bboost(ed)?\b", r"\bflash\b",
+            r"\bscorcher\b", r"\bdemon\b", r"\bgoblin\b", r"\brival\b",
+        ]
+        alternate = any(re.search(p, low, flags=re.I) for p in alt_patterns)
+
+        full_game = any(x in low for x in ["full game", "entire game", "game total", "period=ft", "period ft", "scope=game", "scope game"])
+        live = False
+        for o in objs:
+            if not isinstance(o, dict):
+                continue
+            a = attr(o)
+            for key in ["live_event", "is_live", "live", "in_play", "inplay"]:
+                val = a.get(key)
+                if val is True or str(val).strip().lower() in {"true", "1", "yes", "live", "in_play", "inplay"}:
+                    live = True
+            for key in ["period", "period_type", "game_period", "segment", "segment_type", "scope", "timeframe"]:
+                val = str(a.get(key, "") or "").lower().replace("_", " ").replace("-", " ").strip()
+                if val in {"full", "full game", "game", "ft", "0"}:
+                    full_game = True
+                if val in {"first half", "1st half", "1h", "second half", "2nd half", "2h", "q1", "q2", "q3", "q4", "1q", "2q", "3q", "4q"}:
+                    segment = True
+            for key in ["is_alternate", "alternate", "is_promo", "promotion", "flash", "boost"]:
+                val = a.get(key)
+                if val is True or str(val).strip().lower() in {"true", "1", "yes"}:
+                    alternate = True
+
+        reason_bits = []
+        if segment: reason_bits.append("period/segment")
+        if live: reason_bits.append("live/in-play")
+        if alternate: reason_bits.append("alternate/promo")
+        if full_game: reason_bits.append("explicit full-game")
+        return {
+            "segment": bool(segment),
+            "live": bool(live),
+            "alternate": bool(alternate),
+            "full_game": bool(full_game),
+            "hard_reject": bool(segment or live),
+            "reason": ", ".join(reason_bits) if reason_bits else "no explicit scope marker",
+        }
 
     def team_from_text(txt):
         txt = str(txt or "").upper()
@@ -1815,10 +1939,12 @@ def fetch_underdog_board():
             opts = o["attributes"].get("options")
         return opts if isinstance(opts, list) else []
 
-    def _ud_has_two_sided_options(o):
-        """Main board lines usually have Higher and Lower. Alternate ladders often do not."""
+    def _ud_option_profile(o):
+        """Describe Higher/Lower availability without reading option payout numbers as lines."""
         choices = set()
-        for opt in _ud_options(o):
+        multipliers = []
+        opts = _ud_options(o)
+        for opt in opts:
             if not isinstance(opt, dict):
                 continue
             a = attrs(opt)
@@ -1827,7 +1953,19 @@ def fetch_underdog_board():
                 choices.add("higher")
             if "lower" in blob or "under" in blob:
                 choices.add("lower")
-        return "higher" in choices and "lower" in choices
+            for key in ["payout_multiplier", "multiplier", "decimal_odds"]:
+                v = safe_float(a.get(key), np.nan)
+                if pd.notna(v):
+                    multipliers.append(float(v))
+        return {
+            "choices": sorted(choices),
+            "two_sided": "higher" in choices and "lower" in choices,
+            "option_count": len(opts),
+            "multipliers": multipliers,
+        }
+
+    def _ud_has_two_sided_options(o):
+        return bool(_ud_option_profile(o).get("two_sided"))
 
     def parse_line(*objs):
         # Critical: only trust the official Underdog main over_under_line object.
@@ -1889,22 +2027,63 @@ def fetch_underdog_board():
             "Raw Sample": str(raw)[:700],
         })
 
-    def append_row(player, team, market, line, raw, parser):
+    def append_row(player, team, market, line, raw, parser, line_obj=None, connected=None):
         if market not in MARKETS:
             return False
         if pd.isna(line):
             return False
+        connected = connected or []
+        profile = _ud_option_profile(line_obj) if isinstance(line_obj, dict) else {"two_sided": False, "option_count": 0, "choices": []}
+        scope = market_scope_flags(*(connected or ([line_obj] if isinstance(line_obj, dict) else [])))
+        ref = full_game_reference(player, market)
+        line_val = float(line)
+        ratio = line_val / ref if pd.notna(ref) and ref > 0 else np.nan
+        distance = abs(line_val - ref) if pd.notna(ref) else np.nan
+        distance_pct = distance / max(ref, 1.0) if pd.notna(distance) else np.nan
+        is_half = abs((line_val * 2) - round(line_val * 2)) < 1e-9 and abs(line_val - round(line_val)) > 1e-9
+
+        score = 0.0
+        score += 280.0 if profile.get("two_sided") else -600.0
+        score += 85.0 if is_half else -35.0
+        score += 100.0 if scope.get("full_game") else 0.0
+        score -= 900.0 if scope.get("segment") else 0.0
+        score -= 900.0 if scope.get("live") else 0.0
+        score -= 260.0 if scope.get("alternate") else 0.0
+        if pd.notna(distance_pct):
+            score += max(-220.0, 260.0 * (1.0 - min(float(distance_pct), 1.85)))
+            if market in {"PTS", "PRA"}:
+                if ratio < 0.58: score -= 460.0
+                elif ratio < 0.72: score -= 220.0
+                elif ratio < 0.82: score -= 75.0
+                if ratio > 1.60: score -= 280.0
+            else:  # REB / AST
+                if ratio < 0.42: score -= 460.0
+                elif ratio < 0.56: score -= 220.0
+                elif ratio < 0.68: score -= 75.0
+                if ratio > 1.90: score -= 280.0
+
         rows.append({
             "Player": player,
             "Team": team,
             "Opponent": "",
             "Market": market,
-            "Line": float(line),
+            "Line": line_val,
             "Source": "Underdog",
             "Start": "",
-            "Raw": str(raw)[:400],
+            "Raw": str(raw)[:900],
             "Parser Mode": parser,
             "NameKey": normalize_name(player),
+            "Two Sided": bool(profile.get("two_sided")),
+            "Option Count": int(profile.get("option_count", 0) or 0),
+            "Scope": scope.get("reason", ""),
+            "Segment Flag": bool(scope.get("segment")),
+            "Live Flag": bool(scope.get("live")),
+            "Alternate Flag": bool(scope.get("alternate")),
+            "Full Game Flag": bool(scope.get("full_game")),
+            "Reference Line": round(float(ref), 3) if pd.notna(ref) else np.nan,
+            "Line Ratio": round(float(ratio), 4) if pd.notna(ratio) else np.nan,
+            "Reference Distance": round(float(distance), 3) if pd.notna(distance) else np.nan,
+            "Candidate Score": round(float(score), 3),
         })
         return True
 
@@ -1986,8 +2165,12 @@ def fetch_underdog_board():
             if ACTIVE_TEAMS and resolved.get("Team") and resolved.get("Team") not in ACTIVE_TEAMS:
                 add_decode(raw_name, market, line, resolved, False, "matched player not on active schedule team", "relationship", raw)
                 continue
-            append_row(resolved["Player"], resolved.get("Team", ""), market, line, raw, "relationship")
-            add_decode(raw_name, market, line, resolved, True, resolved.get("Reason", "accepted"), "relationship", raw)
+            scope = market_scope_flags(*connected)
+            if scope.get("hard_reject"):
+                add_decode(raw_name, market, line, resolved, False, f"rejected {scope.get('reason')}", "relationship", raw)
+                continue
+            append_row(resolved["Player"], resolved.get("Team", ""), market, line, raw, "relationship", line_obj=lo, connected=connected)
+            add_decode(raw_name, market, line, resolved, True, f"main-line candidate; {scope.get('reason')}", "relationship", raw)
 
         # No recursive option fallback. It was useful for debugging but created bad lines
         # from Higher/Lower alt-option text. Relationship parser above is the only active parser.
@@ -1996,29 +2179,128 @@ def fetch_underdog_board():
             break
 
     decode_df = pd.DataFrame(decode_rows)
+
+    if rows:
+        candidates_df = pd.DataFrame(rows)
+        candidates_df["Line"] = pd.to_numeric(candidates_df["Line"], errors="coerce")
+        candidates_df = candidates_df[candidates_df["Line"].between(0.5, 80)].copy()
+        candidates_df = candidates_df.drop_duplicates(subset=["NameKey", "Market", "Line", "Raw"], keep="first")
+        candidates_df["Candidate Score"] = pd.to_numeric(candidates_df.get("Candidate Score"), errors="coerce").fillna(-9999.0)
+        candidates_df["Selection Adjustment"] = 0.0
+        candidates_df["Selection Note"] = "candidate"
+
+        # Duplicate relationship guard: when two lines are close to a 2:1 relationship,
+        # the smaller one is usually a half/quarter line. This works even if Underdog
+        # omits the explicit period label in one version of the feed.
+        for (_, market), idxs in candidates_df.groupby(["NameKey", "Market"], dropna=False).groups.items():
+            idxs = list(idxs)
+            vals = candidates_df.loc[idxs, "Line"].dropna().astype(float)
+            if len(vals.unique()) < 2:
+                continue
+            vmax, vmin = float(vals.max()), float(vals.min())
+            relation = vmax / max(vmin, 0.5)
+            if 1.62 <= relation <= 2.45:
+                low_mask = candidates_df.index.isin(idxs) & (candidates_df["Line"] <= vmin + 1e-9)
+                high_mask = candidates_df.index.isin(idxs) & (candidates_df["Line"] >= vmax - 1e-9)
+                candidates_df.loc[low_mask, "Selection Adjustment"] -= 260.0
+                candidates_df.loc[low_mask, "Selection Note"] = "penalized likely period line"
+                candidates_df.loc[high_mask, "Selection Adjustment"] += 90.0
+                candidates_df.loc[high_mask, "Selection Note"] = "favored likely full-game line"
+
+        candidates_df["Final Candidate Score"] = candidates_df["Candidate Score"] + candidates_df["Selection Adjustment"]
+        candidates_df = candidates_df.sort_values(
+            ["NameKey", "Market", "Final Candidate Score", "Reference Distance", "Line"],
+            ascending=[True, True, False, True, False],
+            na_position="last",
+        )
+
+        selected_rows = []
+        selected_indices = set()
+        rejected_guard = 0
+        for (_, market), grp in candidates_df.groupby(["NameKey", "Market"], sort=False, dropna=False):
+            top = grp.iloc[0].copy()
+            ref = safe_float(top.get("Reference Line"), np.nan)
+            ratio = safe_float(top.get("Line Ratio"), np.nan)
+            plausible = True
+            reason = "selected highest-scoring full-game candidate"
+            if bool(top.get("Segment Flag", False)) or bool(top.get("Live Flag", False)):
+                plausible = False
+                reason = "blocked explicit period/live candidate"
+            elif pd.notna(ref) and ref >= 2.0 and pd.notna(ratio):
+                if str(market).upper() in {"PTS", "PRA"}:
+                    plausible = 0.62 <= ratio <= 1.68
+                else:
+                    plausible = 0.46 <= ratio <= 2.00
+                if not plausible:
+                    reason = f"blocked implausible line ratio {ratio:.2f} vs full-game baseline {ref:.2f}"
+            if not bool(top.get("Two Sided", False)):
+                plausible = False
+                reason = "blocked one-sided/alternate option"
+
+            if plausible:
+                top["Main Line Selection"] = reason
+                top["Line Parser Version"] = LINE_PARSER_VERSION
+                selected_rows.append(top)
+                selected_indices.add(int(top.name))
+            else:
+                rejected_guard += 1
+
+        audit = candidates_df.copy()
+        audit["Selected"] = audit.index.map(lambda i: "YES" if int(i) in selected_indices else "NO")
+        audit["Line Parser Version"] = LINE_PARSER_VERSION
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            audit.to_csv(DATA_DIR / "wnba_underdog_mainline_candidates.csv", index=False)
+        except Exception:
+            pass
+
+        # Add selection decisions to the decode file so the Debug tab explains why
+        # a line was chosen or discarded.
+        try:
+            audit_decode = pd.DataFrame({
+                "Raw Player": audit.get("Player", ""),
+                "Raw Market": audit.get("Market", ""),
+                "Line": audit.get("Line", np.nan),
+                "Resolved Player": audit.get("Player", ""),
+                "Resolved Team": audit.get("Team", ""),
+                "Match Score": np.nan,
+                "Accepted": audit["Selected"].map({"YES": "✅", "NO": "❌"}),
+                "Reason": audit.apply(lambda r: ("SELECTED — " if r.get("Selected") == "YES" else "REJECTED — ") + str(r.get("Selection Note", "candidate")) + f"; score={safe_float(r.get('Final Candidate Score'), np.nan):.1f}; ref={safe_float(r.get('Reference Line'), np.nan):.2f}", axis=1),
+                "Parser": "main-line selector v2",
+                "Raw Sample": audit.get("Raw", "").astype(str).str[:700],
+            })
+            decode_df = pd.concat([decode_df, audit_decode], ignore_index=True, sort=False)
+        except Exception:
+            pass
+
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            decode_df.to_csv(DATA_DIR / "wnba_underdog_decode.csv", index=False)
+        except Exception:
+            pass
+
+        if selected_rows:
+            df = pd.DataFrame(selected_rows).reset_index(drop=True)
+            drop_cols = ["Selection Adjustment"]
+            df = df.drop(columns=drop_cols, errors="ignore")
+            debug.append({
+                "source":"Underdog", "url":"parser", "status":"ok", "rows":len(df),
+                "message":f"selected {len(df)} verified full-game main lines from {len(candidates_df)} candidates; blocked {rejected_guard} implausible groups; parser={LINE_PARSER_VERSION}"
+            })
+            return df, pd.DataFrame(debug)
+
+        debug.append({
+            "source":"Underdog", "url":"parser", "status":"guard blocked all", "rows":0,
+            "message":f"all {len(candidates_df)} candidates failed the full-game main-line guard; parser={LINE_PARSER_VERSION}"
+        })
+        return pd.DataFrame(columns=["Player", "Team", "Opponent", "Market", "Line", "Source", "Start", "Raw", "Parser Mode", "NameKey"]), pd.DataFrame(debug)
+
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         decode_df.to_csv(DATA_DIR / "wnba_underdog_decode.csv", index=False)
     except Exception:
         pass
-
-    if rows:
-        df = pd.DataFrame(rows)
-        df = df[pd.to_numeric(df["Line"], errors="coerce").between(0.5, 80)].copy()
-        # One main line per Player+Market. Underdog may include alternate ladders
-        # or combo lines for the same player. Real main WNBA props are almost always .5.
-        # Pick the LOWEST half-point line per player/market after unsupported combo
-        # markets are filtered. This selects 11.5 over 18.5 for PTS, 8.5 over 11.5 for REB, etc.
-        df["_line_num"] = pd.to_numeric(df["Line"], errors="coerce")
-        df["_is_half"] = df["_line_num"].map(lambda x: 1 if pd.notna(x) and abs((x * 2) - round(x * 2)) < 1e-9 and abs(x - round(x)) > 1e-9 else 0)
-        # Penalize whole-number values like 4/5/7 that often come from sort/rank/stat IDs.
-        df["_line_priority"] = df["_is_half"] * 1000 - df["_line_num"].clip(0, 80)
-        df = df.sort_values(["NameKey", "Market", "_line_priority"], ascending=[True, True, False])
-        df = df.drop_duplicates(subset=["NameKey", "Market"], keep="first").drop(columns=["_line_num", "_is_half", "_line_priority"], errors="ignore")
-        debug.append({"source":"Underdog", "url":"parser", "status":"ok", "rows":len(df), "message":f"accepted {len(df)} real main-line rows; decode rows {len(decode_df)}"})
-        return df.reset_index(drop=True), pd.DataFrame(debug)
-
-    debug.append({"source":"Underdog", "url":"parser", "status":"no accepted rows", "rows":0, "message":f"decode rows {len(decode_df)}; active teams {sorted(ACTIVE_TEAMS) if ACTIVE_TEAMS else 'not detected'}"})
+    debug.append({"source":"Underdog", "url":"parser", "status":"no accepted rows", "rows":0, "message":f"decode rows {len(decode_df)}; active teams {sorted(ACTIVE_TEAMS) if ACTIVE_TEAMS else 'not detected'}; parser={LINE_PARSER_VERSION}"})
     return pd.DataFrame(columns=["Player", "Team", "Opponent", "Market", "Line", "Source", "Start", "Raw", "Parser Mode", "NameKey"]), pd.DataFrame(debug)
 
 @st.cache_data(ttl=240, show_spinner=False)
@@ -8168,7 +8450,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     with top_cols[2]:
         st.metric("Database players", 0 if master_global is None or master_global.empty else len(master_global))
     with top_cols[3]:
-        st.caption("Grouped layout: one player card contains PTS / REB / AST / PRA. Save Board lets this page reopen instantly without pulling lines again.")
+        st.caption(f"Grouped layout: one player card contains PTS / REB / AST / PRA. Full-game line guard: {LINE_PARSER_VERSION}. Old saved boards from the previous parser are automatically ignored.")
 
     # MLB-style persistence: if a board was saved, show it immediately on app open
     # without calling Underdog or rebuilding the database. Refresh Live overrides this.
@@ -10309,6 +10591,17 @@ with tabs[5]:
             st.warning(f"Decode file exists but could not be read: {e}")
     else:
         st.info("No decode file yet. Click Refresh / Pull Lines first.")
+
+    candidate_path = DATA_DIR / "wnba_underdog_mainline_candidates.csv"
+    if candidate_path.exists():
+        try:
+            candidate_df = pd.read_csv(candidate_path, low_memory=False)
+            st.markdown("### Full-Game Main-Line Audit")
+            st.caption("Every duplicate candidate is scored against its full-game baseline. Period/live/one-sided/implausible rows are blocked before projections are built.")
+            st.dataframe(candidate_df.tail(300), use_container_width=True)
+            st.download_button("Download main-line audit CSV", candidate_df.to_csv(index=False), "wnba_underdog_mainline_candidates.csv", "text/csv")
+        except Exception as e:
+            st.warning(f"Could not read main-line audit file: {e}")
 
     with st.expander("PrizePicks test pull — debug only", expanded=False):
         st.caption("This only tests whether a public PrizePicks JSON response is reachable. It does not feed projections yet.")
