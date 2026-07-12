@@ -32,7 +32,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.0 — Automatic Live Data + True Recent Projections"
+APP_VERSION = "WNBA v3.4.9 — Automatic Final Results + Reliable Grading"
 
 # ============================================================
 # Storage
@@ -777,6 +777,11 @@ def standardize_player_logs(df: pd.DataFrame) -> pd.DataFrame:
     game_id_col = find_col(d, ["GAME_ID", "game_id", "event_id", "competition_id"])
     home_away_col = find_col(d, ["home_away", "homeAway", "home_away_flag", "location"])
     starter_col = find_col(d, ["starter", "is_starter", "started", "starter_flag"])
+    source_col = find_col(d, ["Source", "source", "data_source"])
+    slate_date_col = find_col(d, ["SlateDate", "slate_date", "slate_day"])
+    event_start_col = find_col(d, ["EventStartUTC", "event_start_utc", "event_start", "start_time_utc"])
+    dnp_col = find_col(d, ["DNP", "did_not_play", "didNotPlay", "inactive", "not_played"])
+    played_col = find_col(d, ["Played", "played", "participated", "did_play"])
 
     cols = {
         "Player": player_col,
@@ -787,6 +792,11 @@ def standardize_player_logs(df: pd.DataFrame) -> pd.DataFrame:
         "GameID": game_id_col,
         "HomeAway": home_away_col,
         "Starter": starter_col,
+        "Source": source_col,
+        "SlateDate": slate_date_col,
+        "EventStartUTC": event_start_col,
+        "DNP": dnp_col,
+        "Played": played_col,
         "MIN": find_col(d, ["MIN", "minutes", "min", "athlete_minutes", "display_minutes"]),
         "PTS": find_col(d, ["PTS", "points", "athlete_points"]),
         "REB": find_col(d, ["REB", "rebounds", "total_rebounds", "athlete_rebounds"]),
@@ -813,7 +823,10 @@ def standardize_player_logs(df: pd.DataFrame) -> pd.DataFrame:
     out["Player"] = out["Player"].astype(str)
     out["Team"] = out["Team"].fillna("").astype(str)
     out["Opponent"] = out["Opponent"].fillna("").astype(str)
+    out["Source"] = out["Source"].fillna("").astype(str)
     out["GameDate"] = parse_date_series(out["GameDate"])
+    out["SlateDate"] = pd.to_datetime(out["SlateDate"], errors="coerce")
+    out["EventStartUTC"] = pd.to_datetime(out["EventStartUTC"], errors="coerce", utc=True)
     out["Season"] = pd.to_numeric(out["Season"], errors="coerce")
     if out["Season"].isna().all() and out["GameDate"].notna().any():
         out["Season"] = out["GameDate"].dt.year
@@ -822,6 +835,25 @@ def standardize_player_logs(df: pd.DataFrame) -> pd.DataFrame:
     out = coerce_numeric(out, numeric_cols)
     for c in ["MIN", "PTS", "REB", "AST", "FGA", "FGM", "FG3A", "FG3M", "FTA", "FTM", "TOV", "OREB", "DREB", "STL", "BLK"]:
         out[c] = out[c].fillna(0)
+
+    def _boolish(v, default=False):
+        if pd.isna(v):
+            return default
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        text = str(v).strip().lower()
+        if text in {"1", "true", "yes", "y", "dnp", "inactive", "out"}:
+            return True
+        if text in {"0", "false", "no", "n", "played", "active"}:
+            return False
+        return default
+
+    out["DNP"] = out["DNP"].map(lambda v: _boolish(v, False))
+    if out["Played"].isna().all():
+        out["Played"] = (~out["DNP"]) & (out["MIN"] > 0)
+    else:
+        out["Played"] = out["Played"].map(lambda v: _boolish(v, False))
+        out.loc[out["DNP"], "Played"] = False
     out["PRA"] = out["PTS"] + out["REB"] + out["AST"]
     out["NameKey"] = out["Player"].map(normalize_name)
     out["GameKey"] = out["GameID"].fillna("").astype(str)
@@ -3807,120 +3839,195 @@ def latest_closing_line_for_pick(player: str, market: str, saved_at: str = "", s
     return safe_float(h.iloc[-1].get("Line"), np.nan)
 
 
-def grade_pending(logs, mode: Optional[str] = None):
-    """Auto-grade pending official plays using imported player logs.
+def _grade_record_date(record: Dict[str, Any]) -> Optional[date]:
+    """Resolve the slate date saved with a pick or result row."""
+    for key in ["SlateDate", "GameDate", "Start", "ActualGameDate", "SavedAt"]:
+        dt = pd.to_datetime(record.get(key), errors="coerce")
+        if pd.notna(dt):
+            try:
+                return dt.date()
+            except Exception:
+                pass
+    return None
 
-    This version is safer than the original:
-    - it grades the first matching game after SavedAt / Start, not always the latest game;
-    - it stores ClosingLine and CLV when a later line snapshot exists;
-    - it never crashes if logs or columns are missing.
+
+def _grade_bool(v: Any, default: bool = False) -> bool:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return default
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    text = str(v).strip().lower()
+    if text in {"1", "true", "yes", "y", "dnp", "inactive", "out"}:
+        return True
+    if text in {"0", "false", "no", "n", "played", "active"}:
+        return False
+    return default
+
+
+def _grade_team_key(v: Any) -> str:
+    try:
+        return _team_key_for_matchup(v)
+    except Exception:
+        return re.sub(r"[^A-Z0-9]", "", str(v or "").upper())
+
+
+def grade_pending(logs, mode: Optional[str] = None, allowed_dates: Optional[List[date]] = None):
+    """Grade pending WNBA props from completed player logs.
+
+    Reliability upgrades:
+    - uses the saved slate date instead of raw UTC tip date;
+    - supports ESPN/official rows that land one UTC calendar day later;
+    - fuzzy-matches player names when the source abbreviates punctuation/suffixes;
+    - grades DNP/inactive players as VOID, never as a fake Under win;
+    - can grade a supplied set of pending slate dates in one MLB-style run.
     """
     official = load_json(OFFICIAL_LOG, [])
-    if not official or logs is None or logs.empty:
+    if not official or logs is None or getattr(logs, "empty", True):
         return 0
-    logs = standardize_player_logs(logs) if "NameKey" not in logs.columns else logs.copy()
+    logs = standardize_player_logs(logs)
     if logs.empty or "GameDate" not in logs.columns:
         return 0
+
     logs["GameDate"] = pd.to_datetime(logs["GameDate"], errors="coerce")
+    if "SlateDate" not in logs.columns:
+        logs["SlateDate"] = pd.NaT
+    else:
+        logs["SlateDate"] = pd.to_datetime(logs["SlateDate"], errors="coerce")
+    logs["_GradeDate"] = logs["SlateDate"].dt.date
+    missing_grade_date = logs["_GradeDate"].isna()
+    logs.loc[missing_grade_date, "_GradeDate"] = logs.loc[missing_grade_date, "GameDate"].dt.date
+
     grade_target_date = slate_target_date(mode) if mode in ["Today", "Tomorrow"] else None
+    allowed = {d for d in (allowed_dates or []) if d is not None}
     now_ts = pd.Timestamp.now()
     updated = 0
     learn = load_json(LEARNING_LOG, [])
-    existing_ids = set()
-    for r in learn:
-        existing_ids.add(str(r.get("SavedAt", "")) + "|" + normalize_name(r.get("Player")) + "|" + str(r.get("Market")))
+    if not isinstance(learn, list):
+        learn = []
+    existing_ids = {
+        str(r.get("SavedAt", "")) + "|" + normalize_name(r.get("Player")) + "|" + str(r.get("Market"))
+        for r in learn
+    }
+
     for row in official:
-        if row.get("Result") != "PENDING":
+        if str(row.get("Result", "PENDING")).upper() != "PENDING":
             continue
-        # If grading from a Today/Tomorrow board, grade only that slate.
-        # This prevents one-game slates from grading tomorrow/future games or
-        # old saved boards that are still pending.
-        row_slate_date = None
-        for _dc in [row.get("SlateDate"), row.get("Start"), row.get("GameDate")]:
-            _dt = pd.to_datetime(_dc, errors="coerce")
-            if pd.notna(_dt):
-                row_slate_date = _dt.date()
-                break
-        if grade_target_date is not None:
-            if row_slate_date is None:
-                row["GradeNote"] = f"Skipped: slate date missing for {mode} grader."
-                continue
-            if row_slate_date != grade_target_date:
-                row["GradeNote"] = f"Skipped: saved for {row_slate_date}, not {mode} ({grade_target_date})."
-                continue
-        # Never grade a game that has not started yet.
-        _start_dt = pd.to_datetime(row.get("Start"), errors="coerce")
-        if pd.notna(_start_dt):
+
+        row_slate_date = _grade_record_date(row)
+        if grade_target_date is not None and row_slate_date != grade_target_date:
+            row["GradeNote"] = f"Skipped: saved for {row_slate_date}, not {mode} ({grade_target_date})."
+            continue
+        if allowed and row_slate_date not in allowed:
+            row["GradeNote"] = f"Skipped: slate date {row_slate_date} not in selected final-result dates."
+            continue
+
+        start_dt = pd.to_datetime(row.get("Start"), errors="coerce")
+        if pd.notna(start_dt):
             try:
-                _start_dt = _start_dt.tz_convert(None)
+                start_dt = start_dt.tz_convert(None)
             except Exception:
                 try:
-                    _start_dt = _start_dt.tz_localize(None)
+                    start_dt = start_dt.tz_localize(None)
                 except Exception:
                     pass
-            if _start_dt > now_ts:
+            if start_dt > now_ts:
                 row["GradeNote"] = "Skipped: game has not started yet."
                 continue
+
+        market = str(row.get("Market", "")).upper().strip()
+        if market not in {"PTS", "REB", "AST", "PRA"} or market not in logs.columns:
+            row["GradeNote"] = f"Cannot grade: {market or 'market'} not found in player logs."
+            continue
+
+        # Date scope first. ESPN timestamps are UTC, so the explicit SlateDate is preferred.
+        d_scope = logs.copy()
+        target_date = row_slate_date or grade_target_date
+        if target_date is not None:
+            exact = d_scope[d_scope["_GradeDate"] == target_date].copy()
+            if exact.empty:
+                # Safe UTC rollover fallback, restricted further by player/team below.
+                near_dates = {target_date - timedelta(days=1), target_date + timedelta(days=1)}
+                exact = d_scope[d_scope["_GradeDate"].isin(near_dates)].copy()
+            d_scope = exact
+        if d_scope.empty:
+            row["GradeNote"] = f"Skipped: no completed player log for {target_date}."
+            continue
+
         player_name = row.get("Matched Player") or row.get("Player")
         key = normalize_name(player_name)
-        market = str(row.get("Market", "")).upper()
-        if market not in logs.columns:
-            row["GradeNote"] = f"Cannot grade: {market} not in player logs."
-            continue
-        d = logs[logs["NameKey"] == key].copy()
+        d = d_scope[d_scope["NameKey"] == key].copy()
         if d.empty:
-            row["GradeNote"] = "Cannot grade: player not found in logs."
+            # ESPN and WNBA sources occasionally differ on punctuation, accents, or suffixes.
+            names = d_scope[["Player", "NameKey"]].drop_duplicates().copy()
+            names["_score"] = names["Player"].map(lambda x: name_score(player_name, x))
+            if not names.empty and safe_float(names["_score"].max(), 0) >= 0.86:
+                best_key = names.sort_values("_score", ascending=False).iloc[0]["NameKey"]
+                d = d_scope[d_scope["NameKey"] == best_key].copy()
+        if d.empty:
+            row["GradeNote"] = "Cannot grade: player not found in completed boxscore logs."
             continue
-        # Choose first game after the play was saved/start time when possible.
-        cutoff = pd.NaT
-        for tc in [row.get("Start"), row.get("GameDate"), row.get("SavedAt")]:
-            tmp = pd.to_datetime(tc, errors="coerce")
-            if pd.notna(tmp):
-                cutoff = tmp.tz_convert(None) if getattr(tmp, 'tzinfo', None) else tmp
-                break
-        d = d.sort_values("GameDate")
-        if grade_target_date is not None:
-            d_same = d[d["GameDate"].dt.date == grade_target_date].copy()
-            if d_same.empty:
-                row["GradeNote"] = f"Skipped: no completed player log for {grade_target_date}."
-                continue
-            d = d_same
-        elif pd.notna(cutoff):
-            d_after = d[d["GameDate"] >= cutoff - pd.Timedelta(hours=12)].copy()
-            if not d_after.empty:
-                d = d_after
-        actual = safe_float(d.iloc[0].get(market), np.nan)
-        game_date = d.iloc[0].get("GameDate")
+
+        # Team/opponent guard prevents selecting an adjacent-day game for a player.
+        pick_team = _grade_team_key(row.get("Team"))
+        pick_opp = _grade_team_key(row.get("Opponent"))
+        if pick_team and "Team" in d.columns:
+            team_match = d[d["Team"].map(_grade_team_key) == pick_team]
+            if not team_match.empty:
+                d = team_match
+        if pick_opp and "Opponent" in d.columns:
+            opp_match = d[d["Opponent"].map(_grade_team_key) == pick_opp]
+            if not opp_match.empty:
+                d = opp_match
+
+        d = d.sort_values(["_GradeDate", "GameDate"], na_position="last")
+        stat_row = d.iloc[0]
+        source = str(stat_row.get("Source", ""))
+        minutes = safe_float(stat_row.get("MIN"), 0)
+        dnp = _grade_bool(stat_row.get("DNP"), False)
+        played = _grade_bool(stat_row.get("Played"), minutes > 0)
+        if dnp or (source.lower().startswith(("espn", "wnba")) and not played and minutes <= 0):
+            row["Actual"] = None
+            row["ActualGameDate"] = str(target_date or stat_row.get("GameDate"))
+            row["Result"] = "VOID"
+            row["GradedAt"] = now_iso()
+            row["ClosingLine"] = None
+            row["CLV"] = None
+            row["GradeNote"] = f"VOID: player did not participate ({source or 'final boxscore'})."
+            learn_id = str(row.get("SavedAt", "")) + "|" + normalize_name(row.get("Player")) + "|" + market
+            if learn_id not in existing_ids:
+                learn.append(row.copy())
+                existing_ids.add(learn_id)
+            updated += 1
+            continue
+
+        actual = safe_float(stat_row.get(market), np.nan)
         if pd.isna(actual):
-            row["GradeNote"] = "Cannot grade: actual value missing."
+            row["GradeNote"] = "Cannot grade: actual value missing from final boxscore."
             continue
-        lean = str(row.get("Lean", "")).upper()
         line = safe_float(row.get("Line"), np.nan)
         if pd.isna(line):
             row["GradeNote"] = "Cannot grade: line missing."
             continue
+        lean = str(row.get("Lean", "")).upper()
         push = abs(actual - line) < 1e-9
         win = (actual > line and lean == "OVER") or (actual < line and lean == "UNDER")
         row["Actual"] = round(float(actual), 2)
-        row["ActualGameDate"] = str(game_date)
+        row["ActualGameDate"] = str(target_date or stat_row.get("GameDate"))
         row["Result"] = "PUSH" if push else "WIN" if win else "LOSS"
         row["GradedAt"] = now_iso()
         close_line = latest_closing_line_for_pick(row.get("Player"), market, row.get("SavedAt", ""), row.get("Source", ""))
         row["ClosingLine"] = close_line if pd.notna(close_line) else None
-        if pd.notna(close_line):
-            row["CLV"] = round((close_line - line) if lean == "OVER" else (line - close_line), 2)
-        else:
-            row["CLV"] = None
-        row["GradeNote"] = "Auto-graded from imported player logs."
-        learn_id = str(row.get("SavedAt", "")) + "|" + normalize_name(row.get("Player")) + "|" + str(row.get("Market"))
+        row["CLV"] = round((close_line - line) if lean == "OVER" else (line - close_line), 2) if pd.notna(close_line) else None
+        row["GradeNote"] = f"Auto-graded from {source or 'completed player logs'}."
+        learn_id = str(row.get("SavedAt", "")) + "|" + normalize_name(row.get("Player")) + "|" + market
         if learn_id not in existing_ids:
             learn.append(row.copy())
             existing_ids.add(learn_id)
         updated += 1
+
     save_json(OFFICIAL_LOG, official)
     save_json(LEARNING_LOG, learn)
     return updated
-
 
 
 # ============================================================
@@ -3996,51 +4103,88 @@ def _espn_event_is_final(event: Dict[str, Any]) -> bool:
     return state in {"post"} or "FINAL" in name or "final" in desc
 
 
-def pull_espn_final_player_logs(mode: str = "Today", force: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Pull final ESPN WNBA boxscores for the selected slate and merge them into player_game_logs.
+def _merge_and_save_final_logs(frames: List[pd.DataFrame], dbg: List[Dict[str, Any]]) -> pd.DataFrame:
+    usable = [f for f in frames if f is not None and not f.empty]
+    if not usable:
+        return pd.DataFrame()
+    logs_new = standardize_player_logs(pd.concat(usable, ignore_index=True, sort=False))
+    if logs_new.empty:
+        return pd.DataFrame()
+    old = load_dataset("player_game_logs")
+    combined = pd.concat([old, logs_new], ignore_index=True, sort=False) if old is not None and not old.empty else logs_new.copy()
+    combined = standardize_player_logs(combined)
+    try:
+        save_dataset("player_game_logs", combined)
+    except Exception as e:
+        dbg.append({"step":"save_logs", "status":"error", "message":str(e)[:180]})
+    return combined
 
-    This gives the app MLB-style end-game grading: once ESPN marks the game final, the app can fetch
-    player PTS/REB/AST/MIN and grade saved props without you manually importing SportsDataverse logs.
-    Live/not-final games are skipped so tomorrow or in-progress games do not get graded.
+
+def pull_espn_final_player_logs(mode: str = "Today", force: bool = False, target_date: Optional[date] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Pull final ESPN WNBA boxscores for one saved slate date.
+
+    ESPN event timestamps are UTC. The old grader stored that UTC date as GameDate,
+    which moved many evening WNBA games to the next calendar day and caused Grade=0.
+    This version stores the requested slate date explicitly while retaining EventStartUTC.
     """
-    target = slate_target_date(mode) if mode in ["Today", "Tomorrow"] else date.today()
-    dbg = []
+    target = target_date or (slate_target_date(mode) if mode in ["Today", "Tomorrow"] else date.today())
+    dbg: List[Dict[str, Any]] = []
     if target is None:
         return pd.DataFrame(), pd.DataFrame([{"step":"espn_final_logs", "status":"skipped", "message":"No slate date"}])
     ymd = target.strftime("%Y%m%d")
     scoreboard_url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard?dates={ymd}"
     try:
-        r = requests.get(scoreboard_url, timeout=14, headers={"User-Agent":"Mozilla/5.0", "Accept":"application/json"})
-        dbg.append({"step":"scoreboard", "status":f"HTTP {r.status_code}", "message":scoreboard_url})
+        r = requests.get(scoreboard_url, timeout=18, headers={"User-Agent":"Mozilla/5.0", "Accept":"application/json"})
+        dbg.append({"step":"espn_scoreboard", "status":f"HTTP {r.status_code}", "message":f"date={target}"})
         js = r.json() if r.status_code == 200 else {}
     except Exception as e:
-        return pd.DataFrame(), pd.DataFrame([{"step":"scoreboard", "status":"error", "message":str(e)[:220]}])
+        return pd.DataFrame(), pd.DataFrame([{"step":"espn_scoreboard", "status":"error", "message":str(e)[:220]}])
 
-    all_rows = []
-    for ev in js.get("events", []) or []:
+    all_rows: List[Dict[str, Any]] = []
+    events = js.get("events", []) or []
+    if not events:
+        dbg.append({"step":"espn_scoreboard", "status":"no_events", "message":f"No WNBA events returned for {target}."})
+    for ev in events:
         event_id = str(ev.get("id") or "")
         if not event_id:
             continue
         if not _espn_event_is_final(ev):
             status_desc = (((ev.get("status") or {}).get("type") or {}).get("description") or "not final")
-            dbg.append({"step":"event", "status":"skipped_not_final", "message":f"{event_id}: {status_desc}"})
+            dbg.append({"step":"espn_event", "status":"skipped_not_final", "message":f"{event_id}: {status_desc}"})
             continue
-        event_date = pd.to_datetime(ev.get("date"), errors="coerce")
+
+        event_start_utc = pd.to_datetime(ev.get("date"), errors="coerce", utc=True)
         comps = ev.get("competitions", []) or []
         comp = comps[0] if comps else {}
-        competitor_teams = {}
+        competitor_teams: Dict[str, Dict[str, str]] = {}
+        ordered_teams: List[str] = []
         for c in comp.get("competitors", []) or []:
-            tid = str((c.get("team") or {}).get("id") or c.get("id") or "")
-            ab = _team_key_for_matchup((c.get("team") or {}).get("abbreviation") or (c.get("team") or {}).get("shortDisplayName") or (c.get("team") or {}).get("displayName") or "")
+            team_obj = c.get("team") or {}
+            tid = str(team_obj.get("id") or c.get("id") or "")
+            ab = _team_key_for_matchup(team_obj.get("abbreviation") or team_obj.get("shortDisplayName") or team_obj.get("displayName") or "")
             competitor_teams[tid] = {"Team": ab, "HomeAway": str(c.get("homeAway", "")).upper()}
-        summary_url = f"https://site.web.api.espn.com/apis/site/v2/sports/basketball/wnba/summary?event={event_id}"
-        try:
-            sr = requests.get(summary_url, timeout=16, headers={"User-Agent":"Mozilla/5.0", "Accept":"application/json"})
-            dbg.append({"step":"summary", "status":f"HTTP {sr.status_code}", "message":summary_url})
-            sj = sr.json() if sr.status_code == 200 else {}
-        except Exception as e:
-            dbg.append({"step":"summary", "status":"error", "message":f"{event_id}: {str(e)[:180]}"})
+            if ab:
+                ordered_teams.append(ab)
+
+        summary_urls = [
+            f"https://site.web.api.espn.com/apis/site/v2/sports/basketball/wnba/summary?event={event_id}",
+            f"https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary?event={event_id}",
+        ]
+        sj: Dict[str, Any] = {}
+        for summary_url in summary_urls:
+            try:
+                sr = requests.get(summary_url, timeout=20, headers={"User-Agent":"Mozilla/5.0", "Accept":"application/json"})
+                dbg.append({"step":"espn_summary", "status":f"HTTP {sr.status_code}", "message":f"event={event_id}"})
+                if sr.status_code == 200:
+                    candidate = sr.json()
+                    if ((candidate.get("boxscore") or {}).get("players") or []):
+                        sj = candidate
+                        break
+            except Exception as e:
+                dbg.append({"step":"espn_summary", "status":"error", "message":f"{event_id}: {str(e)[:180]}"})
+        if not sj:
             continue
+
         players_groups = ((sj.get("boxscore") or {}).get("players") or [])
         for team_group in players_groups:
             team_obj = team_group.get("team", {}) or {}
@@ -4049,6 +4193,7 @@ def pull_espn_final_player_logs(mode: str = "Today", force: bool = False) -> Tup
             if not team_ab and team_id in competitor_teams:
                 team_ab = competitor_teams[team_id].get("Team", "")
             home_away = competitor_teams.get(team_id, {}).get("HomeAway", "")
+            opponent = next((t for t in ordered_teams if t and t != team_ab), "")
             for stat_group in team_group.get("statistics", []) or []:
                 labels = stat_group.get("labels") or stat_group.get("keys") or []
                 athletes = stat_group.get("athletes") or []
@@ -4059,42 +4204,176 @@ def pull_espn_final_player_logs(mode: str = "Today", force: bool = False) -> Tup
                         continue
                     stats = a.get("stats") or a.get("statistics") or []
                     vals = _espn_map_player_stats(labels, stats)
-                    # Include DNP rows too, but grading will use actual 0 where a player prop was saved.
+                    reason = str(a.get("reason") or a.get("comment") or athlete.get("status") or "")
+                    did_not_play = bool(a.get("didNotPlay", False)) or reason.upper().startswith("DNP")
+                    played = (not did_not_play) and safe_float(vals.get("MIN"), 0) > 0
                     row = {
                         "Player": player,
                         "Team": team_ab,
-                        "Opponent": "",
-                        "GameDate": event_date if pd.notna(event_date) else pd.Timestamp(target),
+                        "Opponent": opponent,
+                        # Critical: use the queried local slate date, not the UTC event calendar date.
+                        "GameDate": pd.Timestamp(target),
+                        "SlateDate": pd.Timestamp(target),
+                        "EventStartUTC": event_start_utc,
                         "Season": target.year,
                         "GameID": event_id,
                         "HomeAway": home_away,
                         "Starter": bool(a.get("starter", False)),
+                        "DNP": did_not_play,
+                        "Played": played,
                         "Source": "ESPN final boxscore",
                     }
                     row.update(vals)
                     all_rows.append(row)
-    logs_new = standardize_player_logs(pd.DataFrame(all_rows)) if all_rows else pd.DataFrame()
+
+    raw = pd.DataFrame(all_rows)
+    logs_new = standardize_player_logs(raw) if not raw.empty else pd.DataFrame()
     if logs_new.empty:
-        return pd.DataFrame(), pd.DataFrame(dbg + [{"step":"espn_final_logs", "status":"no_final_logs", "message":"No final ESPN player rows parsed yet."}])
-    old = load_dataset("player_game_logs")
-    combined = pd.concat([old, logs_new], ignore_index=True, sort=False) if old is not None and not old.empty else logs_new.copy()
-    combined = standardize_player_logs(combined)
-    try:
-        combined.to_csv(CACHE_FILES["player_game_logs"], index=False)
-    except Exception as e:
-        dbg.append({"step":"save_logs", "status":"error", "message":str(e)[:180]})
-    dbg.append({"step":"espn_final_logs", "status":"saved", "message":f"{len(logs_new)} new/updated ESPN player rows; cache now {len(combined)} rows."})
+        return pd.DataFrame(), pd.DataFrame(dbg + [{"step":"espn_final_logs", "status":"no_final_logs", "message":f"No final ESPN player rows parsed for {target}."}])
+    dbg.append({"step":"espn_final_logs", "status":"parsed", "message":f"{len(logs_new)} ESPN player rows parsed for {target}."})
     return logs_new, pd.DataFrame(dbg)
 
 
-def pull_final_results_and_grade(mode: str = "Today") -> Tuple[int, pd.DataFrame]:
-    """Fetch final ESPN player logs for finished games, then grade selected slate."""
-    logs_new, dbg = pull_espn_final_player_logs(mode, force=True)
-    logs = load_dataset("player_game_logs")
-    n = grade_pending(logs, mode)
-    extra = pd.DataFrame([{"step":"grade_pending", "status":"done", "message":f"Updated {n} pending plays for {mode}."}])
-    dbg = pd.concat([dbg, extra], ignore_index=True, sort=False) if dbg is not None and not dbg.empty else extra
-    return n, dbg
+def _wnba_live_minutes(v: Any) -> float:
+    s = str(v or "").strip().upper().replace("PT", "").replace("M", ":").replace("S", "")
+    return _espn_parse_min_to_float(s)
+
+
+def pull_wnba_official_final_player_logs(target_date: date) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Best-effort official WNBA fallback.
+
+    It reads the official WNBA current-season schedule CDN, then tries the official
+    live-data boxscore for final games. Failures are diagnostic only and never break grading.
+    """
+    dbg: List[Dict[str, Any]] = []
+    schedule_url = "https://cdn.wnba.com/static/json/staticData/scheduleLeagueV2.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.wnba.com",
+        "Referer": "https://www.wnba.com/",
+    }
+    try:
+        r = requests.get(schedule_url, timeout=20, headers=headers)
+        dbg.append({"step":"wnba_schedule", "status":f"HTTP {r.status_code}", "message":str(target_date)})
+        js = r.json() if r.status_code == 200 else {}
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame([{"step":"wnba_schedule", "status":"error", "message":str(e)[:220]}])
+
+    games: List[Dict[str, Any]] = []
+    for gd in (((js.get("leagueSchedule") or {}).get("gameDates")) or []):
+        gd_date = pd.to_datetime(gd.get("gameDate"), errors="coerce")
+        if pd.notna(gd_date) and gd_date.date() == target_date:
+            games.extend(gd.get("games") or [])
+    rows: List[Dict[str, Any]] = []
+    for game in games:
+        game_id = str(game.get("gameId") or game.get("gameID") or "")
+        status_num = safe_float(game.get("gameStatus"), 0)
+        status_text = str(game.get("gameStatusText") or game.get("gameStatusText") or "")
+        if not game_id or not (status_num == 3 or "final" in status_text.lower()):
+            continue
+        box_url = f"https://cdn.wnba.com/static/json/liveData/boxscore/boxscore_{game_id}.json"
+        try:
+            br = requests.get(box_url, timeout=20, headers=headers)
+            dbg.append({"step":"wnba_boxscore", "status":f"HTTP {br.status_code}", "message":game_id})
+            bj = br.json() if br.status_code == 200 else {}
+        except Exception as e:
+            dbg.append({"step":"wnba_boxscore", "status":"error", "message":f"{game_id}: {str(e)[:160]}"})
+            continue
+        game_obj = bj.get("game") or bj.get("boxScoreTraditional") or bj.get("boxscore") or {}
+        teams = [game_obj.get("homeTeam") or {}, game_obj.get("awayTeam") or {}]
+        team_codes = []
+        for t in teams:
+            code = _team_key_for_matchup(t.get("teamTricode") or t.get("teamCode") or t.get("teamName") or "")
+            if code:
+                team_codes.append(code)
+        for team_obj in teams:
+            team_ab = _team_key_for_matchup(team_obj.get("teamTricode") or team_obj.get("teamCode") or team_obj.get("teamName") or "")
+            opponent = next((x for x in team_codes if x != team_ab), "")
+            for pl in team_obj.get("players") or []:
+                stx = pl.get("statistics") or pl.get("stats") or {}
+                name = pl.get("name") or pl.get("nameI") or pl.get("playerName") or " ".join([str(pl.get("firstName") or ""), str(pl.get("familyName") or pl.get("lastName") or "")]).strip()
+                if not name:
+                    continue
+                dnp_reason = str(pl.get("notPlayingReason") or pl.get("status") or "")
+                minutes = _wnba_live_minutes(stx.get("minutesCalculated") or stx.get("minutes") or pl.get("minutes"))
+                dnp = bool(pl.get("didNotPlay", False)) or "DNP" in dnp_reason.upper()
+                pts = safe_float(stx.get("points"), 0)
+                reb = safe_float(stx.get("reboundsTotal", stx.get("rebounds", 0)), 0)
+                ast = safe_float(stx.get("assists"), 0)
+                rows.append({
+                    "Player": name, "Team": team_ab, "Opponent": opponent,
+                    "GameDate": pd.Timestamp(target_date), "SlateDate": pd.Timestamp(target_date),
+                    "Season": target_date.year, "GameID": game_id,
+                    "MIN": minutes, "PTS": pts, "REB": reb, "AST": ast, "PRA": pts + reb + ast,
+                    "FGA": safe_float(stx.get("fieldGoalsAttempted"), 0),
+                    "FGM": safe_float(stx.get("fieldGoalsMade"), 0),
+                    "FG3A": safe_float(stx.get("threePointersAttempted"), 0),
+                    "FG3M": safe_float(stx.get("threePointersMade"), 0),
+                    "FTA": safe_float(stx.get("freeThrowsAttempted"), 0),
+                    "FTM": safe_float(stx.get("freeThrowsMade"), 0),
+                    "DNP": dnp, "Played": (not dnp and minutes > 0),
+                    "Source": "WNBA official live boxscore",
+                })
+    out = standardize_player_logs(pd.DataFrame(rows)) if rows else pd.DataFrame()
+    if out.empty:
+        dbg.append({"step":"wnba_official_final_logs", "status":"no_rows", "message":f"No official live boxscore rows parsed for {target_date}."})
+    else:
+        dbg.append({"step":"wnba_official_final_logs", "status":"parsed", "message":f"{len(out)} official WNBA player rows parsed for {target_date}."})
+    return out, pd.DataFrame(dbg)
+
+
+def _pending_grade_dates(mode: Optional[str]) -> List[date]:
+    official = load_json(OFFICIAL_LOG, [])
+    pending = [r for r in official if str(r.get("Result", "PENDING")).upper() == "PENDING"] if isinstance(official, list) else []
+    dates = sorted({d for d in (_grade_record_date(r) for r in pending) if d is not None})
+    if mode in ["Today", "Tomorrow"]:
+        target = slate_target_date(mode)
+        exact = [d for d in dates if d == target]
+        if exact:
+            return exact
+        # Helpful after midnight: use the most recent ungraded slate from the last two days.
+        recent = [d for d in dates if target is not None and timedelta(days=0) <= (target - d) <= timedelta(days=2)]
+        if recent:
+            return [max(recent)]
+        return [target] if target else []
+    return dates[-10:]
+
+
+def pull_final_results_and_grade(mode: Optional[str] = "Today") -> Tuple[int, pd.DataFrame]:
+    """MLB-style one-click grading: pull final boxscores, merge logs, then grade.
+
+    ESPN is primary. The official WNBA live boxscore is a safe fallback. All pending
+    dates are supported, and the newly pulled rows are passed directly to the grader.
+    """
+    targets = _pending_grade_dates(mode)
+    all_new: List[pd.DataFrame] = []
+    diagnostics: List[pd.DataFrame] = []
+    if not targets:
+        return 0, pd.DataFrame([{"step":"grade", "status":"no_pending_dates", "message":"No pending saved slate dates were found."}])
+
+    for target in targets:
+        espn_logs, espn_dbg = pull_espn_final_player_logs(mode or "Today", force=True, target_date=target)
+        diagnostics.append(espn_dbg)
+        if espn_logs is not None and not espn_logs.empty:
+            all_new.append(espn_logs)
+        else:
+            wnba_logs, wnba_dbg = pull_wnba_official_final_player_logs(target)
+            diagnostics.append(wnba_dbg)
+            if wnba_logs is not None and not wnba_logs.empty:
+                all_new.append(wnba_logs)
+
+    dbg_rows: List[Dict[str, Any]] = []
+    for frame in diagnostics:
+        if frame is not None and not frame.empty:
+            dbg_rows.extend(frame.to_dict("records"))
+    combined = _merge_and_save_final_logs(all_new, dbg_rows)
+    if combined.empty:
+        combined = load_dataset("player_game_logs")
+    n = grade_pending(combined, mode=None, allowed_dates=targets)
+    dbg_rows.append({"step":"grade_pending", "status":"done", "message":f"Updated {n} pending plays across {', '.join(map(str, targets))}."})
+    return n, pd.DataFrame(dbg_rows)
+
 
 def grade_diagnostics(logs, mode: Optional[str] = None) -> Dict[str, Any]:
     """Quick status check so user can see why AutoGrader updated 0 plays."""
@@ -4169,6 +4448,8 @@ def build_after_game_results_table(source_df: pd.DataFrame) -> pd.DataFrame:
             return "❌"
         if result == "PUSH":
             return "➖"
+        if result == "VOID":
+            return "🚫"
         return "⏳"
     def _actual_vs_line(r):
         actual = r.get("Actual")
@@ -4180,7 +4461,7 @@ def build_after_game_results_table(source_df: pd.DataFrame) -> pd.DataFrame:
         actual = r.get("Actual")
         line = r.get("Line")
         lean = str(r.get("Lean", "")).upper()
-        if pd.isna(actual) or pd.isna(line):
+        if str(r.get("Result", "")).upper() == "VOID" or pd.isna(actual) or pd.isna(line):
             return np.nan
         return round((actual - line) if lean == "OVER" else (line - actual), 2)
     df["✅/❌"] = df.apply(_cleared, axis=1)
@@ -7078,13 +7359,16 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
             n = save_officials(proj_df)
             st.success(f"Saved {n} official plays for {mode}.")
     with action_cols[1]:
-        if st.button(f"📊 Grade After Results", key=f"grade_after_{mode}_{market_key}"):
-            n = grade_pending(logs_global, mode)
-            st.success(f"Graded {n} pending plays for {mode} only.")
+        if st.button(f"📊 Pull Final Results + Grade", key=f"grade_after_{mode}_{market_key}"):
+            n, grade_dbg = pull_final_results_and_grade(mode)
+            st.success(f"Pulled final boxscores and graded {n} pending plays for {mode}.")
+            if n == 0:
+                with st.expander("Why did grading return 0?", expanded=True):
+                    st.dataframe(grade_dbg, use_container_width=True, hide_index=True)
     with action_cols[2]:
         st.download_button(f"Download {mode} Board CSV", proj_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ', '_')}_projection_board.csv", "text/csv", key=f"dl_{mode}_{market_key}")
     with action_cols[3]:
-        st.caption("Save before does not change projections. Grade after uses the latest imported stat logs and updates learning history.")
+        st.caption("Save before does not change projections. Grade after automatically pulls final ESPN/official WNBA boxscores, then updates learning history.")
 
     board_filter = st.radio(
         "Board filter",
@@ -7731,8 +8015,12 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
         if st.button(f"✅ Save {mode} Official Before", key=f"{key_prefix}_save_before", use_container_width=True):
             n = save_officials(view_df); st.success(f"Saved {n} real-line projections for {mode} tracking and grading.")
     with ac2:
-        if st.button(f"📊 Grade After Results", key=f"{key_prefix}_grade_after", use_container_width=True):
-            n = grade_pending(load_dataset("player_game_logs"), mode); st.success(f"Graded {n} pending plays for {mode} only.")
+        if st.button(f"📊 Pull Final Results + Grade", key=f"{key_prefix}_grade_after", use_container_width=True):
+            n, grade_dbg = pull_final_results_and_grade(mode)
+            st.success(f"Pulled final boxscores and graded {n} pending plays for {mode}.")
+            if n == 0:
+                with st.expander("Why did grading return 0?", expanded=True):
+                    st.dataframe(grade_dbg, use_container_width=True, hide_index=True)
     with ac3:
         st.download_button(f"Download {mode} Board CSV", view_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ','_')}_board.csv", "text/csv", key=f"{key_prefix}_download")
 
@@ -9941,19 +10229,15 @@ with tabs[3]:
                     st.success(f"Saved {n} real-line projections for tracking and grading.")
         with c2:
             grade_scope = st.selectbox("Grade scope", ["Today", "Tomorrow", "All pending"], index=0, key="grade_scope_after_results")
-            if st.button("📊 Grade pending after results", use_container_width=True):
+            if st.button("🏁 Pull final results + grade pending plays", use_container_width=True):
                 mode_arg = None if grade_scope == "All pending" else grade_scope
-                n = grade_pending(logs_global, mode_arg)
-                st.success(f"AutoGrader updated {n} pending plays for {grade_scope}.")
-            if st.button("🏁 Pull final ESPN results + grade finished games", use_container_width=True):
-                mode_arg = "Today" if grade_scope == "All pending" else grade_scope
                 n, dbg = pull_final_results_and_grade(mode_arg)
-                st.success(f"Pulled final ESPN boxscores and graded {n} finished-game plays for {mode_arg}.")
-                with st.expander("Final-result pull diagnostics", expanded=True):
-                    st.dataframe(dbg, use_container_width=True)
+                st.success(f"Pulled final boxscores and graded {n} pending plays for {grade_scope}.")
+                with st.expander("Final-result pull diagnostics", expanded=(n == 0)):
+                    st.dataframe(dbg, use_container_width=True, hide_index=True)
         with c3:
             st.metric("Current board", 0 if board.empty else len(board))
-        st.info("AutoGrader only marks plays when a completed player log exists. The ESPN final-results button can pull those logs after the game. Future/not-started games remain pending/skipped.")
+        st.info("The grader now pulls final ESPN boxscores automatically, falls back to the official WNBA feed, and grades only completed games. Future/not-started games remain pending.")
     official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
     learning = pd.DataFrame(load_json(LEARNING_LOG, []))
     with grade_tabs[1]:
@@ -9972,12 +10256,14 @@ with tabs[3]:
             wins = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "WIN").sum()) if total else 0
             losses = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "LOSS").sum()) if total else 0
             pushes = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "PUSH").sum()) if total else 0
+            voids = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "VOID").sum()) if total else 0
+            decisions = wins + losses
             c1.metric("Graded", total)
             c2.metric("✅ Wins", wins)
             c3.metric("❌ Losses", losses)
-            c4.metric("Push", pushes)
-            if total:
-                st.metric("Win rate", f"{wins}/{total} ({wins/total:.1%})")
+            c4.metric("🚫 Voids / Pushes", f"{voids} / {pushes}")
+            if decisions:
+                st.metric("Win rate (voids/pushes excluded)", f"{wins}/{decisions} ({wins/decisions:.1%})")
             st.dataframe(show_results, use_container_width=True)
             st.download_button("Download after-game results CSV", show_results.to_csv(index=False), "wnba_after_game_results.csv", "text/csv")
     with grade_tabs[2]:
@@ -10067,10 +10353,13 @@ with tabs[6]:
             st.metric("Tracked win rate", "N/A")
 
     st.markdown("### 1) Result AutoGrader")
-    st.write("Uses imported SportsDataverse player logs to grade saved official plays. It matches the first player game after the pick's saved/start time, then writes WIN/LOSS/PUSH, actual value, closing line, and CLV.")
+    st.write("Pulls final ESPN boxscores automatically, falls back to official WNBA live boxscores, then writes WIN/LOSS/PUSH/VOID, actual value, closing line, and CLV.")
     if st.button("Run AutoGrader now", type="primary", use_container_width=True):
-        n = grade_pending(logs_global)
-        st.success(f"AutoGrader updated {n} pending plays.")
+        n, dbg = pull_final_results_and_grade(None)
+        st.success(f"AutoGrader pulled final boxscores and updated {n} pending plays.")
+        if n == 0:
+            with st.expander("AutoGrader diagnostics", expanded=True):
+                st.dataframe(dbg, use_container_width=True, hide_index=True)
     refreshed_official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
     if not refreshed_official.empty:
         cols = [c for c in ["SavedAt", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Projection", "Lean", "Actual", "Result", "ClosingLine", "CLV", "GradeNote"] if c in refreshed_official.columns]
