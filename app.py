@@ -10263,6 +10263,353 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
     return out.sort_values(["Official Play Score","Hit Score","Edge"], ascending=[False,False,False])
 
 
+
+# ============================================================
+# STABLE SINGLE-PASS PROJECTION LOCK
+# ============================================================
+# The working Underdog parser above is intentionally untouched. This layer fixes
+# projection inflation by making the calibrated v3.4.8 rebuild the only function
+# allowed to change Projection. Context fields below are audit/display fields only.
+
+APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Stable Single-Pass Projections"
+PROJECTION_ENGINE_VERSION = "V348_STABLE_SINGLE_PASS_V1"
+PROJECTION_ENGINE_NOTE = "Bayesian L5/L10/L20/season baseline + bounded minutes once + verified matchup once + small market shrink; later context is audit-only."
+
+
+def _stable_context_value(br: Optional[pd.Series], row: pd.Series, names, default=np.nan):
+    """Read a context value without allowing it to alter the final projection."""
+    try:
+        return _v344_value(br, row, list(names), default)
+    except Exception:
+        for name in names:
+            try:
+                value = safe_float(row.get(name), np.nan)
+                if pd.notna(value):
+                    return float(value)
+            except Exception:
+                pass
+        return default
+
+
+def _stable_weighted_stat(br: Optional[pd.Series], row: pd.Series, prefix: str) -> float:
+    """Create an audit-only recent opportunity estimate from available data."""
+    vals = []
+    for col, weight in [
+        (f"{prefix}_l5", 0.20),
+        (f"{prefix}_l10", 0.35),
+        (f"{prefix}_l20", 0.25),
+        (f"{prefix}_avg", 0.20),
+    ]:
+        v = _stable_context_value(br, row, [col, col.upper(), col.lower()])
+        if pd.notna(v):
+            vals.append((float(v), weight))
+    if not vals:
+        return np.nan
+    total_w = sum(w for _, w in vals)
+    return sum(v*w for v, w in vals) / max(total_w, 1e-9)
+
+
+def _stable_attach_context_audit_only(board: pd.DataFrame, base: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Populate useful context columns without modifying Projection, Edge, or side."""
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    lookup = _v344_player_lookup(base) if base is not None and not base.empty else pd.DataFrame()
+    rows = []
+    for _, rr in out.iterrows():
+        row = rr.copy()
+        key = normalize_name(row.get("Matched Player") or row.get("Player"))
+        br = lookup.loc[key] if (not lookup.empty and key in lookup.index) else None
+        market = str(row.get("Market", "PTS")).upper()
+
+        l20 = _stable_context_value(br, row, [f"{market}_l20", "L20 Avg"])
+        if pd.notna(l20):
+            row["L20 Avg"] = round(float(l20), 2)
+
+        fga = _stable_weighted_stat(br, row, "FGA")
+        three_pa = _stable_weighted_stat(br, row, "FG3A")
+        fta = _stable_weighted_stat(br, row, "FTA")
+        if pd.isna(fga):
+            fga = safe_float(row.get("Projected FGA"), np.nan)
+        if pd.notna(fga):
+            row["Projected FGA"] = round(float(fga), 2)
+            row["Projected FGA 2.0"] = round(float(fga), 2)
+        if pd.notna(three_pa):
+            row["Projected 3PA 2.0"] = round(float(three_pa), 2)
+        if pd.notna(fta):
+            row["Projected FTA 2.0"] = round(float(fta), 2)
+
+        minutes = safe_float(row.get("MIN Proj"), np.nan)
+        min_conf = safe_float(row.get("Minutes Confidence"), safe_float(row.get("Final Projection Confidence"), np.nan))
+        row["Minutes 2.0 Projection"] = round(minutes, 2) if pd.notna(minutes) else np.nan
+        row["Minutes 2.0 Confidence"] = round(min_conf, 1) if pd.notna(min_conf) else np.nan
+
+        usg_l5 = _stable_context_value(br, row, ["USG_l5", "USG%_L5", "Usage L5"])
+        usg_l10 = _stable_context_value(br, row, ["USG_l10", "USG%_L10", "Usage L10"])
+        usage_trend = np.nan
+        if pd.notna(usg_l5) and pd.notna(usg_l10) and abs(float(usg_l10)) > 1e-9:
+            usage_trend = float(np.clip((float(usg_l5) / float(usg_l10)) - 1.0, -0.30, 0.30))
+        row["Usage Trend"] = round(usage_trend, 4) if pd.notna(usage_trend) else np.nan
+        row["Live Usage Factor"] = 1.0
+
+        opp_pace = safe_float(row.get("Opponent Pace"), np.nan)
+        game_pace = safe_float(row.get("Projected Pace"), safe_float(row.get("Game Pace Projection"), np.nan))
+        poss_vals = [x for x in [opp_pace, game_pace] if pd.notna(x)]
+        projected_poss = float(np.mean(poss_vals)) if poss_vals else np.nan
+        row["Projected Possessions"] = round(projected_poss, 2) if pd.notna(projected_poss) else np.nan
+        row["Possession Factor"] = 1.0
+        row["Shot Volume Factor"] = 1.0
+        row["Rebound Opportunity Factor"] = 1.0
+
+        blowout = safe_float(row.get("Blowout Risk %"), safe_float(row.get("Blowout Risk"), np.nan))
+        if pd.notna(blowout):
+            row["Blowout Risk %"] = round(float(blowout), 1)
+        volatility = safe_float(row.get("Volatility Score"), np.nan)
+        if pd.isna(volatility):
+            sd = safe_float(row.get("Simulation SD"), np.nan)
+            if pd.notna(sd):
+                volatility = float(np.clip(45 + sd*6, 35, 95))
+        if pd.notna(volatility):
+            row["Volatility Score"] = round(float(volatility), 1)
+            row["Volatility Tier 2.0"] = "HIGH" if volatility >= 78 else "LOW" if volatility <= 55 else "MEDIUM"
+
+        proj = safe_float(row.get("Projection"), np.nan)
+        line = safe_float(row.get("Line"), np.nan)
+        disagreement = abs(proj-line) if pd.notna(proj) and pd.notna(line) else np.nan
+        row["Market Disagreement"] = round(disagreement, 2) if pd.notna(disagreement) else np.nan
+        row["Market Intelligence Flag"] = (
+            "LARGE MODEL/MARKET DISAGREEMENT"
+            if pd.notna(disagreement) and disagreement >= {"PTS": 5.0, "REB": 2.2, "AST": 2.0, "PRA": 7.5}.get(market, 4.0)
+            else "NORMAL"
+        )
+        row["Context Total Multiplier"] = 1.0
+        row["Context Base Projection"] = round(proj, 2) if pd.notna(proj) else np.nan
+        row["Context Explain"] = "Audit only: minutes, usage, possessions, shot volume, rebound opportunity, blowout, volatility, and market disagreement are displayed but are not stacked onto Projection."
+        row["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+        row["Projection Audit"] = PROJECTION_ENGINE_NOTE
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _stable_recalculate_side_fields(board: pd.DataFrame, base: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Keep projection fixed and make Edge/Lean/probability/Official internally consistent."""
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    lookup = _v344_player_lookup(base) if base is not None and not base.empty else pd.DataFrame()
+    repaired = []
+    for _, rr in out.iterrows():
+        row = rr.copy()
+        market = str(row.get("Market", "PTS")).upper()
+        proj = safe_float(row.get("Projection"), np.nan)
+        line = safe_float(row.get("Line"), np.nan)
+        edge = proj-line if pd.notna(proj) and pd.notna(line) else np.nan
+        key = normalize_name(row.get("Matched Player") or row.get("Player"))
+        br = lookup.loc[key] if (not lookup.empty and key in lookup.index) else None
+        confidence = safe_float(row.get("Final Projection Confidence"), 70.0)
+        sd = safe_float(row.get("Simulation SD"), np.nan)
+        if pd.isna(sd) and pd.notna(proj):
+            try:
+                sd = _v344_sd(br, market, proj, confidence)
+            except Exception:
+                sd = {"PTS": 4.8, "REB": 2.3, "AST": 2.1, "PRA": 6.8}.get(market, 4.0)
+        overp = _v344_probability(line, proj, sd) if pd.notna(line) and pd.notna(proj) else np.nan
+        underp = 100.0-overp if pd.notna(overp) else np.nan
+
+        neutral_edge = {"PTS":0.75,"REB":0.40,"AST":0.40,"PRA":1.25}.get(market,0.75)
+        min_prob = 54.5
+        if pd.isna(edge):
+            lean = "PASS"
+        elif edge >= neutral_edge and pd.notna(overp) and overp >= min_prob:
+            lean = "OVER"
+        elif edge <= -neutral_edge and pd.notna(underp) and underp >= min_prob:
+            lean = "UNDER"
+        else:
+            lean = "NEUTRAL"
+        sidep = overp if lean == "OVER" else underp if lean == "UNDER" else max(overp, underp) if pd.notna(overp) else 0.0
+
+        vals = []
+        for c in ["L5 Avg", "L10 Avg", "L20 Avg", "Season Avg"]:
+            v = safe_float(row.get(c), np.nan)
+            if pd.notna(v): vals.append(v)
+        votes = 0
+        if pd.notna(line) and lean in {"OVER", "UNDER"}:
+            votes = sum(1 for v in vals if (v > line) == (lean == "OVER"))
+
+        integrity = str(row.get("Data Integrity", "LIMITED")).upper()
+        official_edge = {"PTS":1.50,"REB":0.75,"AST":0.75,"PRA":2.25}.get(market,1.25)
+        official_prob = {"PTS":60.0,"REB":59.0,"AST":59.0,"PRA":60.0}.get(market,60.0)
+        reasons = []
+        if lean not in {"OVER", "UNDER"}: reasons.append("inside neutral/no-play zone")
+        if integrity != "VERIFIED": reasons.append("data/opponent context not verified")
+        if pd.isna(edge) or abs(edge) < official_edge: reasons.append("edge below official threshold")
+        if sidep < official_prob: reasons.append("probability below official threshold")
+        if votes < 2: reasons.append("recent/season support is weak")
+        if confidence < 78: reasons.append("projection confidence below 78%")
+        official = "PASS" if reasons else ("🔥 OVER" if lean == "OVER" else "⚠️ UNDER")
+
+        # Preserve the calibrated score formula but force it to use the selected side.
+        edge_scale = {"PTS":6.0,"REB":11.0,"AST":11.0,"PRA":3.8}.get(market,6.0)
+        edge_score = float(np.clip(50 + abs(edge if pd.notna(edge) else 0)*edge_scale, 0, 100))
+        hit_score = float(np.clip(0.46*sidep + 0.24*confidence + 0.16*edge_score + 0.14*(40+votes*13), 0, 100))
+
+        row["Edge"] = round(edge, 2) if pd.notna(edge) else np.nan
+        row["Lean"] = lean
+        row["Over %"] = round(overp, 1) if pd.notna(overp) else np.nan
+        row["Under %"] = round(underp, 1) if pd.notna(underp) else np.nan
+        row["Simulation SD"] = round(sd, 2) if pd.notna(sd) else np.nan
+        row["Hit Score"] = round(hit_score, 1)
+        row["Official Play Score"] = round(hit_score, 1)
+        row["Official"] = official
+        row["Tier"] = "S" if official != "PASS" and hit_score >= 86 else "A" if official != "PASS" and hit_score >= 78 else "B" if official != "PASS" else "TRACK"
+        row["PASS Reason"] = " · ".join(dict.fromkeys(reasons))
+        repaired.append(row)
+
+    out = pd.DataFrame(repaired)
+    actionable = out[out["Lean"].isin(["OVER", "UNDER"])]
+    overs = int((actionable["Lean"] == "OVER").sum())
+    unders = int((actionable["Lean"] == "UNDER").sum())
+    neutrals = int((out["Lean"] == "NEUTRAL").sum())
+    total = len(actionable)
+    over_rate = overs/max(1,total)
+    warning = "BALANCED"
+    if total >= 8 and over_rate >= 0.75:
+        warning = f"OVER-SKEW WARNING: {overs}/{total} actionable projections. Review the stable baseline inputs; no sides were force-balanced."
+    elif total >= 8 and over_rate <= 0.25:
+        warning = f"UNDER-SKEW WARNING: {unders}/{total} actionable projections. Review the stable baseline inputs; no sides were force-balanced."
+    st.session_state["wnba_slate_bias_summary"] = {"overs":overs,"unders":unders,"neutrals":neutrals,"total":total,"over_rate":over_rate,"warning":warning}
+    out["Slate Over Count"] = overs
+    out["Slate Under Count"] = unders
+    out["Slate Neutral Count"] = neutrals
+    out["Slate Bias Warning"] = warning
+    return out.sort_values(["Official Play Score", "Hit Score", "Edge"], ascending=[False, False, False])
+
+
+def _stable_repair_projection_board(board: pd.DataFrame, base: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Rebuild an old/inflated cached board using the exact same lines and the stable v3.4.8 model."""
+    if board is None or board.empty:
+        return board
+    rebuilt = _v344_rebuild_board(board.copy(), base)
+    rebuilt = _stable_attach_context_audit_only(rebuilt, base)
+    rebuilt = _stable_recalculate_side_fields(rebuilt, base)
+    rebuilt["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+    return rebuilt
+
+
+def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+    """Single-pass projection builder. The Underdog line pull remains unchanged."""
+    board = _make_projection_board_v344_input(lines, logs, base, mode)
+    board = _v344_rebuild_board(board, base)
+    board = _stable_attach_context_audit_only(board, base)
+    board = _stable_recalculate_side_fields(board, base)
+    if board is not None and not board.empty:
+        board["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+        save_dataset("projection_board", board)
+    return board
+
+
+def _stable_load_or_repair_cached_board(mode: str, base: Optional[pd.DataFrame]) -> tuple:
+    board, label = _load_last_good_projection_board(mode)
+    if board is None or board.empty:
+        return pd.DataFrame(), label
+    versions = set(board.get("Projection Engine Version", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+    if PROJECTION_ENGINE_VERSION not in versions:
+        try:
+            board = _stable_repair_projection_board(board, base)
+            board.to_csv(CACHE_FILES["projection_board"], index=False)
+            label = f"repaired {label}"
+        except Exception as exc:
+            st.session_state["wnba_projection_cache_repair_error"] = str(exc)[:220]
+    return board, label
+
+
+def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame):
+    """Player Cards synchronized with Best Bets, using one stable projection pass only."""
+    st.markdown(f"<div class='section-title'>{mode} — Grouped Player Cards</div>", unsafe_allow_html=True)
+    top_cols = st.columns([1.2, 1.0, 1.0, 2.0])
+    with top_cols[0]:
+        refresh_label = "🔄 Refresh Live Today" if mode == "Today" else f"🔄 Refresh Live {mode}"
+        if st.button(refresh_label, key=f"group_refresh_{mode}", use_container_width=True):
+            st.session_state[f"wnba_force_live_{mode}"] = True
+            if mode == "Today":
+                run_one_click_refresh_today(mode, use_ud_flag)
+            else:
+                clear_line_pull_caches(); pull_board_lines(use_ud_flag, False, False, ""); st.session_state["wnba_last_refresh"] = now_iso()
+            st.rerun()
+    with top_cols[1]:
+        meta = saved_board_meta()
+        st.metric("Last refresh", st.session_state.get("wnba_last_refresh", meta.get("SavedAt", "not yet")))
+    with top_cols[2]:
+        _cache_preview, _ = _stable_load_or_repair_cached_board(mode, master_global)
+        _db_n = 0 if master_global is None or master_global.empty else len(master_global)
+        _board_n = 0 if _cache_preview is None or _cache_preview.empty or "Player" not in _cache_preview.columns else int(_cache_preview["Player"].nunique())
+        st.metric("Database players" if _db_n > 0 else "Board players", _db_n if _db_n > 0 else _board_n)
+    with top_cols[3]:
+        st.caption(f"Grouped layout: one player card contains PTS / REB / AST / PRA. Line pull locked: {WORKING_PULL_LOCK}. Projection engine: {PROJECTION_ENGINE_VERSION}.")
+
+    force_live = bool(st.session_state.get(f"wnba_force_live_{mode}", False))
+    saved_df = load_board_snapshot(mode)
+    if not force_live and saved_df is not None and not saved_df.empty:
+        saved_df = _stable_repair_projection_board(saved_df, master_global)
+        saved_df.to_csv(CACHE_FILES["projection_board"], index=False)
+        st.success("Loaded saved lines and rebuilt them with the stable single-pass projection engine.")
+        return _render_grouped_projection_df(saved_df, mode, f"saved_group_search_{mode}", f"saved_group_max_{mode}", f"saved_group_official_only_{mode}", saved_view=True)
+
+    cached_board, cached_label = _stable_load_or_repair_cached_board(mode, master_global)
+    if not force_live and cached_board is not None and not cached_board.empty:
+        st.success(f"Loaded {len(cached_board):,} rows from the last-good {cached_label}. Player Cards and Best Bets now use the same repaired board.")
+        return _render_grouped_projection_df(cached_board, mode, f"cache_group_search_{mode}", f"cache_group_max_{mode}", f"cache_group_official_only_{mode}", saved_view=True)
+
+    lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, False, False, "")
+    lines, slate_note = filter_lines_for_slate(lines_all, mode)
+    render_source_status_card(lines_all, ud_debug, sl_debug, False, "")
+    if mode == "Today":
+        render_refresh_today_status()
+    st.caption(slate_note)
+    if lines is None or lines.empty:
+        cached_board, cached_label = _stable_load_or_repair_cached_board(mode, master_global)
+        if cached_board is not None and not cached_board.empty:
+            st.session_state[f"wnba_force_live_{mode}"] = False
+            st.warning("Live Underdog returned 0 rows, so the last-good lines were retained and projections were rebuilt with the stable engine.")
+            return _render_grouped_projection_df(cached_board, mode, f"fallback_group_search_{mode}", f"fallback_group_max_{mode}", f"fallback_group_official_only_{mode}", saved_view=True)
+        st.error("No live lines were returned and no last-good board is available. Check Debug / Status.")
+        return pd.DataFrame()
+
+    st.session_state["wnba_current_mode"] = mode
+    proj_df = make_projection_board(lines[lines["Market"].isin(MARKETS)], logs_global, master_global, mode)
+    if proj_df is None or proj_df.empty:
+        st.warning("Lines loaded, but no projection match was built. Check unmatched player names in Debug / Status.")
+        return pd.DataFrame()
+    proj_df["Slate"] = mode
+    proj_df["SlateDate"] = str(slate_target_date(mode) or "ALL")
+    proj_df = enrich_board_with_matchups(proj_df, mode)  # display/matchup labels only; no projection multiplier here
+    proj_df["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+    CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
+    proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
+    st.session_state[f"wnba_force_live_{mode}"] = False
+
+    save_cols = st.columns([1.2, 2.8])
+    with save_cols[0]:
+        if st.button("💾 Save Board", key=f"save_board_snapshot_{mode}", use_container_width=True):
+            n = save_board_snapshot(proj_df, lines_all, mode)
+            st.success(f"Saved {n:,} board rows with the stable projection version.")
+    with save_cols[1]:
+        st.caption("The working Underdog lines are preserved. Projection context is applied once; extra context fields are audit-only.")
+    return render_grouped_table_or_cards(proj_df, mode, f"live_group_{mode}", default_cards=False)
+
+
+# Repair any older inflated projection cache before Best Bets renders.
+try:
+    _startup_board = load_dataset("projection_board")
+    if _startup_board is not None and not _startup_board.empty:
+        _startup_versions = set(_startup_board.get("Projection Engine Version", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+        if PROJECTION_ENGINE_VERSION not in _startup_versions:
+            _startup_board = _stable_repair_projection_board(_startup_board, master_global)
+            save_dataset("projection_board", _startup_board)
+except Exception as _stable_startup_exc:
+    st.session_state["wnba_stable_startup_repair_error"] = str(_stable_startup_exc)[:240]
+
+
 tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
 
 with tabs[0]:
