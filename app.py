@@ -32,9 +32,10 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Player Cards/Best Bets Sync"
+APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Stable Projections + Embedded Core Data"
 LINE_PARSER_VERSION = "UD_FULL_GAME_MAINLINE_V2"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
+EMBEDDED_DATA_VERSION = "CORE_DATA_SELF_HEAL_V1"
 
 # ============================================================
 # Storage
@@ -1241,6 +1242,317 @@ def load_dataset(dataset_key: str) -> pd.DataFrame:
 
     # 3) No cache available; caller can trigger official WNBA fallback.
     return pd.DataFrame()
+
+
+# ============================================================
+# Embedded/self-healing core data
+# ============================================================
+def _read_cache_direct(dataset_key: str) -> pd.DataFrame:
+    """Read a local cache without triggering any network or Streamlit callbacks."""
+    path = CACHE_FILES.get(dataset_key)
+    if path is None or not Path(path).exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path, low_memory=False)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _first_existing_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
+    if df is None or df.empty:
+        return None
+    lowered = {str(c).strip().lower(): c for c in df.columns}
+    for name in names:
+        if str(name).strip().lower() in lowered:
+            return lowered[str(name).strip().lower()]
+    return find_col(df, names)
+
+
+def _derive_player_season_from_logs() -> pd.DataFrame:
+    """Create player season averages from the already cached game logs.
+
+    This is a deterministic local fallback. It does not touch the Underdog
+    request, line parser, or projection-side selection logic.
+    """
+    raw = _read_cache_direct("player_game_logs")
+    logs = standardize_player_logs(raw) if raw is not None and not raw.empty else pd.DataFrame()
+    if logs is None or logs.empty:
+        return pd.DataFrame()
+
+    d = logs.copy()
+    if "Played" in d.columns:
+        played = d["Played"].fillna(False).astype(bool)
+        if played.any():
+            d = d[played].copy()
+    if "MIN" in d.columns and (pd.to_numeric(d["MIN"], errors="coerce") > 0).any():
+        d = d[pd.to_numeric(d["MIN"], errors="coerce") > 0].copy()
+    if d.empty:
+        return pd.DataFrame()
+
+    if "Season" not in d.columns or pd.to_numeric(d["Season"], errors="coerce").isna().all():
+        d["Season"] = pd.to_datetime(d.get("GameDate"), errors="coerce").dt.year
+    d["Season"] = pd.to_numeric(d["Season"], errors="coerce").fillna(datetime.utcnow().year).astype(int)
+    d["NameKey"] = d.get("NameKey", d.get("Player", "")).map(normalize_name)
+    d = d[d["NameKey"].astype(str).str.len() > 0].copy()
+
+    stat_cols = ["MIN", "PTS", "REB", "AST", "FGA", "FGM", "FG3A", "FG3M", "FTA", "FTM", "TOV", "OREB", "DREB", "STL", "BLK"]
+    for c in stat_cols:
+        d[c] = pd.to_numeric(d.get(c, np.nan), errors="coerce")
+
+    # Latest team/name on the season wins, which handles midseason team changes.
+    sort_cols = [c for c in ["Season", "GameDate"] if c in d.columns]
+    latest = d.sort_values(sort_cols if sort_cols else ["Season"]).groupby(["NameKey", "Season"], as_index=False).tail(1)
+    latest_map = latest.set_index(["NameKey", "Season"])
+
+    agg_map = {c: (c, "mean") for c in stat_cols}
+    grouped = d.groupby(["NameKey", "Season"], as_index=False).agg(**agg_map)
+    counts = d.groupby(["NameKey", "Season"], as_index=False).size().rename(columns={"size": "GP"})
+    grouped = grouped.merge(counts, on=["NameKey", "Season"], how="left")
+
+    grouped["Player"] = [
+        latest_map.loc[(nk, season), "Player"] if (nk, season) in latest_map.index else nk
+        for nk, season in zip(grouped["NameKey"], grouped["Season"])
+    ]
+    grouped["Team"] = [
+        latest_map.loc[(nk, season), "Team"] if (nk, season) in latest_map.index else ""
+        for nk, season in zip(grouped["NameKey"], grouped["Season"])
+    ]
+    grouped["PRA"] = grouped["PTS"].fillna(0) + grouped["REB"].fillna(0) + grouped["AST"].fillna(0)
+    denom_ts = 2 * (grouped["FGA"].fillna(0) + 0.44 * grouped["FTA"].fillna(0))
+    grouped["TS%"] = np.where(denom_ts > 0, grouped["PTS"].fillna(0) / denom_ts, np.nan)
+    grouped["eFG%"] = np.where(
+        grouped["FGA"].fillna(0) > 0,
+        (grouped["FGM"].fillna(0) + 0.5 * grouped["FG3M"].fillna(0)) / grouped["FGA"].fillna(0),
+        np.nan,
+    )
+    grouped["UsageProxy"] = grouped["FGA"].fillna(0) + 0.44 * grouped["FTA"].fillna(0) + grouped["TOV"].fillna(0)
+    grouped["USG%"] = np.nan
+    grouped["AST%"] = np.nan
+    grouped["TRB%"] = np.nan
+    grouped["PER"] = np.nan
+    grouped["EmbeddedDataSource"] = "DERIVED_FROM_PLAYER_GAME_LOGS"
+    grouped["EmbeddedDataVersion"] = EMBEDDED_DATA_VERSION
+    grouped["DerivedAt"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    ordered = ["Player", "Team", "Season", "GP", "MIN", "PTS", "REB", "AST", "PRA", "FGA", "FGM", "FG3A", "FG3M", "FTA", "FTM", "TOV", "OREB", "DREB", "STL", "BLK", "USG%", "TS%", "eFG%", "AST%", "TRB%", "PER", "UsageProxy", "NameKey", "EmbeddedDataSource", "EmbeddedDataVersion", "DerivedAt"]
+    return grouped[[c for c in ordered if c in grouped.columns]].copy()
+
+
+def _derive_player_season_from_master() -> pd.DataFrame:
+    """Fallback when only the compact master feature table is available."""
+    m = _read_cache_direct("master_features")
+    if m is None or m.empty:
+        return pd.DataFrame()
+    player_col = _first_existing_col(m, ["Player", "Matched Player", "PLAYER_NAME", "player_name", "Name"])
+    if not player_col:
+        return pd.DataFrame()
+    team_col = _first_existing_col(m, ["Team", "TEAM_ABBREVIATION", "team_abbreviation"])
+    season_col = _first_existing_col(m, ["Season", "SEASON", "year"])
+    out = pd.DataFrame()
+    out["Player"] = m[player_col].astype(str)
+    out["Team"] = m[team_col].astype(str) if team_col else ""
+    out["Season"] = pd.to_numeric(m[season_col], errors="coerce") if season_col else datetime.utcnow().year
+
+    aliases = {
+        "GP": ["Games", "GP", "games_played"],
+        "MIN": ["MIN_avg", "MIN", "MIN_season", "MinutesProjectionBase", "MIN Proj"],
+        "PTS": ["PTS_avg", "PTS_season", "PTS", "Season PTS Avg"],
+        "REB": ["REB_avg", "REB_season", "REB", "Season REB Avg"],
+        "AST": ["AST_avg", "AST_season", "AST", "Season AST Avg"],
+        "FGA": ["FGA_avg", "FGA_season", "FGA", "Projected FGA"],
+        "FGM": ["FGM_avg", "FGM_season", "FGM"],
+        "FG3A": ["FG3A_avg", "FG3A_season", "FG3A", "ThreePA"],
+        "FG3M": ["FG3M_avg", "FG3M_season", "FG3M"],
+        "FTA": ["FTA_avg", "FTA_season", "FTA"],
+        "FTM": ["FTM_avg", "FTM_season", "FTM"],
+        "TOV": ["TOV_avg", "TOV_season", "TOV"],
+        "OREB": ["OREB_avg", "OREB_season", "OREB"],
+        "DREB": ["DREB_avg", "DREB_season", "DREB"],
+    }
+    for target, candidates in aliases.items():
+        col = _first_existing_col(m, candidates)
+        out[target] = pd.to_numeric(m[col], errors="coerce") if col else np.nan
+    out["GP"] = out["GP"].fillna(0)
+    out["PRA"] = out["PTS"].fillna(0) + out["REB"].fillna(0) + out["AST"].fillna(0)
+    denom_ts = 2 * (out["FGA"].fillna(0) + 0.44 * out["FTA"].fillna(0))
+    out["TS%"] = np.where(denom_ts > 0, out["PTS"].fillna(0) / denom_ts, np.nan)
+    out["eFG%"] = np.where(out["FGA"].fillna(0) > 0, (out["FGM"].fillna(0) + 0.5*out["FG3M"].fillna(0))/out["FGA"].fillna(0), np.nan)
+    out["UsageProxy"] = out["FGA"].fillna(0) + 0.44*out["FTA"].fillna(0) + out["TOV"].fillna(0)
+    for c in ["USG%", "AST%", "TRB%", "PER"]:
+        out[c] = np.nan
+    out["NameKey"] = out["Player"].map(normalize_name)
+    out["EmbeddedDataSource"] = "DERIVED_FROM_MASTER_FEATURES"
+    out["EmbeddedDataVersion"] = EMBEDDED_DATA_VERSION
+    out["DerivedAt"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    out = out[out["NameKey"].astype(str).str.len() > 0].drop_duplicates(["NameKey", "Season"], keep="last")
+    return out
+
+
+def _derive_rosters_from_existing_cache() -> pd.DataFrame:
+    """Build a current roster table from game rosters, master features and logs."""
+    parts = []
+
+    gr_raw = _read_cache_direct("game_rosters")
+    if gr_raw is not None and not gr_raw.empty:
+        gr = standardize_game_rosters(gr_raw)
+        if gr is not None and not gr.empty:
+            gr["RosterPriority"] = 3
+            parts.append(gr)
+
+    m = _read_cache_direct("master_features")
+    if m is not None and not m.empty:
+        player_col = _first_existing_col(m, ["Player", "Matched Player", "PLAYER_NAME", "player_name", "Name"])
+        if player_col:
+            mm = pd.DataFrame()
+            mm["Player"] = m[player_col].astype(str)
+            team_col = _first_existing_col(m, ["Team", "TEAM_ABBREVIATION", "team_abbreviation"])
+            pos_col = _first_existing_col(m, ["Position", "Pos", "PositionGroup", "position"])
+            season_col = _first_existing_col(m, ["Season", "SEASON", "year"])
+            mm["Team"] = m[team_col].astype(str) if team_col else ""
+            mm["Position"] = m[pos_col].astype(str) if pos_col else ""
+            mm["Season"] = pd.to_numeric(m[season_col], errors="coerce") if season_col else datetime.utcnow().year
+            mm["GameDate"] = pd.NaT
+            mm["NameKey"] = mm["Player"].map(normalize_name)
+            mm["RosterPriority"] = 2
+            parts.append(mm)
+
+    logs_raw = _read_cache_direct("player_game_logs")
+    if logs_raw is not None and not logs_raw.empty:
+        lg = standardize_player_logs(logs_raw)
+        if lg is not None and not lg.empty:
+            ll = lg[[c for c in ["Player", "Team", "Season", "GameDate", "NameKey"] if c in lg.columns]].copy()
+            ll["Position"] = ""
+            ll["RosterPriority"] = 1
+            parts.append(ll)
+
+    if not parts:
+        return pd.DataFrame()
+    allr = pd.concat(parts, ignore_index=True, sort=False)
+    allr["NameKey"] = allr.get("NameKey", allr.get("Player", "")).map(normalize_name)
+    allr["Season"] = pd.to_numeric(allr.get("Season", datetime.utcnow().year), errors="coerce").fillna(datetime.utcnow().year).astype(int)
+    allr["GameDate"] = pd.to_datetime(allr.get("GameDate"), errors="coerce")
+    allr["RosterPriority"] = pd.to_numeric(allr.get("RosterPriority", 0), errors="coerce").fillna(0)
+    allr = allr[allr["NameKey"].astype(str).str.len() > 0].copy()
+
+    # Latest dated record first, then the richest source for position/team.
+    allr["DateRank"] = allr["GameDate"].fillna(pd.Timestamp("1900-01-01"))
+    allr = allr.sort_values(["NameKey", "Season", "DateRank", "RosterPriority"])
+    latest = allr.groupby(["NameKey", "Season"], as_index=False).tail(1).copy()
+
+    # Fill missing position/team from any richer row for the same player-season.
+    for col in ["Team", "Position", "Player"]:
+        if col not in latest.columns:
+            latest[col] = ""
+        lookup = (
+            allr[allr[col].fillna("").astype(str).str.strip().ne("")]
+            .sort_values(["NameKey", "Season", "RosterPriority", "DateRank"])
+            .groupby(["NameKey", "Season"])[col]
+            .last()
+        )
+        latest[col] = [
+            val if str(val or "").strip() else lookup.get((nk, season), "")
+            for val, nk, season in zip(latest[col], latest["NameKey"], latest["Season"])
+        ]
+    latest["PositionGroup"] = latest["Position"].map(position_group)
+    latest["Active"] = True
+    latest["EmbeddedDataSource"] = "DERIVED_FROM_CACHED_ROSTER_CONTEXT"
+    latest["EmbeddedDataVersion"] = EMBEDDED_DATA_VERSION
+    latest["DerivedAt"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    cols = ["Player", "Team", "Position", "PositionGroup", "Season", "NameKey", "Active", "EmbeddedDataSource", "EmbeddedDataVersion", "DerivedAt"]
+    return latest[[c for c in cols if c in latest.columns]].drop_duplicates(["NameKey", "Season"], keep="last")
+
+
+def _enrich_master_with_embedded_core(season_df: pd.DataFrame, roster_df: pd.DataFrame) -> int:
+    """Fill only missing master columns; never overwrite verified values."""
+    master = _read_cache_direct("master_features")
+    if master is None or master.empty:
+        return 0
+    m = master.copy()
+    if "NameKey" not in m.columns:
+        player_col = _first_existing_col(m, ["Player", "Matched Player", "PLAYER_NAME", "player_name", "Name"])
+        if not player_col:
+            return 0
+        m["NameKey"] = m[player_col].map(normalize_name)
+
+    if roster_df is not None and not roster_df.empty:
+        rr = roster_df.drop_duplicates("NameKey", keep="last").set_index("NameKey")
+        for target, source in [("Team", "Team"), ("Position", "Position"), ("PositionGroup", "PositionGroup")]:
+            mapped = m["NameKey"].map(rr[source]) if source in rr.columns else pd.Series(index=m.index, dtype=object)
+            if target not in m.columns:
+                m[target] = mapped
+            else:
+                blank = m[target].isna() | m[target].astype(str).str.strip().isin(["", "nan", "None", "Unknown"])
+                m.loc[blank, target] = mapped[blank]
+
+    if season_df is not None and not season_df.empty:
+        ss = season_df.sort_values("Season").drop_duplicates("NameKey", keep="last").set_index("NameKey")
+        pairs = {
+            "MIN_avg": "MIN", "PTS_avg": "PTS", "REB_avg": "REB", "AST_avg": "AST",
+            "PRA_avg": "PRA", "FGA_avg": "FGA", "FG3A_avg": "FG3A", "FTA_avg": "FTA",
+            "Games": "GP", "TS%_Season": "TS%", "eFG%_Season": "eFG%",
+        }
+        for target, source in pairs.items():
+            if source not in ss.columns:
+                continue
+            mapped = pd.to_numeric(m["NameKey"].map(ss[source]), errors="coerce")
+            if target not in m.columns:
+                m[target] = mapped
+            else:
+                existing = pd.to_numeric(m[target], errors="coerce")
+                m[target] = existing.where(existing.notna(), mapped)
+    m["EmbeddedCoreDataVersion"] = EMBEDDED_DATA_VERSION
+    save_dataset("master_features", m)
+    return len(m)
+
+
+def ensure_embedded_core_cache_files() -> pd.DataFrame:
+    """Self-heal the two optional core datasets from already bundled caches.
+
+    Priority remains:
+      1. Existing verified CSV committed to the repository
+      2. Locally derived season/roster cache from game logs/master features
+
+    Nothing in this function calls or modifies Underdog.
+    """
+    rows = []
+
+    season_existing = _read_cache_direct("player_season_stats")
+    if season_existing is None or season_existing.empty:
+        season_df = _derive_player_season_from_logs()
+        if season_df.empty:
+            season_df = _derive_player_season_from_master()
+        if not season_df.empty:
+            save_dataset("player_season_stats", season_df)
+            rows.append({"Dataset": "player_season_stats", "Status": "created locally", "Rows": len(season_df), "Source": season_df.get("EmbeddedDataSource", pd.Series([""])).iloc[0]})
+        else:
+            rows.append({"Dataset": "player_season_stats", "Status": "still unavailable", "Rows": 0, "Source": "no usable logs/master"})
+    else:
+        season_df = season_existing
+        rows.append({"Dataset": "player_season_stats", "Status": "existing cache preserved", "Rows": len(season_df), "Source": "repository/runtime cache"})
+
+    roster_existing = _read_cache_direct("rosters")
+    if roster_existing is None or roster_existing.empty:
+        roster_df = _derive_rosters_from_existing_cache()
+        if not roster_df.empty:
+            save_dataset("rosters", roster_df)
+            rows.append({"Dataset": "rosters", "Status": "created locally", "Rows": len(roster_df), "Source": roster_df.get("EmbeddedDataSource", pd.Series([""])).iloc[0]})
+        else:
+            rows.append({"Dataset": "rosters", "Status": "still unavailable", "Rows": 0, "Source": "no usable roster/master/logs"})
+    else:
+        roster_df = roster_existing
+        rows.append({"Dataset": "rosters", "Status": "existing cache preserved", "Rows": len(roster_df), "Source": "repository/runtime cache"})
+
+    try:
+        master_rows = _enrich_master_with_embedded_core(season_df, roster_df)
+        rows.append({"Dataset": "master_features", "Status": "missing fields backfilled" if master_rows else "no master change", "Rows": master_rows, "Source": EMBEDDED_DATA_VERSION})
+    except Exception as exc:
+        rows.append({"Dataset": "master_features", "Status": "backfill skipped", "Rows": 0, "Source": str(exc)[:120]})
+
+    report = pd.DataFrame(rows)
+    try:
+        (LOCAL_DIR / "embedded_core_data_status.json").write_text(json.dumps(rows, indent=2, default=str))
+    except Exception:
+        pass
+    return report
 
 # ============================================================
 # Feature builders
@@ -5960,6 +6272,11 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
 # Streamlit app
 # ============================================================
 st.set_page_config(page_title="ONE WAY PICKZ WNBA", page_icon="🏀", layout="wide")
+try:
+    _embedded_core_report = ensure_embedded_core_cache_files()
+    st.session_state["embedded_core_data_report"] = _embedded_core_report.to_dict("records") if _embedded_core_report is not None else []
+except Exception as _embedded_core_error:
+    st.session_state["embedded_core_data_report"] = [{"Dataset": "embedded_core", "Status": "startup fallback skipped", "Rows": 0, "Source": str(_embedded_core_error)[:140]}]
 inject_css()
 st.markdown("<div class='owp-header'>🏀 ONE WAY PICKZ — WNBA Prop Engine</div>", unsafe_allow_html=True)
 st.caption(APP_VERSION + " — MLB-style Today/Tomorrow refresh → save before → grade after workflow")
@@ -8780,7 +9097,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Player Cards/Best Bets Sync"
+APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Stable Projections + Embedded Core Data"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -10741,6 +11058,11 @@ with tabs[5]:
     st.caption("Diagnostics only. Heavy imports/rebuilds are in Data Manager and never run automatically.")
     st.markdown("### Data status")
     st.dataframe(dataset_status_table(), use_container_width=True)
+    embedded_report = pd.DataFrame(st.session_state.get("embedded_core_data_report", []))
+    if not embedded_report.empty:
+        with st.expander("Embedded core-data self-heal", expanded=False):
+            st.caption("Automatically creates player season stats and rosters from cached game logs/master features when the repository files are missing. The Underdog line pull is untouched.")
+            st.dataframe(embedded_report, use_container_width=True)
     st.markdown("### Aggregated real lines")
     lines, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud, False, False, "")
     render_source_status_card(lines, ud_debug, sl_debug, False, "")
