@@ -9480,12 +9480,256 @@ def _v345_sustainable_projection(row: pd.Series) -> float:
     return final
 
 
+
+# ================================================================
+# v3.4.8 EVIDENCE-BOUNDED CONTEXT LAYERS
+# Adds role/opportunity context without rewriting the calibrated core.
+# Every projection change is symmetric, data-gated, auditable, and capped.
+# ================================================================
+
+def _v348_first_num(row: pd.Series, names, default=np.nan):
+    for name in names:
+        try:
+            value = _v345_num(row.get(name))
+            if pd.notna(value):
+                return value
+        except Exception:
+            pass
+    return default
+
+
+def _v348_text(row: pd.Series, names) -> str:
+    return " ".join(str(row.get(name, "")) for name in names).upper()
+
+
+def _v348_role_verified(row: pd.Series) -> bool:
+    txt = _v348_text(row, [
+        "Injury Status", "Availability", "Lineup Status", "Starter Status",
+        "Role", "Injury Context Note", "Projected Rotation Note"
+    ])
+    positive = any(tag in txt for tag in [
+        "CONFIRMED START", "NEW STARTER", "STARTING IN PLACE", "ROLE CHANGE",
+        "TEAMMATE OUT", "USAGE BUMP", "MINUTES BUMP"
+    ])
+    uncertain = any(tag in txt for tag in ["QUESTIONABLE", "GTD", "GAME TIME DECISION", "MINUTES LIMIT"])
+    return positive and not uncertain
+
+
+def _v348_blowout_context(row: pd.Series, projected_minutes: float) -> dict:
+    spread = _v348_first_num(row, ["Spread", "Game Spread", "Vegas Spread", "Team Spread", "Market Spread"])
+    existing = _v348_first_num(row, ["Blowout Risk", "Blowout Risk %", "BlowoutRisk", "Blowout Probability"])
+    if pd.notna(existing):
+        risk = existing * 100.0 if 0 <= existing <= 1 else existing
+    elif pd.notna(spread):
+        # Smooth probability proxy: near pick'em ~10%; 10+ point spread ~45%.
+        risk = float(np.clip(8.0 + abs(spread) * 3.7, 8.0, 55.0))
+    else:
+        risk = 15.0
+    star_minutes = pd.notna(projected_minutes) and projected_minutes >= 28
+    # Expected-minute tax only; never a direct stat-rate penalty.
+    minute_tax = 0.0
+    if star_minutes and risk >= 45:
+        minute_tax = -0.025
+    elif star_minutes and risk >= 32:
+        minute_tax = -0.012
+    note = "High blowout watch" if risk >= 45 else "Moderate blowout watch" if risk >= 32 else "Low/neutral blowout risk"
+    return {"risk": float(np.clip(risk, 0, 100)), "minute_tax": minute_tax, "note": note}
+
+
+def _v348_minutes_context(row: pd.Series) -> dict:
+    current = _v348_first_num(row, ["MIN Proj", "Projected Minutes", "Minutes Projection"])
+    l3 = _v348_first_num(row, ["MIN_l3", "Minutes L3", "L3 Minutes"])
+    l5 = _v348_first_num(row, ["MIN_l5", "Minutes L5", "L5 Minutes"])
+    l10 = _v348_first_num(row, ["MIN_l10", "Minutes L10", "L10 Minutes"])
+    season = _v348_first_num(row, ["MIN_avg", "Season Minutes", "MIN", "Minutes Avg"])
+    vals = [v for v in [l3, l5, l10, season, current] if pd.notna(v) and v > 0]
+    if not vals:
+        return {"minutes": current, "factor": 1.0, "confidence": 45.0, "blowout": _v348_blowout_context(row, current), "note": "No reliable minute history"}
+    med = float(np.median(vals))
+    l3 = med if pd.isna(l3) else l3
+    l5 = med if pd.isna(l5) else l5
+    l10 = med if pd.isna(l10) else l10
+    season = med if pd.isna(season) else season
+    current = med if pd.isna(current) else current
+    predicted = 0.16*l3 + 0.34*l5 + 0.32*l10 + 0.18*season
+    if _v348_role_verified(row):
+        predicted = 0.68*predicted + 0.32*current
+    else:
+        predicted = 0.84*predicted + 0.16*current
+    blow = _v348_blowout_context(row, predicted)
+    predicted *= (1.0 + blow["minute_tax"])
+    dispersion = float(np.std([l3, l5, l10, season]))
+    confidence = float(np.clip(96.0 - 7.5*dispersion - abs(current-predicted)*1.8, 45, 96))
+    baseline = max(1.0, 0.40*l10 + 0.35*l5 + 0.25*season)
+    raw_factor = predicted / baseline
+    cap = 0.055 if _v348_role_verified(row) and confidence >= 75 else 0.035
+    factor = float(np.clip(raw_factor, 1-cap, 1+cap))
+    return {"minutes": float(np.clip(predicted, 4, 40.5)), "factor": factor, "confidence": confidence, "blowout": blow, "note": f"L3/L5/L10/season rotation blend; {blow['note']}"}
+
+
+def _v348_usage_context(row: pd.Series, market: str) -> dict:
+    # Prefer true usage fields; fall back to possession-volume proxies.
+    u3 = _v348_first_num(row, ["USG_l3", "Usage L3", "L3 Usage", "USG% L3"])
+    u5 = _v348_first_num(row, ["USG_l5", "Usage L5", "L5 Usage", "USG% L5", "usage_roll5"])
+    u10 = _v348_first_num(row, ["USG_l10", "Usage L10", "L10 Usage", "USG% L10"])
+    useason = _v348_first_num(row, ["USG%", "Usage", "Season Usage", "Usage Proxy"])
+    vals = [v for v in [u3,u5,u10,useason] if pd.notna(v) and v > 0]
+    if market not in {"PTS","AST","PRA"} or len(vals) < 2:
+        return {"factor":1.0,"confidence":45.0,"trend":0.0,"note":"Usage neutral / unavailable"}
+    med=float(np.median(vals))
+    u3=med if pd.isna(u3) else u3; u5=med if pd.isna(u5) else u5; u10=med if pd.isna(u10) else u10; useason=med if pd.isna(useason) else useason
+    recent=0.20*u3+0.38*u5+0.42*u10
+    baseline=max(0.1,0.60*u10+0.40*useason)
+    trend=(recent-baseline)/baseline
+    cap=0.045 if _v348_role_verified(row) else 0.025
+    # AST is less directly usage-driven than scoring.
+    sensitivity=0.70 if market=="AST" else 1.0
+    factor=float(np.clip(1.0+trend*sensitivity,1-cap,1+cap))
+    dispersion=float(np.std([u3,u5,u10,useason]))
+    confidence=float(np.clip(90-dispersion*2.5,45,92))
+    return {"factor":factor,"confidence":confidence,"trend":trend,"note":f"Recent usage {'up' if trend>0.02 else 'down' if trend<-0.02 else 'stable'} ({trend:+.1%})"}
+
+
+def _v348_possession_context(row: pd.Series) -> dict:
+    game_pace = _v348_first_num(row, ["Projected Pace", "Game Pace", "Pace Projection", "Expected Possessions"])
+    team_pace = _v348_first_num(row, ["Team Pace", "Own Team Pace"])
+    opp_pace = _v348_first_num(row, ["Opponent Pace", "Opp Pace"])
+    league = _v348_first_num(row, ["League Pace", "League Avg Pace"], 80.0)
+    vals=[v for v in [game_pace,team_pace,opp_pace] if pd.notna(v) and v>0]
+    if not vals or pd.isna(league) or league<=0:
+        return {"factor":1.0,"possessions":np.nan,"note":"Possession pace neutral"}
+    projected = game_pace if pd.notna(game_pace) else float(np.mean(vals))
+    # Normalize NBA-style 95–105 values to WNBA 76–84 scale if necessary.
+    if projected > 90 and league <= 90:
+        projected *= 0.80
+    factor=float(np.clip(projected/league,0.985,1.015))
+    return {"factor":factor,"possessions":projected,"note":f"Projected game pace {projected:.1f}"}
+
+
+def _v348_shot_volume_context(row: pd.Series, market: str, minutes: float) -> dict:
+    if market not in {"PTS","PRA"}:
+        return {"factor":1.0,"fga":np.nan,"three_pa":np.nan,"fta":np.nan,"note":"Shot-volume layer not used"}
+    fga5=_v348_first_num(row,["FGA_l5","FGA L5","L5 FGA"])
+    fga10=_v348_first_num(row,["FGA_l10","FGA L10","L10 FGA"])
+    fgaseason=_v348_first_num(row,["FGA_avg","Season FGA","FGA"])
+    three5=_v348_first_num(row,["3PA_l5","3PA L5","L5 3PA"])
+    three10=_v348_first_num(row,["3PA_l10","3PA L10","L10 3PA"])
+    threeseason=_v348_first_num(row,["3PA_avg","Season 3PA","3PA"])
+    fta5=_v348_first_num(row,["FTA_l5","FTA L5","L5 FTA"])
+    fta10=_v348_first_num(row,["FTA_l10","FTA L10","L10 FTA"])
+    ftaseason=_v348_first_num(row,["FTA_avg","Season FTA","FTA"])
+    fgas=[v for v in [fga5,fga10,fgaseason] if pd.notna(v) and v>=0]
+    if len(fgas)<2:
+        return {"factor":1.0,"fga":_v348_first_num(row,["Projected FGA","FGA Projection"]),"three_pa":np.nan,"fta":np.nan,"note":"Shot volume neutral / limited"}
+    med=float(np.median(fgas)); fga5=med if pd.isna(fga5) else fga5; fga10=med if pd.isna(fga10) else fga10; fgaseason=med if pd.isna(fgaseason) else fgaseason
+    projected_fga=0.36*fga5+0.40*fga10+0.24*fgaseason
+    baseline=max(0.5,0.58*fga10+0.42*fgaseason)
+    volume_trend=(projected_fga-baseline)/baseline
+    cap=0.035 if _v348_role_verified(row) else 0.022
+    factor=float(np.clip(1.0+volume_trend,1-cap,1+cap))
+    def blend(a,b,c):
+        vals=[v for v in [a,b,c] if pd.notna(v)]
+        if not vals: return np.nan
+        m=float(np.median(vals)); a=m if pd.isna(a) else a; b=m if pd.isna(b) else b; c=m if pd.isna(c) else c
+        return 0.36*a+0.40*b+0.24*c
+    return {"factor":factor,"fga":projected_fga,"three_pa":blend(three5,three10,threeseason),"fta":blend(fta5,fta10,ftaseason),"note":f"Shot volume {'up' if volume_trend>0.02 else 'down' if volume_trend<-0.02 else 'stable'} ({volume_trend:+.1%})"}
+
+
+def _v348_rebound_context(row: pd.Series, market: str) -> dict:
+    if market not in {"REB","PRA"}:
+        return {"factor":1.0,"note":"Rebound-opportunity layer not used"}
+    chances5=_v348_first_num(row,["Rebound Chances L5","REB Chances L5","ReboundChances_l5"])
+    chances10=_v348_first_num(row,["Rebound Chances L10","REB Chances L10","ReboundChances_l10"])
+    chances_season=_v348_first_num(row,["Rebound Chances","Season Rebound Chances","ReboundChances_avg"])
+    opp_fg=_v348_first_num(row,["Opponent FG%","Opp FG%","Opponent eFG%"])
+    opp_reb_rank=_v348_first_num(row,["Opponent REB Rank","REB Market Rank"])
+    teams=_v348_first_num(row,["Opponent Market Rank Teams","Teams Ranked"],13)
+    vals=[v for v in [chances5,chances10,chances_season] if pd.notna(v) and v>=0]
+    trend=0.0
+    if len(vals)>=2:
+        med=float(np.median(vals)); chances5=med if pd.isna(chances5) else chances5; chances10=med if pd.isna(chances10) else chances10; chances_season=med if pd.isna(chances_season) else chances_season
+        recent=0.42*chances5+0.58*chances10
+        base=max(0.5,0.58*chances10+0.42*chances_season)
+        trend=(recent-base)/base
+    miss_env=0.0
+    if pd.notna(opp_fg):
+        fg=opp_fg/100.0 if opp_fg>1 else opp_fg
+        miss_env=float(np.clip((0.445-fg)*0.18,-0.010,0.010))
+    rank_env=0.0
+    if pd.notna(opp_reb_rank) and pd.notna(teams) and teams>=6:
+        pct=(opp_reb_rank-1)/max(1,teams-1)
+        rank_env=float(np.clip((pct-0.5)*0.018,-0.009,0.009))
+    factor=float(np.clip(1.0+trend*0.45+miss_env+rank_env,0.975,1.025))
+    return {"factor":factor,"note":f"Rebound chances trend {trend:+.1%}; miss/rank environment bounded"}
+
+
+def _v348_volatility_context(row: pd.Series, market: str) -> dict:
+    vals=[_v345_num(row.get(c)) for c in ["L5 Avg","L10 Avg","L20 Avg","Season Avg"]]
+    vals=[v for v in vals if pd.notna(v)]
+    if len(vals)<2:
+        return {"score":70.0,"tier":"MEDIUM","sd_mult":1.08,"confidence_tax":5.0}
+    mean=max(0.5,float(np.mean(vals))); cv=float(np.std(vals)/mean)
+    score=float(np.clip(35+cv*180,25,95))
+    tier="HIGH" if score>=72 else "LOW" if score<=45 else "MEDIUM"
+    sd_mult=1.16 if tier=="HIGH" else 0.96 if tier=="LOW" else 1.04
+    confidence_tax=8.0 if tier=="HIGH" else 0.0 if tier=="LOW" else 3.0
+    return {"score":score,"tier":tier,"sd_mult":sd_mult,"confidence_tax":confidence_tax}
+
+
+def _v348_market_intelligence(row: pd.Series, projection: float) -> dict:
+    line=_v345_num(row.get("Line")); open_line=_v348_first_num(row,["Opening Line","Open Line","Line Open"])
+    consensus=_v348_first_num(row,["Consensus Line","Market Consensus","Median Market Line"])
+    current_ref=consensus if pd.notna(consensus) else line
+    disagreement=projection-current_ref if pd.notna(projection) and pd.notna(current_ref) else np.nan
+    movement=(line-open_line) if pd.notna(line) and pd.notna(open_line) else np.nan
+    flag="NORMAL"
+    tax=0.0
+    if pd.notna(disagreement) and abs(disagreement)>=5:
+        flag="LARGE MODEL/MARKET DISAGREEMENT"; tax=7.0
+    elif pd.notna(disagreement) and abs(disagreement)>=3:
+        flag="MODERATE MODEL/MARKET DISAGREEMENT"; tax=3.5
+    return {"disagreement":disagreement,"movement":movement,"flag":flag,"confidence_tax":tax}
+
+
+def _v348_enhance_projection(row: pd.Series, base_projection: float, market: str) -> tuple:
+    if pd.isna(base_projection):
+        return base_projection, {}
+    minutes=_v348_minutes_context(row)
+    usage=_v348_usage_context(row,market)
+    poss=_v348_possession_context(row)
+    shots=_v348_shot_volume_context(row,market,minutes.get("minutes",np.nan))
+    reb=_v348_rebound_context(row,market)
+    # Multiplicative modules are combined in log space and globally capped.
+    factors=[minutes["factor"],usage["factor"],poss["factor"],shots["factor"],reb["factor"]]
+    log_move=sum(float(np.log(max(0.85,min(1.15,f)))) for f in factors if pd.notna(f))
+    total_cap=0.070 if _v348_role_verified(row) else 0.045
+    total_factor=float(np.exp(np.clip(log_move,np.log(1-total_cap),np.log(1+total_cap))))
+    final=float(base_projection*total_factor)
+    # Robust final guardrail around the already calibrated baseline.
+    width={"PTS":2.4,"REB":1.0,"AST":0.95,"PRA":3.6}.get(market,2.0)
+    final=float(np.clip(final,max(0.0,base_projection-width),base_projection+width))
+    market_ctx=_v348_market_intelligence(row,final)
+    vol=_v348_volatility_context(row,market)
+    audit={
+        "minutes":minutes,"usage":usage,"possession":poss,"shots":shots,"rebound":reb,
+        "volatility":vol,"market":market_ctx,"total_factor":total_factor,
+        "base_projection":base_projection,"final_projection":final,
+    }
+    return final,audit
+
 def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     if board is None or board.empty:
         return board
     out = board.copy()
     out["Projection Before Final Side Fix"] = pd.to_numeric(out.get("Projection"), errors="coerce")
     out["Projection"] = out.apply(_v345_sustainable_projection, axis=1)
+    _v348_audits = {}
+    for _idx, _r in out.iterrows():
+        _market = str(_r.get("Market", "PTS")).upper()
+        _base_proj = _v345_num(out.at[_idx, "Projection"])
+        _final_proj, _audit = _v348_enhance_projection(_r, _base_proj, _market)
+        out.at[_idx, "Projection"] = _final_proj
+        _v348_audits[_idx] = _audit
 
     # PRA must equal the final displayed PTS + REB + AST whenever all components
     # are available for that player/team/opponent slate.
@@ -9513,10 +9757,13 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
     for _, rr in out.iterrows():
         row = rr.copy()
         market = str(row.get("Market", "PTS")).upper()
+        audit = _v348_audits.get(row.name, {})
         proj = _v345_num(row.get("Projection"))
         line = _v345_num(row.get("Line"))
         edge = proj-line if pd.notna(proj) and pd.notna(line) else np.nan
         sd = _v345_market_sd(row, market, proj)
+        vol_ctx = audit.get("volatility", {})
+        sd = float(np.clip(sd * _v345_num(vol_ctx.get("sd_mult"), 1.0), 0.5, 15.0))
         overp = _v345_norm_over(line, proj, sd)
         underp = 100.0-overp
 
@@ -9538,6 +9785,9 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
         votes = sum(1 for x in baseline_vals if pd.notna(line) and ((x>line)==(lean=="OVER"))) if lean in {"OVER","UNDER"} else 0
         edge_score = float(np.clip(50 + abs(edge if pd.notna(edge) else 0)*{"PTS":7.0,"REB":12.0,"AST":12.0,"PRA":4.0}.get(market,7.0), 0, 100))
         data_score = 92.0 if integrity=="VERIFIED" else 62.0
+        market_ctx = audit.get("market", {})
+        confidence_tax = _v345_num(vol_ctx.get("confidence_tax"), 0.0) + _v345_num(market_ctx.get("confidence_tax"), 0.0)
+        data_score = float(np.clip(data_score - confidence_tax, 35, 96))
         hit_score = float(np.clip(0.52*sidep + 0.20*edge_score + 0.16*data_score + 0.12*(40+votes*14), 0, 100))
 
         official_edge = {"PTS":1.60,"REB":0.85,"AST":0.85,"PRA":2.40}.get(market,1.50)
@@ -9554,6 +9804,10 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
         if pd.isna(edge) or abs(edge)<official_edge: reasons.append("edge below official threshold")
         if sidep<official_prob: reasons.append("probability below official threshold")
         if votes<2: reasons.append("recent/season support is weak")
+        blow_ctx = audit.get("minutes", {}).get("blowout", {})
+        if _v345_num(blow_ctx.get("risk"), 0) >= 45 and market in {"PTS","PRA"}: reasons.append("high blowout/minutes volatility")
+        if str(vol_ctx.get("tier", "MEDIUM")) == "HIGH" and sidep < 62: reasons.append("high player volatility")
+        if str(market_ctx.get("flag", "NORMAL")) == "LARGE MODEL/MARKET DISAGREEMENT": reasons.append("large model/market disagreement")
         official = "PASS" if reasons else ("🔥 OVER" if lean=="OVER" else "⚠️ UNDER")
 
         row["Projection"] = round(proj,2) if pd.notna(proj) else np.nan
@@ -9567,8 +9821,34 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
         row["Official"] = official
         row["Tier"] = "S" if official!="PASS" and hit_score>=86 else "A" if official!="PASS" and hit_score>=78 else "B" if official!="PASS" else "TRACK"
         row["PASS Reason"] = " · ".join(dict.fromkeys(reasons))
-        row["Finalizer Version"] = "v3.4.7-double-checked-tracker"
-        row["Projection Audit"] = "sustainable L5/L10/L20/season baseline + small role-aware model signal + verified matchup once (max ±1%) + final neutral side gate"
+        min_ctx = audit.get("minutes", {})
+        usage_ctx = audit.get("usage", {})
+        poss_ctx = audit.get("possession", {})
+        shot_ctx = audit.get("shots", {})
+        reb_ctx = audit.get("rebound", {})
+        blow_ctx = min_ctx.get("blowout", {})
+        row["Context Base Projection"] = round(_v345_num(audit.get("base_projection"), proj), 2)
+        row["Context Total Multiplier"] = round(_v345_num(audit.get("total_factor"), 1.0), 4)
+        row["Minutes 2.0 Projection"] = round(_v345_num(min_ctx.get("minutes")), 2) if pd.notna(_v345_num(min_ctx.get("minutes"))) else np.nan
+        row["Minutes 2.0 Confidence"] = round(_v345_num(min_ctx.get("confidence"), 45), 1)
+        row["Live Usage Factor"] = round(_v345_num(usage_ctx.get("factor"), 1.0), 4)
+        row["Usage Trend"] = round(_v345_num(usage_ctx.get("trend"), 0.0), 4)
+        row["Projected Possessions"] = round(_v345_num(poss_ctx.get("possessions")), 2) if pd.notna(_v345_num(poss_ctx.get("possessions"))) else np.nan
+        row["Possession Factor"] = round(_v345_num(poss_ctx.get("factor"), 1.0), 4)
+        row["Shot Volume Factor"] = round(_v345_num(shot_ctx.get("factor"), 1.0), 4)
+        row["Projected FGA 2.0"] = round(_v345_num(shot_ctx.get("fga")), 2) if pd.notna(_v345_num(shot_ctx.get("fga"))) else np.nan
+        row["Projected 3PA 2.0"] = round(_v345_num(shot_ctx.get("three_pa")), 2) if pd.notna(_v345_num(shot_ctx.get("three_pa"))) else np.nan
+        row["Projected FTA 2.0"] = round(_v345_num(shot_ctx.get("fta")), 2) if pd.notna(_v345_num(shot_ctx.get("fta"))) else np.nan
+        row["Rebound Opportunity Factor"] = round(_v345_num(reb_ctx.get("factor"), 1.0), 4)
+        row["Blowout Risk %"] = round(_v345_num(blow_ctx.get("risk"), 15), 1)
+        row["Blowout Note"] = str(blow_ctx.get("note", "Low/neutral blowout risk"))
+        row["Volatility Score"] = round(_v345_num(vol_ctx.get("score"), 70), 1)
+        row["Volatility Tier 2.0"] = str(vol_ctx.get("tier", "MEDIUM"))
+        row["Market Disagreement"] = round(_v345_num(market_ctx.get("disagreement")), 2) if pd.notna(_v345_num(market_ctx.get("disagreement"))) else np.nan
+        row["Market Intelligence Flag"] = str(market_ctx.get("flag", "NORMAL"))
+        row["Context Explain"] = " | ".join([str(min_ctx.get("note","")), str(usage_ctx.get("note","")), str(poss_ctx.get("note","")), str(shot_ctx.get("note","")), str(reb_ctx.get("note",""))])
+        row["Finalizer Version"] = "v3.4.8-context-layers-blowout"
+        row["Projection Audit"] = "calibrated core preserved → bounded Minutes 2.0 → live usage → possessions → shot/rebound opportunity → blowout minutes risk → volatility/market confidence only → final neutral side gate"
         rows.append(row)
 
     out = pd.DataFrame(rows)
