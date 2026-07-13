@@ -1636,12 +1636,15 @@ def compute_player_baselines(logs: pd.DataFrame, season_stats: pd.DataFrame = pd
         Season=("Season", lambda x: x.dropna().iloc[-1] if len(x.dropna()) else np.nan),
         Games=("PTS", "count"),
         LastGame=("GameDate", "max"),
-        MIN_avg=("MIN", "mean"), MIN_l3=("MIN", lambda x: x.tail(3).mean()), MIN_l5=("MIN", lambda x: x.tail(5).mean()), MIN_l10=("MIN", lambda x: x.tail(10).mean()),
+        MIN_avg=("MIN", "mean"), MIN_l3=("MIN", lambda x: x.tail(3).mean()), MIN_l5=("MIN", lambda x: x.tail(5).mean()), MIN_l10=("MIN", lambda x: x.tail(10).mean()), MIN_l20=("MIN", lambda x: x.tail(20).mean()),
         PTS_avg=("PTS", "mean"), REB_avg=("REB", "mean"), AST_avg=("AST", "mean"), PRA_avg=("PRA", "mean"),
         PTS_l3=("PTS", lambda x: x.tail(3).mean()), REB_l3=("REB", lambda x: x.tail(3).mean()), AST_l3=("AST", lambda x: x.tail(3).mean()), PRA_l3=("PRA", lambda x: x.tail(3).mean()),
         PTS_l5=("PTS", lambda x: x.tail(5).mean()), REB_l5=("REB", lambda x: x.tail(5).mean()), AST_l5=("AST", lambda x: x.tail(5).mean()), PRA_l5=("PRA", lambda x: x.tail(5).mean()),
         PTS_l10=("PTS", lambda x: x.tail(10).mean()), REB_l10=("REB", lambda x: x.tail(10).mean()), AST_l10=("AST", lambda x: x.tail(10).mean()), PRA_l10=("PRA", lambda x: x.tail(10).mean()),
         PTS_l20=("PTS", lambda x: x.tail(20).mean()), REB_l20=("REB", lambda x: x.tail(20).mean()), AST_l20=("AST", lambda x: x.tail(20).mean()), PRA_l20=("PRA", lambda x: x.tail(20).mean()),
+        FGA_avg=("FGA", "mean"), FGA_l3=("FGA", lambda x: x.tail(3).mean()), FGA_l5=("FGA", lambda x: x.tail(5).mean()), FGA_l10=("FGA", lambda x: x.tail(10).mean()), FGA_l20=("FGA", lambda x: x.tail(20).mean()),
+        FG3A_avg=("FG3A", "mean"), FG3A_l5=("FG3A", lambda x: x.tail(5).mean()), FG3A_l10=("FG3A", lambda x: x.tail(10).mean()), FG3A_l20=("FG3A", lambda x: x.tail(20).mean()),
+        FTA_avg=("FTA", "mean"), FTA_l5=("FTA", lambda x: x.tail(5).mean()), FTA_l10=("FTA", lambda x: x.tail(10).mean()), FTA_l20=("FTA", lambda x: x.tail(20).mean()),
         FGA=("FGA", "sum"), FGM=("FGM", "sum"), FG3A=("FG3A", "sum"), FG3M=("FG3M", "sum"), FTA=("FTA", "sum"), TOV=("TOV", "sum"), OREB=("OREB", "sum"), DREB=("DREB", "sum"),
     ).reset_index()
     base["eFG%"] = np.where(base["FGA"] > 0, (base["FGM"] + 0.5*base["FG3M"]) / base["FGA"], np.nan)
@@ -10626,6 +10629,52 @@ def _stable_weighted_stat(br: Optional[pd.Series], row: pd.Series, prefix: str) 
     return sum(v*w for v, w in vals) / max(total_w, 1e-9)
 
 
+def _stable_projected_fga(br: Optional[pd.Series], row: pd.Series, projected_minutes: float) -> float:
+    """Project field-goal attempts from rolling game logs and projected minutes.
+
+    Uses L5/L10/L20/season FGA rates when available. Older cached master files
+    are also supported by converting season FGA totals back to per-game rates.
+    This is an audit/display field only and does not change Projection or Lean.
+    """
+    fga_season = _stable_context_value(br, row, ["FGA_avg", "FGA_season", "Season FGA"])
+    if pd.isna(fga_season):
+        fga_total = _stable_context_value(br, row, ["FGA"])
+        games = _stable_context_value(br, row, ["Games", "GP"], 0.0)
+        if pd.notna(fga_total) and pd.notna(games) and float(games) > 0:
+            fga_season = float(fga_total) / float(games)
+
+    fga_l5 = _stable_context_value(br, row, ["FGA_l5", "FGA L5", "L5 FGA"])
+    fga_l10 = _stable_context_value(br, row, ["FGA_l10", "FGA L10", "L10 FGA"])
+    fga_l20 = _stable_context_value(br, row, ["FGA_l20", "FGA L20", "L20 FGA"])
+    fga_values = [v for v in [fga_l5, fga_l10, fga_l20, fga_season] if pd.notna(v) and float(v) >= 0]
+    if not fga_values:
+        return np.nan
+    fallback_fga = float(np.median(fga_values))
+    fga_l5 = fallback_fga if pd.isna(fga_l5) else float(fga_l5)
+    fga_l10 = fallback_fga if pd.isna(fga_l10) else float(fga_l10)
+    fga_l20 = fallback_fga if pd.isna(fga_l20) else float(fga_l20)
+    fga_season = fallback_fga if pd.isna(fga_season) else float(fga_season)
+    fga_base = 0.25*fga_l5 + 0.35*fga_l10 + 0.25*fga_l20 + 0.15*fga_season
+
+    min_avg = _stable_context_value(br, row, ["MIN_avg", "MIN", "Season Minutes"])
+    min_l5 = _stable_context_value(br, row, ["MIN_l5", "Minutes L5", "L5 Minutes"])
+    min_l10 = _stable_context_value(br, row, ["MIN_l10", "Minutes L10", "L10 Minutes"])
+    min_l20 = _stable_context_value(br, row, ["MIN_l20", "Minutes L20", "L20 Minutes"])
+    minute_values = [v for v in [min_l5, min_l10, min_l20, min_avg] if pd.notna(v) and float(v) > 0]
+    if not minute_values or pd.isna(projected_minutes) or float(projected_minutes) <= 0:
+        return float(np.clip(fga_base, 0.0, 35.0))
+    fallback_min = float(np.median(minute_values))
+    min_l5 = fallback_min if pd.isna(min_l5) or float(min_l5) <= 0 else float(min_l5)
+    min_l10 = fallback_min if pd.isna(min_l10) or float(min_l10) <= 0 else float(min_l10)
+    min_l20 = fallback_min if pd.isna(min_l20) or float(min_l20) <= 0 else float(min_l20)
+    min_avg = fallback_min if pd.isna(min_avg) or float(min_avg) <= 0 else float(min_avg)
+    minutes_base = 0.25*min_l5 + 0.35*min_l10 + 0.25*min_l20 + 0.15*min_avg
+    if minutes_base <= 0:
+        return float(np.clip(fga_base, 0.0, 35.0))
+    projected = fga_base * (float(projected_minutes) / minutes_base)
+    return float(np.clip(projected, 0.0, 35.0))
+
+
 def _stable_attach_context_audit_only(board: pd.DataFrame, base: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Populate useful context columns without modifying Projection, Edge, or side."""
     if board is None or board.empty:
@@ -10643,7 +10692,8 @@ def _stable_attach_context_audit_only(board: pd.DataFrame, base: Optional[pd.Dat
         if pd.notna(l20):
             row["L20 Avg"] = round(float(l20), 2)
 
-        fga = _stable_weighted_stat(br, row, "FGA")
+        minutes = safe_float(row.get("MIN Proj"), safe_float(br.get("MinutesProjectionBase"), np.nan) if br is not None else np.nan)
+        fga = _stable_projected_fga(br, row, minutes)
         three_pa = _stable_weighted_stat(br, row, "FG3A")
         fta = _stable_weighted_stat(br, row, "FTA")
         if pd.isna(fga):
@@ -10651,12 +10701,12 @@ def _stable_attach_context_audit_only(board: pd.DataFrame, base: Optional[pd.Dat
         if pd.notna(fga):
             row["Projected FGA"] = round(float(fga), 2)
             row["Projected FGA 2.0"] = round(float(fga), 2)
+            row["FGA Projection Source"] = "L5/L10/L20/season FGA adjusted to projected minutes"
         if pd.notna(three_pa):
             row["Projected 3PA 2.0"] = round(float(three_pa), 2)
         if pd.notna(fta):
             row["Projected FTA 2.0"] = round(float(fta), 2)
 
-        minutes = safe_float(row.get("MIN Proj"), np.nan)
         min_conf = safe_float(row.get("Minutes Confidence"), safe_float(row.get("Final Projection Confidence"), np.nan))
         row["Minutes 2.0 Projection"] = round(minutes, 2) if pd.notna(minutes) else np.nan
         row["Minutes 2.0 Confidence"] = round(min_conf, 1) if pd.notna(min_conf) else np.nan
@@ -10924,8 +10974,8 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Market-Isolated Projections"
-PROJECTION_ENGINE_VERSION = "V348_MARKET_ISOLATED_CONTEXT_V2"
+APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Market-Isolated Projections + Projected FGA"
+PROJECTION_ENGINE_VERSION = "V348_MARKET_ISOLATED_CONTEXT_FGA_V3"
 PROJECTION_ENGINE_NOTE = (
     "Each market uses only its own L5/L10/L20/season inputs; PTS/REB/AST never "
     "share generic averages. Opponent pace/DRtg is joined before one bounded "
