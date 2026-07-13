@@ -10915,6 +10915,406 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     return render_grouped_table_or_cards(proj_df, mode, f"live_group_{mode}", default_cards=False)
 
 
+# ============================================================
+# v3.4.8 MARKET-ISOLATED PROJECTION + VERIFIED OPPONENT CONTEXT
+# ============================================================
+# This final override is intentionally placed after every prior projection layer.
+# It does not touch the working Underdog fetch/parser functions. It fixes two
+# confirmed issues only:
+#   1) generic PTS-row averages bleeding into REB/AST component projections;
+#   2) opponent team context being attached after, instead of before, projection.
+
+APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Market-Isolated Projections"
+PROJECTION_ENGINE_VERSION = "V348_MARKET_ISOLATED_CONTEXT_V2"
+PROJECTION_ENGINE_NOTE = (
+    "Each market uses only its own L5/L10/L20/season inputs; PTS/REB/AST never "
+    "share generic averages. Opponent pace/DRtg is joined before one bounded "
+    "matchup adjustment. PRA equals the corrected component sum."
+)
+
+
+def _strict_num_from(row, names, default=np.nan):
+    for name in names:
+        try:
+            if isinstance(row, dict):
+                value = row.get(name)
+            else:
+                value = row.get(name)
+            value = safe_float(value, np.nan)
+            if pd.notna(value):
+                return float(value)
+        except Exception:
+            continue
+    return default
+
+
+def _strict_team_context_table() -> pd.DataFrame:
+    """Load and coalesce the cached team season/rank files by canonical team."""
+    frames = []
+    for dataset_name in ["team_season_stats", "team_ranks"]:
+        try:
+            frame = load_dataset(dataset_name)
+        except Exception:
+            frame = pd.DataFrame()
+        if frame is None or frame.empty:
+            continue
+        d = frame.copy()
+        team_col = next((c for c in ["Team", "team", "team_abbreviation", "TeamAbbreviation", "Abbreviation"] if c in d.columns), None)
+        if team_col is None:
+            continue
+        d["Team"] = d[team_col].map(lambda x: _team_key_for_matchup(x) or str(x or "").strip().upper())
+        if "Season" not in d.columns:
+            d["Season"] = 2026
+        d["Season"] = pd.to_numeric(d["Season"], errors="coerce")
+        frames.append(d)
+    if not frames:
+        return pd.DataFrame()
+    all_rows = pd.concat(frames, ignore_index=True, sort=False)
+    all_rows = all_rows[all_rows["Team"].astype(str).str.len() > 0].copy()
+    if all_rows.empty:
+        return all_rows
+    # Prefer the newest season and the later source (team_ranks) for populated rank fields.
+    all_rows = all_rows.sort_values(["Season"], na_position="first")
+    latest_season = pd.to_numeric(all_rows["Season"], errors="coerce").max()
+    if pd.notna(latest_season):
+        recent = all_rows[pd.to_numeric(all_rows["Season"], errors="coerce") == latest_season]
+        if not recent.empty:
+            all_rows = recent
+
+    def last_non_null(series):
+        values = series.dropna()
+        if len(values):
+            return values.iloc[-1]
+        return np.nan
+
+    combined = all_rows.groupby("Team", as_index=False).agg(last_non_null)
+    # Normalize common aliases used by different data providers.
+    alias_pairs = {
+        "Defensive Rating": "DRtg", "DefRtg": "DRtg", "defensive_rating": "DRtg",
+        "Offensive Rating": "ORtg", "OffRtg": "ORtg", "offensive_rating": "ORtg",
+        "Net Rating": "NetRtg", "NetRating": "NetRtg", "net_rating": "NetRtg",
+        "Team Pace": "Pace", "pace": "Pace", "Points Allowed": "PointsAllowed",
+    }
+    for old, new in alias_pairs.items():
+        if old in combined.columns and new not in combined.columns:
+            combined[new] = combined[old]
+    for col in ["Pace", "ORtg", "DRtg", "NetRtg", "PointsAllowed", "DefensiveRank", "PointsAllowedRank", "PaceRank"]:
+        if col in combined.columns:
+            combined[col] = pd.to_numeric(combined[col], errors="coerce")
+    if "DRtg" not in combined.columns:
+        combined["DRtg"] = np.nan
+    if "PointsAllowed" in combined.columns:
+        combined["DRtg"] = combined["DRtg"].fillna(combined["PointsAllowed"])
+    if "NetRtg" not in combined.columns:
+        combined["NetRtg"] = np.nan
+    if "ORtg" in combined.columns:
+        combined["NetRtg"] = combined["NetRtg"].fillna(combined["ORtg"] - combined["DRtg"])
+    n = max(1, len(combined))
+    if "DefensiveRank" not in combined.columns or combined["DefensiveRank"].isna().all():
+        combined["DefensiveRank"] = combined["DRtg"].rank(ascending=True, method="min")
+    if "PointsAllowedRank" not in combined.columns or combined["PointsAllowedRank"].isna().all():
+        source = combined["PointsAllowed"] if "PointsAllowed" in combined.columns else combined["DRtg"]
+        combined["PointsAllowedRank"] = source.rank(ascending=True, method="min")
+    if "PaceRank" not in combined.columns or combined["PaceRank"].isna().all():
+        combined["PaceRank"] = combined["Pace"].rank(ascending=False, method="min") if "Pace" in combined.columns else np.nan
+    combined["ContextTeams"] = n
+    return combined
+
+
+def _strict_attach_opponent_context(board: pd.DataFrame, mode: Optional[str] = None) -> pd.DataFrame:
+    """Resolve opponent and attach real pace/DRtg/rank before projection math."""
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    try:
+        out = enrich_board_with_matchups(out, mode or "Today")
+    except Exception:
+        pass
+    context = _strict_team_context_table()
+    context_map = {}
+    if context is not None and not context.empty:
+        context_map = {str(r.get("Team")): r for _, r in context.iterrows()}
+        pace_values = pd.to_numeric(context.get("Pace"), errors="coerce") if "Pace" in context.columns else pd.Series(dtype=float)
+        drtg_values = pd.to_numeric(context.get("DRtg"), errors="coerce") if "DRtg" in context.columns else pd.Series(dtype=float)
+    else:
+        pace_values = pd.Series(dtype=float)
+        drtg_values = pd.Series(dtype=float)
+    team_count = max(1, len(context_map))
+
+    for idx, rr in out.iterrows():
+        team = _team_key_for_matchup(rr.get("Team"))
+        opp = _team_key_for_matchup(rr.get("Opponent"))
+        out.at[idx, "Team"] = team or str(rr.get("Team") or "")
+        out.at[idx, "Opponent"] = opp or ""
+        ctx = context_map.get(opp, {}) if opp else {}
+        pace = _strict_num_from(ctx, ["Pace", "Team Pace", "Team_Pace_Official"])
+        drtg = _strict_num_from(ctx, ["DRtg", "Defensive Rating", "DefRtg", "PointsAllowed"])
+        net = _strict_num_from(ctx, ["NetRtg", "Net Rating", "NetRating"])
+        market = str(rr.get("Market", "PTS")).upper()
+        rank_candidates = {
+            "PTS": ["PTSAllowedRank", "PointsAllowedRank", "DefensiveRank"],
+            "REB": ["REBAllowedRank", "ReboundsAllowedRank", "DefensiveRank"],
+            "AST": ["ASTAllowedRank", "AssistsAllowedRank", "DefensiveRank"],
+            "PRA": ["PRAAllowedRank", "PointsAllowedRank", "DefensiveRank"],
+        }.get(market, ["DefensiveRank"])
+        market_rank = _strict_num_from(ctx, rank_candidates)
+
+        # Percentile-based matchup score: higher pace and higher DRtg are easier.
+        score = 50.0
+        if pd.notna(pace) and len(pace_values.dropna()) >= 4:
+            pace_pct = float((pace_values <= pace).mean())
+            score += (pace_pct - 0.5) * 14.0
+        if pd.notna(drtg) and len(drtg_values.dropna()) >= 4:
+            drtg_pct = float((drtg_values <= drtg).mean())
+            score += (drtg_pct - 0.5) * 26.0
+        score = float(np.clip(score, 30.0, 70.0))
+        grade = "Favorable" if score >= 58 else "Tough" if score <= 42 else "Neutral"
+
+        out.at[idx, "Opponent Pace"] = round(pace, 2) if pd.notna(pace) else np.nan
+        out.at[idx, "Opponent DRtg"] = round(drtg, 2) if pd.notna(drtg) else np.nan
+        out.at[idx, "Opponent NetRtg"] = round(net, 2) if pd.notna(net) else np.nan
+        out.at[idx, "Opponent Market Rank"] = round(market_rank, 0) if pd.notna(market_rank) else np.nan
+        out.at[idx, "Opponent Market Rank Teams"] = team_count
+        out.at[idx, "Opponent Matchup Score"] = round(score, 1)
+        out.at[idx, "Opponent Matchup Grade"] = grade if opp and pd.notna(pace) and pd.notna(drtg) else "Unknown"
+        out.at[idx, "Opponent Matchup Note"] = (
+            f"{opp}: pace {pace:.2f}, DRtg {drtg:.2f}, defense rank {market_rank:.0f}/{team_count}"
+            if opp and pd.notna(pace) and pd.notna(drtg) and pd.notna(market_rank)
+            else "Opponent context incomplete; neutral matchup factor used."
+        )
+
+        # Verify only when player baseline + opponent context are actually present.
+        baseline_ok = all(pd.notna(safe_float(rr.get(c), np.nan)) for c in ["L5 Avg", "L10 Avg", "Season Avg"])
+        minutes_ok = pd.notna(safe_float(rr.get("MIN Proj"), np.nan))
+        context_ok = bool(opp) and pd.notna(pace) and pd.notna(drtg)
+        if baseline_ok and minutes_ok and context_ok:
+            out.at[idx, "Data Integrity"] = "VERIFIED"
+            out.at[idx, "Data Integrity Score"] = 100.0
+            out.at[idx, "Data Integrity Note"] = "Player baseline, minutes, opponent, pace and DRtg verified."
+        elif str(rr.get("Data Integrity", "")).upper() != "INCOMPLETE":
+            out.at[idx, "Data Integrity"] = "LIMITED"
+            out.at[idx, "Data Integrity Note"] = "Player data loaded, but opponent pace/DRtg could not be fully verified."
+    return out
+
+
+def _strict_player_market_rows(board: pd.DataFrame) -> dict:
+    lookup = {}
+    if board is None or board.empty:
+        return lookup
+    for _, rr in board.iterrows():
+        player_key = normalize_name(rr.get("Matched Player") or rr.get("Player"))
+        team_key = _team_key_for_matchup(rr.get("Team"))
+        market = str(rr.get("Market", "")).upper()
+        if not player_key or market not in {"PTS", "REB", "AST", "PRA"}:
+            continue
+        lookup[(player_key, team_key, market)] = rr.copy()
+        lookup.setdefault((player_key, "", market), rr.copy())
+    return lookup
+
+
+def _strict_market_source_row(current_row: pd.Series, market: str, market_rows: dict) -> pd.Series:
+    player_key = normalize_name(current_row.get("Matched Player") or current_row.get("Player"))
+    team_key = _team_key_for_matchup(current_row.get("Team"))
+    source = market_rows.get((player_key, team_key, market))
+    if source is None:
+        source = market_rows.get((player_key, "", market))
+    if isinstance(source, pd.Series):
+        out = source.copy()
+    else:
+        out = current_row.copy()
+        out["Market"] = market
+        out["Line"] = np.nan
+        out["Projection"] = np.nan
+        # These generic columns belong to current_row's market and may not cross markets.
+        for col in ["L5 Avg", "L10 Avg", "L20 Avg", "Season Avg"]:
+            out[col] = np.nan
+    # Carry only matchup/context fields from the current row when the market row lacks them.
+    for col in [
+        "Team", "Opponent", "Matchup", "HomeAway", "MIN Proj", "Data Integrity",
+        "Opponent Pace", "Opponent DRtg", "Opponent NetRtg", "Opponent Market Rank",
+        "Opponent Market Rank Teams", "Opponent Matchup Score", "Opponent Matchup Grade",
+    ]:
+        try:
+            if (col not in out.index or pd.isna(out.get(col)) or str(out.get(col)).strip() in {"", "nan", "None"}) and col in current_row.index:
+                out[col] = current_row.get(col)
+        except Exception:
+            pass
+    return out
+
+
+def _strict_market_inputs(row: pd.Series, br: Optional[pd.Series], market: str) -> dict:
+    """Read only market-specific fields; generic row averages are allowed only for that row's market."""
+    row_market = str(row.get("Market", "")).upper()
+    suffixes = {
+        "l5": [f"{market}_l5", f"{market}_L5", f"{market.lower()}_l5"],
+        "l10": [f"{market}_l10", f"{market}_L10", f"{market.lower()}_l10"],
+        "l20": [f"{market}_l20", f"{market}_L20", f"{market.lower()}_l20"],
+        "season": [f"{market}_avg", f"{market}_season", market, f"{market.lower()}_avg"],
+        "prior": [f"{market}_prior", f"{market.lower()}_prior"],
+    }
+    generic = {"l5": "L5 Avg", "l10": "L10 Avg", "l20": "L20 Avg", "season": "Season Avg"}
+    values = {}
+    for label, candidates in suffixes.items():
+        value = np.nan
+        if br is not None:
+            value = _strict_num_from(br, candidates)
+        if pd.isna(value) and row_market == market and label in generic:
+            value = safe_float(row.get(generic[label]), np.nan)
+        values[label] = value
+    available = [float(v) for v in values.values() if pd.notna(v)]
+    if available:
+        med = float(np.median(available))
+        for label in values:
+            if pd.isna(values[label]):
+                values[label] = med
+    return values
+
+
+def _strict_component_projection(row: pd.Series, br: Optional[pd.Series], market: str) -> tuple:
+    values = _strict_market_inputs(row, br, market)
+    available = [float(v) for v in values.values() if pd.notna(v)]
+    if not available:
+        fallback = safe_float(row.get("Projection"), np.nan) if str(row.get("Market", "")).upper() == market else np.nan
+        return fallback, values, {"minutes_mult": 1.0, "minutes_conf": 45.0, "matchup_mult": 1.0, "matchup_grade": "Unknown", "matchup_conf": 35.0, "market_weight": 0.0, "sample_quality": 0.35}
+    med = float(np.median(available))
+    l5 = values.get("l5", med); l10 = values.get("l10", med); l20 = values.get("l20", med); season = values.get("season", med); prior = values.get("prior", med)
+    anchor = 0.16*l5 + 0.26*l10 + 0.22*l20 + 0.29*season + 0.07*prior
+    mad = float(np.median(np.abs(np.asarray(available) - med))) if available else 0.0
+    width = max({"PTS": 2.8, "REB": 1.25, "AST": 1.15, "PRA": 4.2}.get(market, 2.0), 2.5*mad)
+    anchor = float(np.clip(anchor, max(0.0, med-width), med+width))
+
+    minutes_mult, minutes_conf = _v344_minutes_multiplier(row, br)
+    matchup_mult, matchup_grade, matchup_conf = _v344_matchup_multiplier(row)
+    raw = anchor * minutes_mult * matchup_mult
+    stable = [values.get(k) for k in ["l10", "l20", "season", "prior"] if pd.notna(values.get(k))]
+    if stable:
+        center = float(np.median(stable))
+        sd_proxy = float(np.std(stable)) if len(stable) >= 2 else 0.0
+        cap_width = max({"PTS": 3.2, "REB": 1.45, "AST": 1.35, "PRA": 4.8}.get(market, 2.5), 2.25*sd_proxy)
+        raw = float(np.clip(raw, max(0.0, center-cap_width), center+cap_width))
+
+    line = safe_float(row.get("Line"), np.nan)
+    sample_n = _strict_num_from(br, [f"{market}_Games", "Games", "GP"], 15.0) if br is not None else 15.0
+    sample_quality = float(np.clip(sample_n/25.0, 0.35, 1.0))
+    integrity = str(row.get("Data Integrity", "LIMITED")).upper()
+    final, market_weight = _v344_market_shrink(raw, line, integrity, sample_quality)
+    return final, values, {
+        "anchor": anchor,
+        "minutes_mult": minutes_mult,
+        "minutes_conf": minutes_conf,
+        "matchup_mult": matchup_mult,
+        "matchup_grade": matchup_grade,
+        "matchup_conf": matchup_conf,
+        "market_weight": market_weight,
+        "sample_quality": sample_quality,
+    }
+
+
+def _strict_market_isolated_rebuild(board: pd.DataFrame, base: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    base_lookup = _v344_player_lookup(base) if base is not None and not base.empty else pd.DataFrame()
+    market_rows = _strict_player_market_rows(out)
+    component_cache = {}
+    rebuilt = []
+    for _, rr in out.iterrows():
+        row = rr.copy()
+        player_key = normalize_name(row.get("Matched Player") or row.get("Player"))
+        team_key = _team_key_for_matchup(row.get("Team"))
+        opp_key = _team_key_for_matchup(row.get("Opponent"))
+        br = base_lookup.loc[player_key] if (not base_lookup.empty and player_key in base_lookup.index) else None
+        cache_key = (player_key, team_key, opp_key)
+        if cache_key not in component_cache:
+            components, values_by_market, meta_by_market = {}, {}, {}
+            for component_market in ["PTS", "REB", "AST", "PRA"]:
+                source_row = _strict_market_source_row(row, component_market, market_rows)
+                projection, values, meta = _strict_component_projection(source_row, br, component_market)
+                components[component_market] = projection
+                values_by_market[component_market] = values
+                meta_by_market[component_market] = meta
+            component_cache[cache_key] = (components, values_by_market, meta_by_market)
+        components, values_by_market, meta_by_market = component_cache[cache_key]
+        market = str(row.get("Market", "PTS")).upper()
+
+        if market == "PRA" and all(pd.notna(components.get(m)) for m in ["PTS", "REB", "AST"]):
+            final_projection = float(sum(components[m] for m in ["PTS", "REB", "AST"]))
+            display_values = _strict_market_inputs(row, br, "PRA")
+            meta = {
+                "minutes_mult": float(np.mean([meta_by_market[m].get("minutes_mult", 1.0) for m in ["PTS", "REB", "AST"]])),
+                "minutes_conf": float(np.mean([meta_by_market[m].get("minutes_conf", 45.0) for m in ["PTS", "REB", "AST"]])),
+                "matchup_mult": float(np.mean([meta_by_market[m].get("matchup_mult", 1.0) for m in ["PTS", "REB", "AST"]])),
+                "matchup_grade": str(row.get("Opponent Matchup Grade", "Unknown")),
+                "matchup_conf": float(np.mean([meta_by_market[m].get("matchup_conf", 35.0) for m in ["PTS", "REB", "AST"]])),
+                "market_weight": float(np.mean([meta_by_market[m].get("market_weight", 0.0) for m in ["PTS", "REB", "AST"]])),
+                "sample_quality": float(np.mean([meta_by_market[m].get("sample_quality", 0.35) for m in ["PTS", "REB", "AST"]])),
+            }
+        else:
+            final_projection = components.get(market, np.nan)
+            display_values = values_by_market.get(market, _strict_market_inputs(row, br, market))
+            meta = meta_by_market.get(market, {})
+
+        row["Projection Before Market Isolation"] = safe_float(row.get("Projection"), np.nan)
+        row["Projection"] = round(final_projection, 2) if pd.notna(final_projection) else np.nan
+        for label, column in [("l5", "L5 Avg"), ("l10", "L10 Avg"), ("l20", "L20 Avg"), ("season", "Season Avg")]:
+            value = display_values.get(label) if isinstance(display_values, dict) else np.nan
+            if pd.notna(value):
+                row[column] = round(float(value), 2)
+        integrity = str(row.get("Data Integrity", "LIMITED")).upper()
+        data_conf = 94.0 if integrity == "VERIFIED" else 64.0
+        final_conf = float(np.clip(
+            0.36*data_conf + 0.32*meta.get("minutes_conf", 45.0) + 0.18*meta.get("matchup_conf", 35.0) + 0.14*(meta.get("sample_quality", 0.35)*100.0),
+            35.0, 96.0,
+        ))
+        row["Minutes Multiplier Applied"] = round(meta.get("minutes_mult", 1.0), 4)
+        row["Matchup Multiplier Applied"] = round(meta.get("matchup_mult", 1.0), 4)
+        row["Minutes Confidence"] = round(meta.get("minutes_conf", 45.0), 1)
+        row["Matchup Confidence"] = round(meta.get("matchup_conf", 35.0), 1)
+        row["Final Projection Confidence"] = round(final_conf, 1)
+        row["Market Shrink Weight"] = round(meta.get("market_weight", 0.0), 3)
+        row["Projection Audit"] = PROJECTION_ENGINE_NOTE
+        row["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+        if market == "PRA" and all(pd.notna(components.get(m)) for m in ["PTS", "REB", "AST"]):
+            row["PRA Component PTS"] = round(components["PTS"], 2)
+            row["PRA Component REB"] = round(components["REB"], 2)
+            row["PRA Component AST"] = round(components["AST"], 2)
+            row["PRA Component Sum"] = round(final_projection, 2)
+            row["PRA Identity Check"] = True
+        try:
+            sanity_status, _, sanity_note = _projection_sanity_audit(row)
+            row["Projection Sanity"] = sanity_status
+            row["Projection Sanity Note"] = sanity_note
+        except Exception:
+            pass
+        rebuilt.append(row)
+    return pd.DataFrame(rebuilt)
+
+
+def _stable_repair_projection_board(board: pd.DataFrame, base: Optional[pd.DataFrame], mode: Optional[str] = None) -> pd.DataFrame:
+    """Repair cached boards using market-isolated inputs and pre-projection opponent context."""
+    if board is None or board.empty:
+        return board
+    fixed = _strict_attach_opponent_context(board.copy(), mode or str(board.get("Slate", pd.Series(["Today"])).iloc[0] if "Slate" in board.columns else "Today"))
+    fixed = _strict_market_isolated_rebuild(fixed, base)
+    fixed = _stable_attach_context_audit_only(fixed, base)
+    fixed = _stable_recalculate_side_fields(fixed, base)
+    fixed["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+    return fixed
+
+
+def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+    """Final projection authority; working Underdog pull remains unchanged."""
+    board = _make_projection_board_v344_input(lines, logs, base, mode)
+    board = _strict_attach_opponent_context(board, mode or "Today")
+    board = _strict_market_isolated_rebuild(board, base)
+    board = _stable_attach_context_audit_only(board, base)
+    board = _stable_recalculate_side_fields(board, base)
+    if board is not None and not board.empty:
+        board["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+        save_dataset("projection_board", board)
+    return board
+
+
 # Repair any older inflated projection cache before Best Bets renders.
 try:
     _startup_board = load_dataset("projection_board")
