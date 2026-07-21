@@ -178,7 +178,9 @@ TEAM_LOGO_ALIASES = {
     "MIN": "MIN", "MINNESOTA": "MIN", "MINNESOTA LYNX": "MIN",
     "NYL": "NYL", "NY": "NYL", "NEW YORK": "NYL", "NEW YORK LIBERTY": "NYL",
     "PHX": "PHX", "PHO": "PHX", "PHOENIX": "PHX", "PHOENIX MERCURY": "PHX",
+    "POR": "POR", "PORTLAND": "POR", "PORTLAND FIRE": "POR",
     "SEA": "SEA", "SEATTLE": "SEA", "SEATTLE STORM": "SEA",
+    "TOR": "TOR", "TORONTO": "TOR", "TORONTO TEMPO": "TOR",
     "WAS": "WAS", "WSH": "WAS", "WASHINGTON": "WAS", "WASHINGTON MYSTICS": "WAS",
 }
 
@@ -3152,12 +3154,13 @@ TEAM_COORDS = {
     "LAS": (36.1699, -115.1398), "LV": (36.1699, -115.1398), "MIN": (44.9778, -93.2650),
     "NY": (40.7128, -74.0060), "PHX": (33.4484, -112.0740), "SEA": (47.6062, -122.3321),
     "WAS": (38.9072, -77.0369), "GS": (37.7749, -122.4194), "TOR": (43.6532, -79.3832),
+    "POR": (45.5152, -122.6784),
 }
 TEAM_ALIASES = {
     "ATLANTA DREAM":"ATL", "CHICAGO SKY":"CHI", "CONNECTICUT SUN":"CON", "DALLAS WINGS":"DAL",
     "INDIANA FEVER":"IND", "LOS ANGELES SPARKS":"LA", "LAS VEGAS ACES":"LV", "MINNESOTA LYNX":"MIN",
     "NEW YORK LIBERTY":"NY", "PHOENIX MERCURY":"PHX", "SEATTLE STORM":"SEA", "WASHINGTON MYSTICS":"WAS",
-    "GOLDEN STATE VALKYRIES":"GS", "TORONTO TEMPO":"TOR"
+    "GOLDEN STATE VALKYRIES":"GS", "TORONTO TEMPO":"TOR", "PORTLAND FIRE":"POR"
 }
 REFEREE_FILE = LOCAL_DIR / "wnba_referee_tendencies.csv"
 INJURY_STATUS_FILE = LOCAL_DIR / "wnba_injury_status.json"
@@ -5038,7 +5041,9 @@ TEAM_ALIAS_MAP = {
     "MINNESOTA LYNX": "MIN", "MIN LYNX": "MIN", "MIN": "MIN",
     "NEW YORK LIBERTY": "NYL", "NEW YORK": "NYL", "NY LIBERTY": "NYL", "NY": "NYL", "NYL": "NYL",
     "PHOENIX MERCURY": "PHX", "PHX MERCURY": "PHX", "PHOENIX": "PHX", "PHX": "PHX",
+    "PORTLAND FIRE": "POR", "PORTLAND": "POR", "POR": "POR",
     "SEATTLE STORM": "SEA", "SEA STORM": "SEA", "SEA": "SEA",
+    "TORONTO TEMPO": "TOR", "TORONTO": "TOR", "TOR": "TOR",
     "WASHINGTON MYSTICS": "WAS", "WAS MYSTICS": "WAS", "WASHINGTON": "WAS", "WAS": "WAS",
 }
 
@@ -9336,13 +9341,16 @@ def _grouped_market_html(r: pd.Series) -> str:
     matchup = str(r.get("Opponent Matchup Note", r.get("Opponent Context Note", "Matchup loading")))[:180]
     integrity = str(r.get("Data Integrity", "CHECK")); sanity = str(r.get("Projection Sanity", "CHECK"))
     opportunity = str(r.get("Usage / Opportunity Note", ""))[:100]
+    strong = str(r.get("Strong Play", r.get("Official", "PASS")))
+    strong_reasons = str(r.get("Strong Play Reasons", r.get("PASS Reason", "")))[:160]
+    strong_missing = str(r.get("Strong Play Missing", ""))[:160]
     return f"""
       <div class='owp-market-row owp-mkt-{market.lower()}'>
-        <div class='owp-market-head'><span class='owp-market-name'>{market}</span><span class='owp-market-vol'>{r.get('Volatility','NA')}</span><span class='owp-market-conf {side_cls}'>{conf}%</span><span class='owp-market-side {side_cls}'>{side_txt}</span></div>
+        <div class='owp-market-head'><span class='owp-market-name'>{market}</span><span class='owp-market-vol'>{strong}</span><span class='owp-market-conf {side_cls}'>{conf}%</span><span class='owp-market-side {side_cls}'>{side_txt}</span></div>
         <div class='owp-market-main'><span class='owp-market-proj'>{proj}</span><span class='owp-market-edge {edge_cls}'>{_fmt_num_compact(edge_v,1)} vs {line}</span><span class='owp-market-tier'>{r.get('Tier','')}</span></div>
         <div class='owp-prob-track owp-market-track'><div class='owp-prob-fill' style='width:{fill:.0f}%'></div></div>
         <div class='owp-market-sub'><span>OVER {_fmt_num_compact(overp,0)}%</span><span>UNDER {_fmt_num_compact(underp,0)}%</span></div>
-        <div class='owp-market-note'><b>Opponent:</b> {matchup}<br/><b>Workload:</b> {opportunity or 'minutes-based projection'}<br/><b>Checks:</b> Data {integrity} · Projection {sanity}</div>
+        <div class='owp-market-note'><b>Opponent:</b> {matchup}<br/><b>Workload:</b> {opportunity or 'minutes-based projection'}<br/><b>Strong:</b> {strong_reasons or strong_missing or 'tracking only'}<br/><b>Checks:</b> Data {integrity} · Projection {sanity}</div>
       </div>
     """
 
@@ -9355,11 +9363,14 @@ def grouped_board_table_view(proj_df: pd.DataFrame) -> pd.DataFrame:
     keep = [c for c in [
         "Player","Team","Opponent","Matchup","Opponent Matchup Grade","Opponent Matchup Score",
         "Opponent Market Rank","Opponent Pace","Opponent DRtg","Market","Projection","Line","Edge",
-        "Lean","Over %","Under %","Hit Score","Official Play Score","Tier","MIN Proj","Projected FGA",
-        "L5 Avg","L10 Avg","Season Avg","Data Integrity","Projection Sanity","Official","PASS Reason","Source"
+        "Lean","Over %","Under %","Hit Score","Official Play Score","Strong Play","Strong Play Score",
+        "Tier","MIN Proj","Projected FGA","L5 Avg","L10 Avg","Season Avg","Recent Support",
+        "Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Freshness Status",
+        "Lineup Confirmed","Late Scratch Risk","Minutes Until Tip","Injury Status","Availability",
+        "Data Integrity","Projection Sanity","Official","Strong Play Missing","PASS Reason","Source"
     ] if c in df.columns]
     out = df.sort_values(["Player","_market_order","Line"], na_position="last")[keep].copy()
-    for c in ["Projection","Line","Edge","Over %","Under %","Hit Score","Official Play Score","MIN Proj","Projected FGA","Opponent Matchup Score","Opponent Market Rank","Opponent Pace","Opponent DRtg"]:
+    for c in ["Projection","Line","Edge","Over %","Under %","Hit Score","Official Play Score","Strong Play Score","MIN Proj","Projected FGA","Opponent Matchup Score","Opponent Market Rank","Opponent Pace","Opponent DRtg","Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Minutes Until Tip"]:
         if c in out.columns: out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
     return out
 
@@ -10758,6 +10769,130 @@ def _stable_attach_context_audit_only(board: pd.DataFrame, base: Optional[pd.Dat
     return pd.DataFrame(rows)
 
 
+def _strong_text_blob(row: pd.Series, names: List[str]) -> str:
+    return " ".join(str(row.get(name, "") or "") for name in names).upper()
+
+
+def _strong_availability_risk(row: pd.Series) -> Tuple[bool, str]:
+    txt = _strong_text_blob(row, [
+        "Injury Status", "Availability", "Lineup Status", "Starter Status",
+        "Role", "Injury Context Note", "Projected Rotation Note", "Bench Rotation Note"
+    ])
+    bad = ["OUT", "INACTIVE", "DOUBTFUL", "SUSPENDED", "MINUTES LIMIT", "LIMITED MINUTES", "GTD", "GAME TIME DECISION"]
+    caution = ["QUESTIONABLE", "PROBABLE", "RETURNING", "REST", "ILLNESS"]
+    if any(tag in txt for tag in bad):
+        return True, "availability/minutes risk"
+    if any(tag in txt for tag in caution):
+        return True, "availability needs confirmation"
+    return False, "availability clean"
+
+
+def _strong_recent_support(row: pd.Series, line: float, lean: str) -> Tuple[int, str]:
+    if pd.isna(line) or lean not in {"OVER", "UNDER"}:
+        return 0, "no side support"
+    labels = [("L5", "L5 Avg"), ("L10", "L10 Avg"), ("L20", "L20 Avg"), ("Season", "Season Avg")]
+    hits = []
+    for label, col in labels:
+        value = safe_float(row.get(col), np.nan)
+        if pd.notna(value):
+            agrees = (value > line) == (lean == "OVER")
+            hits.append((label, agrees))
+    votes = sum(1 for _, agrees in hits if agrees)
+    note = f"{votes}/{len(hits)} recent/season windows support {lean}" if hits else "recent/season windows unavailable"
+    return votes, note
+
+
+def _strong_line_context(row: pd.Series, line: float, lean: str) -> Tuple[bool, str]:
+    """Use opening/consensus lines when present; neutral when absent."""
+    if lean not in {"OVER", "UNDER"} or pd.isna(line):
+        return False, "no line context"
+    opening = safe_float(row.get("Opening Line"), safe_float(row.get("Open Line"), np.nan))
+    consensus = safe_float(row.get("Consensus Line"), safe_float(row.get("Market Consensus"), np.nan))
+    notes = []
+    supported = True
+    if pd.notna(opening):
+        move = line - opening
+        if lean == "OVER" and move < -0.5:
+            supported = False
+        if lean == "UNDER" and move > 0.5:
+            supported = False
+        notes.append(f"open {opening:.1f} -> {line:.1f}")
+    if pd.notna(consensus):
+        if lean == "OVER" and consensus < line - 0.5:
+            supported = False
+        if lean == "UNDER" and consensus > line + 0.5:
+            supported = False
+        notes.append(f"consensus {consensus:.1f}")
+    if not notes:
+        return True, "line movement/consensus unavailable"
+    return supported, "; ".join(notes)
+
+
+def _strong_play_gate(row: pd.Series, market: str, lean: str, edge: float, sidep: float, confidence: float, votes: int) -> Dict[str, Any]:
+    edge_abs = abs(edge) if pd.notna(edge) else np.nan
+    thresholds = {
+        "PTS": {"edge": 2.0, "prob": 62.0, "conf": 80.0, "minutes": 76.0, "votes": 2},
+        "REB": {"edge": 1.2, "prob": 62.0, "conf": 80.0, "minutes": 76.0, "votes": 2},
+        "AST": {"edge": 1.0, "prob": 62.0, "conf": 80.0, "minutes": 76.0, "votes": 2},
+        "PRA": {"edge": 3.0, "prob": 62.0, "conf": 80.0, "minutes": 76.0, "votes": 2},
+    }.get(market, {"edge": 1.5, "prob": 62.0, "conf": 80.0, "minutes": 76.0, "votes": 2})
+    integrity = str(row.get("Data Integrity", "LIMITED")).upper()
+    sanity = str(row.get("Projection Sanity", "PASS")).upper()
+    minutes_conf = safe_float(row.get("Minutes Confidence"), safe_float(row.get("Minutes 2.0 Confidence"), confidence))
+    opp_ok = bool(str(row.get("Opponent", "")).strip()) and pd.notna(safe_float(row.get("Opponent Pace"), np.nan)) and pd.notna(safe_float(row.get("Opponent DRtg"), np.nan))
+    avail_risk, avail_note = _strong_availability_risk(row)
+    line_ok, line_note = _strong_line_context(row, safe_float(row.get("Line"), np.nan), lean)
+    freshness = str(row.get("Freshness Status", "UNKNOWN")).upper()
+    line_snapshots = safe_float(row.get("Line Snapshot Count"), np.nan)
+    lineup_confirmed = bool(row.get("Lineup Confirmed", False))
+    late_scratch_risk = bool(row.get("Late Scratch Risk", False))
+    minutes_to_tip = safe_float(row.get("Minutes Until Tip"), np.nan)
+    opening_line = safe_float(row.get("Opening Line"), np.nan)
+
+    missing = []
+    if lean not in {"OVER", "UNDER"}: missing.append("no clear OVER/UNDER lean")
+    if integrity != "VERIFIED": missing.append("data integrity not verified")
+    if sanity not in {"PASS", "OK", "VERIFIED"}: missing.append("projection sanity not clean")
+    if pd.isna(edge_abs) or edge_abs < thresholds["edge"]: missing.append(f"edge below {thresholds['edge']:.1f}")
+    if sidep < thresholds["prob"]: missing.append(f"probability below {thresholds['prob']:.0f}%")
+    if confidence < thresholds["conf"]: missing.append(f"projection confidence below {thresholds['conf']:.0f}%")
+    if minutes_conf < thresholds["minutes"]: missing.append(f"minutes confidence below {thresholds['minutes']:.0f}%")
+    if votes < thresholds["votes"]: missing.append("recent/season support too weak")
+    if not opp_ok: missing.append("opponent pace/DRtg missing")
+    if avail_risk: missing.append(avail_note)
+    if not line_ok: missing.append("line movement/consensus against side")
+    if freshness == "STALE": missing.append("data or line feed stale")
+    if pd.isna(line_snapshots) or line_snapshots < 1: missing.append("line snapshot history missing")
+    if pd.isna(opening_line): missing.append("opening line unavailable")
+    if late_scratch_risk: missing.append("late scratch/start check required")
+    if pd.notna(minutes_to_tip) and minutes_to_tip <= 120 and not lineup_confirmed:
+        missing.append("starter/lineup not confirmed near tip")
+
+    edge_score = 0.0 if pd.isna(edge_abs) else min(100.0, edge_abs / thresholds["edge"] * 100.0)
+    strong_score = float(np.clip(
+        0.34*sidep + 0.22*confidence + 0.16*minutes_conf + 0.14*edge_score + 0.14*min(100.0, votes/4.0*100.0),
+        0, 100
+    ))
+    label = "LONG STRONG " + lean if not missing else "TRACK"
+    reasons = [
+        f"{sidep:.1f}% side probability",
+        f"{edge_abs:.2f} edge" if pd.notna(edge_abs) else "edge unavailable",
+        f"{votes}/4 recent support",
+        f"{confidence:.1f}% projection confidence",
+        f"{minutes_conf:.1f}% minutes confidence",
+        line_note,
+        f"freshness {freshness}",
+        "lineup confirmed" if lineup_confirmed else "lineup not confirmed",
+    ]
+    return {
+        "passed": not missing,
+        "label": label,
+        "score": round(strong_score, 1),
+        "reasons": " · ".join(reasons),
+        "missing": " · ".join(dict.fromkeys(missing)),
+    }
+
+
 def _stable_recalculate_side_fields(board: pd.DataFrame, base: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Keep projection fixed and make Edge/Lean/probability/Official internally consistent."""
     if board is None or board.empty:
@@ -10799,21 +10934,22 @@ def _stable_recalculate_side_fields(board: pd.DataFrame, base: Optional[pd.DataF
         for c in ["L5 Avg", "L10 Avg", "L20 Avg", "Season Avg"]:
             v = safe_float(row.get(c), np.nan)
             if pd.notna(v): vals.append(v)
-        votes = 0
-        if pd.notna(line) and lean in {"OVER", "UNDER"}:
-            votes = sum(1 for v in vals if (v > line) == (lean == "OVER"))
+        votes, recent_note = _strong_recent_support(row, line, lean)
 
         integrity = str(row.get("Data Integrity", "LIMITED")).upper()
-        official_edge = {"PTS":1.50,"REB":0.75,"AST":0.75,"PRA":2.25}.get(market,1.25)
-        official_prob = {"PTS":60.0,"REB":59.0,"AST":59.0,"PRA":60.0}.get(market,60.0)
+        official_edge = {"PTS":2.00,"REB":1.20,"AST":1.00,"PRA":3.00}.get(market,1.50)
+        official_prob = {"PTS":62.0,"REB":62.0,"AST":62.0,"PRA":62.0}.get(market,62.0)
         reasons = []
         if lean not in {"OVER", "UNDER"}: reasons.append("inside neutral/no-play zone")
         if integrity != "VERIFIED": reasons.append("data/opponent context not verified")
         if pd.isna(edge) or abs(edge) < official_edge: reasons.append("edge below official threshold")
         if sidep < official_prob: reasons.append("probability below official threshold")
         if votes < 2: reasons.append("recent/season support is weak")
-        if confidence < 78: reasons.append("projection confidence below 78%")
-        official = "PASS" if reasons else ("🔥 OVER" if lean == "OVER" else "⚠️ UNDER")
+        if confidence < 80: reasons.append("projection confidence below 80%")
+        strong_gate = _strong_play_gate(row, market, lean, edge, sidep, confidence, votes)
+        if strong_gate["missing"]:
+            reasons.extend(strong_gate["missing"].split(" · "))
+        official = strong_gate["label"] if strong_gate["passed"] else "PASS"
 
         # Preserve the calibrated score formula but force it to use the selected side.
         edge_scale = {"PTS":6.0,"REB":11.0,"AST":11.0,"PRA":3.8}.get(market,6.0)
@@ -10826,9 +10962,14 @@ def _stable_recalculate_side_fields(board: pd.DataFrame, base: Optional[pd.DataF
         row["Under %"] = round(underp, 1) if pd.notna(underp) else np.nan
         row["Simulation SD"] = round(sd, 2) if pd.notna(sd) else np.nan
         row["Hit Score"] = round(hit_score, 1)
-        row["Official Play Score"] = round(hit_score, 1)
+        row["Official Play Score"] = round(strong_gate["score"] if strong_gate["passed"] else hit_score, 1)
         row["Official"] = official
-        row["Tier"] = "S" if official != "PASS" and hit_score >= 86 else "A" if official != "PASS" and hit_score >= 78 else "B" if official != "PASS" else "TRACK"
+        row["Strong Play"] = official
+        row["Strong Play Score"] = strong_gate["score"]
+        row["Strong Play Reasons"] = strong_gate["reasons"]
+        row["Strong Play Missing"] = strong_gate["missing"]
+        row["Recent Support"] = recent_note
+        row["Tier"] = "LONG" if official.startswith("LONG STRONG") else "TRACK"
         row["PASS Reason"] = " · ".join(dict.fromkeys(reasons))
         repaired.append(row)
 
@@ -10974,13 +11115,196 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Market-Isolated Projections + Projected FGA"
-PROJECTION_ENGINE_VERSION = "V348_MARKET_ISOLATED_CONTEXT_FGA_V3"
+APP_VERSION = "WNBA v3.4.9 — 2026 Teams + Workload-Led Market-Isolated Projections"
+PROJECTION_ENGINE_VERSION = "V349_WORKLOAD_LED_MARKET_ISOLATED_V1"
 PROJECTION_ENGINE_NOTE = (
-    "Each market uses only its own L5/L10/L20/season inputs; PTS/REB/AST never "
-    "share generic averages. Opponent pace/DRtg is joined before one bounded "
-    "matchup adjustment. PRA equals the corrected component sum."
+    "Each market uses its own workload-adjusted true-recent baseline plus L5/L10/L20/season "
+    "shrinkage. Opponent pace/DRtg is joined before one bounded matchup adjustment. "
+    "PRA equals the corrected component sum, and lines do not overwrite the model mean."
 )
+OFFICIAL_WNBA_INJURY_URL = "https://www.wnba.com/webview/wnba-injury-report"
+STRONG_PLAY_FRESHNESS_VERSION = "V349_STRONG_TRUST_FRESHNESS_V1"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_official_wnba_injury_report_rows() -> Tuple[pd.DataFrame, str]:
+    """Best-effort official WNBA injury report ingest.
+
+    The page format can change, so this function never blocks projections. It
+    returns any recognizable Player/Team/Status rows plus a short status string.
+    """
+    try:
+        tables = pd.read_html(OFFICIAL_WNBA_INJURY_URL)
+    except Exception as exc:
+        return pd.DataFrame(), f"official WNBA injury report unavailable: {str(exc)[:120]}"
+    rows = []
+    for t in tables:
+        if t is None or t.empty:
+            continue
+        d = t.copy()
+        d.columns = [str(c).strip() for c in d.columns]
+        pc = find_col(d, ["Player", "Athlete", "Name"])
+        tc = find_col(d, ["Team", "Club"])
+        sc = find_col(d, ["Status", "Game Status", "Designation", "Injury Status"])
+        rc = find_col(d, ["Reason", "Injury", "Notes", "Comment"])
+        if not pc or not sc:
+            continue
+        for _, r in d.iterrows():
+            player = str(r.get(pc, "") or "").strip()
+            status = str(r.get(sc, "") or "").strip()
+            if not player or not status:
+                continue
+            rows.append({
+                "Player": player,
+                "Team": str(r.get(tc, "") or "").strip() if tc else "",
+                "Status": status,
+                "Reason": str(r.get(rc, "") or "").strip() if rc else "",
+                "Source": "Official WNBA injury report",
+                "FetchedAt": now_iso(),
+            })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out, "official WNBA injury report loaded but no player rows recognized"
+    out["NameKey"] = out["Player"].map(normalize_name)
+    out["TeamKey"] = out.get("Team", "").map(_team_key_for_matchup)
+    out["StatusKey"] = out.get("Status", "").astype(str).str.upper()
+    return out.drop_duplicates(["NameKey", "TeamKey", "StatusKey"], keep="last"), f"official WNBA injury report: {len(out)} rows"
+
+
+def _combined_live_injury_table(mode: str = "Today") -> Tuple[pd.DataFrame, str]:
+    frames = []
+    notes = []
+    try:
+        auto = load_automated_injury_table(mode, force=False)
+        if auto is not None and not auto.empty:
+            frames.append(auto.copy())
+            notes.append(f"automated/manual injuries {len(auto)} rows")
+    except Exception as exc:
+        notes.append(f"automated injury table error: {str(exc)[:90]}")
+    try:
+        official, note = fetch_official_wnba_injury_report_rows()
+        notes.append(note)
+        if official is not None and not official.empty:
+            frames.append(official.copy())
+    except Exception as exc:
+        notes.append(f"official injury table error: {str(exc)[:90]}")
+    if not frames:
+        return pd.DataFrame(), " | ".join(notes) if notes else "no injury feed loaded"
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    if "Player" not in out.columns:
+        return pd.DataFrame(), "injury feeds loaded without player column"
+    out["NameKey"] = out.get("NameKey", out["Player"].map(normalize_name))
+    out["TeamKey"] = out.get("TeamKey", out.get("Team", "").map(_team_key_for_matchup))
+    out["Status"] = out.get("Status", out.get("status", "")).astype(str)
+    out["StatusKey"] = out.get("StatusKey", out["Status"].astype(str).str.upper())
+    return out.drop_duplicates(["NameKey", "TeamKey", "StatusKey"], keep="last"), " | ".join(notes)
+
+
+def _latest_line_snapshot_context(player: str, market: str, current_line: float) -> Dict[str, Any]:
+    ctx = clv_engine(player, market, current_line)
+    try:
+        hist = pd.DataFrame(load_json(LINE_HISTORY_FILE, []))
+        if hist.empty:
+            return ctx
+        hist["NameKey"] = hist.get("NameKey", hist.get("Player", "").map(normalize_name))
+        hist["PulledAtDt"] = pd.to_datetime(hist.get("PulledAt", hist.get("SavedAt", "")), errors="coerce")
+        h = hist[
+            (hist["NameKey"] == normalize_name(player)) &
+            (hist.get("Market", "").astype(str).str.upper() == str(market).upper())
+        ].copy()
+        h = h.dropna(subset=["PulledAtDt"]).sort_values("PulledAtDt")
+        if not h.empty:
+            ctx["Line Pulled At"] = h.iloc[-1]["PulledAtDt"].isoformat()
+            ctx["Line Snapshot Count"] = int(len(h))
+            age = (pd.Timestamp.now(tz=None) - h.iloc[-1]["PulledAtDt"].tz_localize(None)).total_seconds()/60.0
+            ctx["Line Age Minutes"] = round(float(max(0, age)), 1)
+    except Exception:
+        pass
+    return ctx
+
+
+def _minutes_until_start(row: pd.Series) -> float:
+    for col in ["Start", "EventStartUTC", "GameTime", "CommenceTime"]:
+        raw = str(row.get(col, "") or "").strip()
+        if not raw:
+            continue
+        dt = pd.to_datetime(raw, errors="coerce", utc=True)
+        if pd.notna(dt):
+            now = pd.Timestamp.utcnow()
+            return float((dt - now).total_seconds()/60.0)
+    return np.nan
+
+
+def _lineup_confirmed(row: pd.Series) -> bool:
+    txt = _strong_text_blob(row, ["Starter Status", "Lineup Status", "Projected Rotation Note", "FallbackLineupRole"])
+    return any(tag in txt for tag in ["CONFIRMED START", "CONFIRMED STARTER", "STARTING", "STARTER", "PROJECTED STARTER"])
+
+
+def _strong_trust_enrich_board(board: pd.DataFrame, mode: Optional[str] = None) -> pd.DataFrame:
+    """Attach freshness, injury, lineup and line-history fields before final gate."""
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    mode = mode or str(st.session_state.get("wnba_current_mode", "Today"))
+    inj, inj_note = _combined_live_injury_table(mode)
+    inj_map = {}
+    if inj is not None and not inj.empty:
+        for _, r in inj.iterrows():
+            key = normalize_name(r.get("Player"))
+            if not key:
+                continue
+            status = str(r.get("Status", "") or "").strip()
+            reason = str(r.get("Reason", "") or r.get("Injury", "") or "").strip()
+            team = _team_key_for_matchup(r.get("Team"))
+            rec = {"status": status, "reason": reason, "team": team, "source": str(r.get("Source", "") or "injury feed")}
+            inj_map[(key, team)] = rec
+            inj_map.setdefault((key, ""), rec)
+    refresh_raw = st.session_state.get("wnba_last_refresh", "")
+    refresh_dt = pd.to_datetime(refresh_raw, errors="coerce")
+    refresh_age = np.nan
+    if pd.notna(refresh_dt):
+        try:
+            refresh_age = (pd.Timestamp.now(tz=None) - refresh_dt.tz_localize(None)).total_seconds()/60.0
+        except Exception:
+            refresh_age = (pd.Timestamp.now() - refresh_dt).total_seconds()/60.0
+
+    rows = []
+    for _, rr in out.iterrows():
+        row = rr.copy()
+        player_key = normalize_name(row.get("Matched Player") or row.get("Player"))
+        team_key = _team_key_for_matchup(row.get("Team"))
+        hit = inj_map.get((player_key, team_key)) or inj_map.get((player_key, ""))
+        if hit:
+            row["Injury Status"] = hit.get("status", "")
+            row["Availability"] = hit.get("status", "")
+            row["Injury Report Reason"] = hit.get("reason", "")
+            row["Injury Source"] = hit.get("source", "")
+        elif not str(row.get("Injury Status", "") or "").strip():
+            row["Injury Status"] = "Not listed"
+            row["Availability"] = "Not listed"
+        line_ctx = _latest_line_snapshot_context(row.get("Player"), row.get("Market"), safe_float(row.get("Line"), np.nan))
+        for k, v in line_ctx.items():
+            row[k] = v
+        minutes_to_tip = _minutes_until_start(row)
+        row["Minutes Until Tip"] = round(minutes_to_tip, 1) if pd.notna(minutes_to_tip) else np.nan
+        row["Lineup Confirmed"] = bool(_lineup_confirmed(row))
+        row["Lineup Trust Note"] = "confirmed/projected starter signal loaded" if row["Lineup Confirmed"] else "lineup not confirmed; require late check"
+        row["Data Freshness Minutes"] = round(float(refresh_age), 1) if pd.notna(refresh_age) else np.nan
+        line_age = safe_float(row.get("Line Age Minutes"), np.nan)
+        row["Freshness Status"] = (
+            "STALE"
+            if (pd.notna(refresh_age) and refresh_age > 240) or (pd.notna(line_age) and line_age > 240)
+            else "FRESH" if pd.notna(refresh_age) or pd.notna(line_age)
+            else "UNKNOWN"
+        )
+        late_window = pd.notna(minutes_to_tip) and -15 <= minutes_to_tip <= 60
+        avail_txt = _strong_text_blob(row, ["Injury Status", "Availability"])
+        clean_avail = bool(avail_txt) and not any(tag in avail_txt for tag in ["QUESTIONABLE", "DOUBTFUL", "OUT", "GTD", "GAME TIME", "LIMIT"])
+        row["Late Scratch Risk"] = bool(late_window and not (clean_avail and row["Lineup Confirmed"]))
+        row["Trust Feed Note"] = inj_note
+        row["Strong Trust Version"] = STRONG_PLAY_FRESHNESS_VERSION
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _strict_num_from(row, names, default=np.nan):
@@ -11220,7 +11544,7 @@ def _strict_market_inputs(row: pd.Series, br: Optional[pd.Series], market: str) 
     return values
 
 
-def _strict_component_projection(row: pd.Series, br: Optional[pd.Series], market: str) -> tuple:
+def _strict_component_projection(row: pd.Series, br: Optional[pd.Series], market: str, market_shrink: bool = False) -> tuple:
     values = _strict_market_inputs(row, br, market)
     available = [float(v) for v in values.values() if pd.notna(v)]
     if not available:
@@ -11236,6 +11560,12 @@ def _strict_component_projection(row: pd.Series, br: Optional[pd.Series], market
     minutes_mult, minutes_conf = _v344_minutes_multiplier(row, br)
     matchup_mult, matchup_grade, matchup_conf = _v344_matchup_multiplier(row)
     raw = anchor * minutes_mult * matchup_mult
+    true_recent = _strict_num_from(br, [f"{market}_true_recent_proj", f"{market.lower()}_true_recent_proj"], np.nan) if br is not None else np.nan
+    if pd.notna(true_recent):
+        # The online master already converts recent production to a minutes-adjusted
+        # per-minute expectation. Let that lead the mean, while the window anchor
+        # keeps hot/cold samples from taking over.
+        raw = 0.62 * float(true_recent) + 0.38 * raw
     stable = [values.get(k) for k in ["l10", "l20", "season", "prior"] if pd.notna(values.get(k))]
     if stable:
         center = float(np.median(stable))
@@ -11247,7 +11577,13 @@ def _strict_component_projection(row: pd.Series, br: Optional[pd.Series], market
     sample_n = _strict_num_from(br, [f"{market}_Games", "Games", "GP"], 15.0) if br is not None else 15.0
     sample_quality = float(np.clip(sample_n/25.0, 0.35, 1.0))
     integrity = str(row.get("Data Integrity", "LIMITED")).upper()
-    final, market_weight = _v344_market_shrink(raw, line, integrity, sample_quality)
+    if market_shrink:
+        # Tiny closing-number respect, but do not let the line become the model.
+        final, market_weight = _v344_market_shrink(raw, line, integrity, sample_quality)
+        final = 0.85 * raw + 0.15 * final
+        market_weight *= 0.15
+    else:
+        final, market_weight = raw, 0.0
     return final, values, {
         "anchor": anchor,
         "minutes_mult": minutes_mult,
@@ -11279,7 +11615,7 @@ def _strict_market_isolated_rebuild(board: pd.DataFrame, base: Optional[pd.DataF
             components, values_by_market, meta_by_market = {}, {}, {}
             for component_market in ["PTS", "REB", "AST", "PRA"]:
                 source_row = _strict_market_source_row(row, component_market, market_rows)
-                projection, values, meta = _strict_component_projection(source_row, br, component_market)
+                projection, values, meta = _strict_component_projection(source_row, br, component_market, market_shrink=False)
                 components[component_market] = projection
                 values_by_market[component_market] = values
                 meta_by_market[component_market] = meta
@@ -11300,9 +11636,8 @@ def _strict_market_isolated_rebuild(board: pd.DataFrame, base: Optional[pd.DataF
                 "sample_quality": float(np.mean([meta_by_market[m].get("sample_quality", 0.35) for m in ["PTS", "REB", "AST"]])),
             }
         else:
-            final_projection = components.get(market, np.nan)
-            display_values = values_by_market.get(market, _strict_market_inputs(row, br, market))
-            meta = meta_by_market.get(market, {})
+            current_source_row = _strict_market_source_row(row, market, market_rows)
+            final_projection, display_values, meta = _strict_component_projection(current_source_row, br, market, market_shrink=True)
 
         row["Projection Before Market Isolation"] = safe_float(row.get("Projection"), np.nan)
         row["Projection"] = round(final_projection, 2) if pd.notna(final_projection) else np.nan
@@ -11347,6 +11682,7 @@ def _stable_repair_projection_board(board: pd.DataFrame, base: Optional[pd.DataF
     fixed = _strict_attach_opponent_context(board.copy(), mode or str(board.get("Slate", pd.Series(["Today"])).iloc[0] if "Slate" in board.columns else "Today"))
     fixed = _strict_market_isolated_rebuild(fixed, base)
     fixed = _stable_attach_context_audit_only(fixed, base)
+    fixed = _strong_trust_enrich_board(fixed, mode)
     fixed = _stable_recalculate_side_fields(fixed, base)
     fixed["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
     return fixed
@@ -11358,6 +11694,7 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
     board = _strict_attach_opponent_context(board, mode or "Today")
     board = _strict_market_isolated_rebuild(board, base)
     board = _stable_attach_context_audit_only(board, base)
+    board = _strong_trust_enrich_board(board, mode or "Today")
     board = _stable_recalculate_side_fields(board, base)
     if board is not None and not board.empty:
         board["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
@@ -11417,7 +11754,7 @@ with tabs[1]:
         if card_view:
             for _, rr in show.head(40).iterrows():
                 render_card(rr)
-        display_cols = [c for c in ["Tier", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Projection", "Edge", "Lean", "Official", "Official Play Score", "Over %", "Under %", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+        display_cols = [c for c in ["Tier", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Opening Line", "CLV", "Projection", "Edge", "Lean", "Official", "Official Play Score", "Over %", "Under %", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
         st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
