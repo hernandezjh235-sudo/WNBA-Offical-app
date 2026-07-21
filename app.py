@@ -8733,9 +8733,12 @@ def render_data_manager_tab():
     with y1:
         if st.button("Refresh SportsDataverse Database", use_container_width=True, key="dm_refresh_remote_visible_nologo"):
             with st.spinner("Refreshing SportsDataverse cache..."):
-                dbg, master, team_ranks = refresh_data_and_build_advanced_features(dataset_choices, [int(season_last), int(season_now)], include_heavy)
+                master, team_ranks, dbg, audit = refresh_data_and_build_advanced_features(dataset_choices, [int(season_last), int(season_now)], include_heavy)
             st.success(f"SportsDataverse refresh complete. Master rows: {0 if master is None else len(master)}")
             st.dataframe(dbg, use_container_width=True)
+            if audit is not None and not audit.empty:
+                st.caption("Missing-field audit")
+                st.dataframe(audit, use_container_width=True)
     with y2:
         if st.button("Download missing-field report", use_container_width=True, key="dm_report_button_nologo"):
             report_path = DATA_DIR / "wnba_feature_missing_report.csv"
