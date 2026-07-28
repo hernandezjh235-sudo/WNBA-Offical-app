@@ -32,7 +32,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.5.6 — No-Bleed Components + Hard Sanity Gates"
+APP_VERSION = "WNBA v3.5.7 — Baseline-Safe Components + Cache Audit"
 LINE_PARSER_VERSION = "UD_FULL_GAME_MAINLINE_V2"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
 EMBEDDED_DATA_VERSION = "CORE_DATA_SELF_HEAL_V1"
@@ -9140,7 +9140,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v3.5.6 — No-Bleed Components + Hard Sanity Gates"
+APP_VERSION = "WNBA v3.5.7 — Baseline-Safe Components + Cache Audit"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -9397,6 +9397,7 @@ def grouped_board_table_view(proj_df: pd.DataFrame) -> pd.DataFrame:
     df["_market_order"] = df.get("Market", "").astype(str).str.upper().map(order).fillna(99)
     keep = [c for c in [
         "Player","Team","Opponent","Matchup","Opponent Matchup Grade","Opponent Matchup Score",
+        "Projection Engine Version","Winning Gate Version","Projection Audit",
         "Opponent Market Rank","Opponent Pace","Opponent DRtg","Market","Projection","Line","Edge",
         "Projection Before Component Opportunity","Component Opportunity Factor","Component Opportunity Note",
         "PTS Component Opportunity","REB Component Opportunity","AST Component Opportunity",
@@ -10647,8 +10648,8 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v3.5.6 — No-Bleed Components + Hard Sanity Gates"
-PROJECTION_ENGINE_VERSION = "V356_NO_BLEED_COMPONENTS_SANITY_V1"
+APP_VERSION = "WNBA v3.5.7 — Baseline-Safe Components + Cache Audit"
+PROJECTION_ENGINE_VERSION = "V357_BASELINE_SAFE_COMPONENTS_V1"
 PROJECTION_ENGINE_NOTE = "Bayesian L5/L10/L20/season baseline + bounded minutes once + verified matchup once + small market shrink; later context is audit-only."
 
 
@@ -11160,8 +11161,8 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v3.5.6 — No-Bleed Components + Hard Sanity Gates"
-PROJECTION_ENGINE_VERSION = "V356_NO_BLEED_COMPONENTS_SANITY_V1"
+APP_VERSION = "WNBA v3.5.7 — Baseline-Safe Components + Cache Audit"
+PROJECTION_ENGINE_VERSION = "V357_BASELINE_SAFE_COMPONENTS_V1"
 PROJECTION_ENGINE_NOTE = (
     "Each market uses its own workload-adjusted true-recent baseline plus L5/L10/L20/season "
     "shrinkage. Opponent pace/DRtg is joined before one bounded matchup adjustment. "
@@ -11171,7 +11172,7 @@ PROJECTION_ENGINE_NOTE = (
 OFFICIAL_WNBA_INJURY_URL = "https://www.wnba.com/webview/wnba-injury-report"
 STRONG_PLAY_FRESHNESS_VERSION = "V349_STRONG_TRUST_FRESHNESS_V1"
 WNBA_MONTE_CARLO_SIMS = 15000
-WNBA_WINNING_GATE_VERSION = "V356_NO_BLEED_COMPONENTS_SANITY_GATE"
+WNBA_WINNING_GATE_VERSION = "V357_BASELINE_SAFE_COMPONENTS_GATE"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -11954,15 +11955,57 @@ def _component_opportunity_projection(row: pd.Series, br: Optional[pd.Series], m
     }
 
 
+def _baseline_safe_component_projection(row: pd.Series, br: Optional[pd.Series], market: str) -> Tuple[float, Dict[str, Any]]:
+    """Baseline-only component projection.
+
+    This intentionally does not read the visible row Projection, because that
+    column is market-specific and caused cross-market bleed in prior versions.
+    """
+    if br is None:
+        return np.nan, {"factor": np.nan, "note": "missing player baseline"}
+    values = _strict_market_inputs(pd.Series({"Market": market}), br, market)
+    available = [float(v) for v in values.values() if pd.notna(v)]
+    if not available:
+        return np.nan, {"factor": np.nan, "note": f"{market} baseline unavailable"}
+    med = float(np.median(available))
+    for k in values:
+        if pd.isna(values[k]):
+            values[k] = med
+    base_proj = float(
+        0.20 * values.get("l5", med)
+        + 0.30 * values.get("l10", med)
+        + 0.18 * values.get("l20", med)
+        + 0.30 * values.get("season", med)
+        + 0.02 * values.get("prior", med)
+    )
+    avg_min = _strict_num_from(br, ["MIN_avg", "MIN", "minutes"], np.nan)
+    row_min = safe_float(row.get("MIN Proj"), np.nan)
+    minute_factor = 1.0
+    if pd.notna(avg_min) and avg_min > 0 and pd.notna(row_min) and row_min > 0:
+        minute_factor = float(np.clip(row_min / avg_min, 0.88, 1.10))
+    matchup_factor, matchup_note = _pace_adjusted_matchup_factor(row, market)
+    matchup_factor = float(np.clip(matchup_factor, 0.97, 1.03))
+    total_factor = float(np.clip(minute_factor * matchup_factor, 0.86, 1.12))
+    projected = base_proj * total_factor
+    caps = {"PTS": (0.0, 42.0, 5.5), "REB": (0.0, 19.0, 3.2), "AST": (0.0, 15.0, 2.8), "PRA": (0.0, 60.0, 8.0)}
+    lo, hard_hi, bump_cap = caps.get(market, (0.0, 45.0, 4.0))
+    season = safe_float(values.get("season"), med)
+    soft_hi = max(season + bump_cap, med + bump_cap)
+    projected = float(np.clip(projected, lo, min(hard_hi, soft_hi)))
+    return projected, {
+        "base": base_proj,
+        "factor": total_factor,
+        "minute_factor": minute_factor,
+        "matchup_factor": matchup_factor,
+        "note": f"baseline-safe {market}; minutes {minute_factor:.3f}; {matchup_note}",
+    }
+
+
 def _apply_component_opportunity_engine(board: pd.DataFrame, base: Optional[pd.DataFrame]) -> pd.DataFrame:
     if board is None or board.empty:
         return board
     lookup = _v344_player_lookup(base) if base is not None and not base.empty else pd.DataFrame()
     rows = []
-    group_cols = [c for c in ["Matched Player", "Player", "Team", "Opponent", "Slate", "SlateDate"] if c in board.columns]
-    player_col = "Matched Player" if "Matched Player" in board.columns else "Player"
-    group_cols = [player_col] + [c for c in ["Team", "Opponent", "Slate", "SlateDate"] if c in board.columns]
-    market_rows = _strict_player_market_rows(board)
     component_cache = {}
     for _, rr in board.iterrows():
         row = rr.copy()
@@ -11974,8 +12017,7 @@ def _apply_component_opportunity_engine(board: pd.DataFrame, base: Optional[pd.D
         if cache_key not in component_cache:
             comps, metas = {}, {}
             for m in ["PTS", "REB", "AST"]:
-                source_row = _strict_market_source_row(row, m, market_rows)
-                p, meta = _component_opportunity_projection(source_row, br, m)
+                p, meta = _baseline_safe_component_projection(row, br, m)
                 comps[m] = p
                 metas[m] = meta
             component_cache[cache_key] = (comps, metas)
@@ -11996,9 +12038,10 @@ def _apply_component_opportunity_engine(board: pd.DataFrame, base: Optional[pd.D
             note = metas[market].get("note", "")
             factor = metas[market].get("factor", np.nan)
         else:
-            new_projection = old_projection
-            note = "component opportunity projection unavailable; retained prior projection"
-            factor = 1.0
+            fallback, meta = _baseline_safe_component_projection(row, br, market)
+            new_projection = fallback if pd.notna(fallback) else old_projection
+            note = meta.get("note", "baseline-safe projection unavailable; retained prior projection")
+            factor = meta.get("factor", 1.0)
         row["Projection Before Component Opportunity"] = round(old_projection, 2) if pd.notna(old_projection) else np.nan
         row["Projection"] = round(new_projection, 2) if pd.notna(new_projection) else np.nan
         row["Component Opportunity Factor"] = round(float(factor), 4) if pd.notna(factor) else np.nan
@@ -12496,7 +12539,7 @@ with tabs[1]:
         if card_view:
             for _, rr in show.head(40).iterrows():
                 render_card(rr)
-        display_cols = [c for c in ["Tier", "Official", "Clean Risk", "Winning Play Score", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Opening Line", "CLV", "Projection", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+        display_cols = [c for c in ["Tier", "Official", "Clean Risk", "Winning Play Score", "Projection Engine Version", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Opening Line", "CLV", "Projection", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
         st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
