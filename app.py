@@ -184,6 +184,11 @@ TEAM_LOGO_ALIASES = {
     "TOR": "TOR", "TORONTO": "TOR", "TORONTO TEMPO": "TOR",
     "WAS": "WAS", "WSH": "WAS", "WASHINGTON": "WAS", "WASHINGTON MYSTICS": "WAS",
 }
+TEAM_ESPN_LOGO_SLUGS = {
+    "ATL": "atl", "CHI": "chi", "CON": "conn", "DAL": "dal", "GSV": "gs",
+    "IND": "ind", "LVA": "lv", "LAS": "la", "MIN": "min", "NYL": "ny",
+    "PHX": "phx", "SEA": "sea", "WAS": "wsh", "POR": "por", "TOR": "tor",
+}
 
 def team_abbr_for_logo(team: Any) -> str:
     t = str(team or "").strip().upper()
@@ -225,6 +230,9 @@ def get_team_logo_src(team: Any) -> str:
     gh = github_logo_url(abbr)
     if gh:
         return gh
+    slug = TEAM_ESPN_LOGO_SLUGS.get(abbr, abbr.lower())
+    if slug:
+        return f"https://a.espncdn.com/i/teamlogos/wnba/500/{slug}.png"
     return ""
 
 # ============================================================
@@ -5761,7 +5769,15 @@ def render_card(r):
     slate_date = _val(r.get("SlateDate"), "")
     matched = _val(r.get("Matched Player"), r.get("Player"))
     logo_src = get_team_logo_src(r.get("Team"))
-    logo_html = f"<img class='owp-logo' src='{logo_src}'/>" if logo_src else f"<div class='owp-logo' style='display:flex;align-items:center;justify-content:center;font-weight:1000;color:#e9d5ff'>{team_abbr_for_logo(r.get('Team'))}</div>"
+    logo_abbr = html.escape(team_abbr_for_logo(r.get("Team")))
+    logo_html = (
+        f"<div class='owp-logo' style='display:flex;align-items:center;justify-content:center;font-weight:1000;color:#e9d5ff'>"
+        f"<img src='{html.escape(logo_src)}' alt='{logo_abbr}' style='width:100%;height:100%;object-fit:contain' "
+        f"onerror=\"this.style.display='none';this.nextElementSibling.style.display='inline'\">"
+        f"<span style='display:none'>{logo_abbr}</span></div>"
+        if logo_src else
+        f"<div class='owp-logo' style='display:flex;align-items:center;justify-content:center;font-weight:1000;color:#e9d5ff'>{logo_abbr}</div>"
+    )
     why = _val(r.get("Projection Explanation"), "Projection explanation unavailable.")
     pos = _val(r.get("Biggest Positive"), "No major positive isolated.")
     risk = _val(r.get("Biggest Risk"), "No major risk isolated.")
@@ -8271,11 +8287,8 @@ def run_one_click_refresh_today(mode: str = "Today", use_ud_flag: bool = True) -
     return status
 
 
-# No-logo UI override: hide/remove logo boxes and keep Data Manager data-focused.
-def get_team_logo_src(team: Any) -> str:
-    return ""
-
-st.markdown("<style>.owp-logo{display:none!important}.owp-card-main{gap:10px!important}</style>", unsafe_allow_html=True)
+# Logo UI override removed: cards use local assets, configured GitHub assets, or ESPN logo fallback.
+st.markdown("<style>.owp-card-main{gap:10px!important}</style>", unsafe_allow_html=True)
 
 
 st.markdown("""<style>
@@ -8404,6 +8417,20 @@ def _grouped_market_html(r: pd.Series) -> str:
     """
 
 
+def _team_logo_html(team: Any, extra_cls: str = "") -> str:
+    abbr = html.escape(team_abbr_for_logo(team))
+    src = html.escape(get_team_logo_src(team))
+    if src:
+        return (
+            f"<span class='owp-team-logo {extra_cls}'>"
+            f"<img class='owp-team-logo-img' src='{src}' alt='{abbr}' "
+            f"onerror=\"this.style.display='none';this.nextElementSibling.style.display='inline'\">"
+            f"<span class='owp-team-logo-text' style='display:none'>{abbr}</span>"
+            f"</span>"
+        )
+    return f"<span class='owp-team-logo {extra_cls}'><span class='owp-team-logo-text'>{abbr}</span></span>"
+
+
 def render_grouped_player_card(player_df: pd.DataFrame):
     if player_df is None or player_df.empty:
         return
@@ -8422,21 +8449,16 @@ def render_grouped_player_card(player_df: pd.DataFrame):
     role = str(first.get("FallbackLineupRole", first.get("Minutes Safety", "NA")))
     min_proj = _fmt_num_compact(player_df.get("MIN Proj", pd.Series([np.nan])).max(), 1)
     data_score = _fmt_num_compact(player_df.get("Data Score", pd.Series([np.nan])).max(), 0)
-    best = player_df.copy()
-    best["_abs_edge"] = pd.to_numeric(best.get("Edge", np.nan), errors="coerce").abs()
-    best = best.sort_values("_abs_edge", ascending=False).iloc[0]
-    best_mkt = str(best.get("Market", "PROP"))
-    best_side = "OVER" if "OVER" in str(best.get("Lean", "")).upper() else "UNDER" if "UNDER" in str(best.get("Lean", "")).upper() else "TRACK"
     market_html = "".join(_grouped_market_html(r) for _, r in player_df.iterrows())
     tracked_n = int(player_df.get("Tracking Status", pd.Series(dtype=str)).astype(str).str.upper().isin(["TRACK", "OFFICIAL"]).sum())
     tracking_pill = f"<span class='owp-pill owp-pill-track'>TRACKED {tracked_n}/{len(player_df)}</span>" if tracked_n else ""
-    team_logo = html.escape(team[:3].upper() or "WN")
-    opp_logo = html.escape(opp[:3].upper() or "OPP")
+    team_logo = _team_logo_html(team)
+    opp_logo = _team_logo_html(opp, "owp-opp-logo")
     st.markdown(f"""
     <div class='owp-group-card'>
       <div class='owp-group-top'>
         <div class='owp-player-wrap'>
-          <div class='owp-logo-row'><span class='owp-team-logo'>{team_logo}</span><span class='owp-vs'>vs</span><span class='owp-team-logo owp-opp-logo'>{opp_logo}</span></div>
+          <div class='owp-logo-row'>{team_logo}<span class='owp-vs'>vs</span>{opp_logo}</div>
           <div class='owp-player'>{player}</div>
           <div class='owp-match'>{matchup} <span class='owp-muted'>| {team} | {pos}</span></div>
           <span class='owp-pill owp-pill-source'>{source_count or 'Lines'}</span>
@@ -8444,7 +8466,6 @@ def render_grouped_player_card(player_df: pd.DataFrame):
           <span class='owp-pill owp-pill-score'>Data {data_score}/100</span>
           {tracking_pill}
         </div>
-        <div class='owp-group-best'><span class='owp-best-label'>Best</span><b>{best_mkt} {best_side}</b><br><span>Min {min_proj}</span></div>
       </div>
       {market_html}
     </div>
@@ -10132,6 +10153,16 @@ st.markdown("""
 .owp-group-card{width:100%;box-sizing:border-box;overflow:hidden;border:1px solid rgba(168,85,247,.48);border-left:6px solid #a855f7;border-radius:20px;padding:16px;margin:16px 0;background:linear-gradient(180deg,rgba(17,10,31,.98),rgba(24,10,42,.94));box-shadow:0 0 28px rgba(168,85,247,.12)}
 .owp-group-top{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap}.owp-player-wrap{min-width:0;flex:1}.owp-logo-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}.owp-team-logo{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:50%;background:#111827;border:1px solid rgba(255,255,255,.14);color:#facc15;font-weight:1000;font-size:.78rem}.owp-opp-logo{color:#93c5fd}.owp-vs{font-size:.68rem;color:#a78bfa;font-weight:1000}.owp-group-best{text-align:right;font-weight:1000;color:#e9d5ff;font-size:.95rem;min-width:96px}.owp-group-best b{display:block;color:#f8fafc;font-size:1.05rem}.owp-best-label{display:block;color:#a78bfa;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em}.owp-group-best span{color:#c4b5fd;font-weight:700}.owp-market-row{background:rgba(15,23,42,.68);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:12px;margin:10px 0;box-sizing:border-box}.owp-market-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.owp-market-name{font-size:.95rem;font-weight:1000;color:#fb7185;letter-spacing:.08em}.owp-market-vol{font-size:.68rem;border:1px solid rgba(250,204,21,.55);color:#fde68a;border-radius:999px;padding:2px 7px;font-weight:900}.owp-market-conf{margin-left:auto;border:1px solid rgba(34,197,94,.45);border-radius:999px;padding:3px 8px;font-weight:1000;font-size:.78rem}.owp-market-side{font-weight:1000;font-size:1.2rem}.owp-market-conf.over,.owp-market-side.over,.owp-market-edge.pos{color:#4ade80}.owp-market-conf.under,.owp-market-side.under,.owp-market-edge.neg{color:#fb7185}.owp-market-conf.track,.owp-market-side.track,.owp-market-edge.flat{color:#e9d5ff}.owp-market-main{display:flex;align-items:baseline;gap:10px;margin-top:9px;flex-wrap:wrap}.owp-market-proj{font-size:2rem;font-weight:1000;color:#f8fafc}.owp-market-edge{font-size:1rem;font-weight:1000}.owp-market-tier{color:#facc15;font-weight:900}.owp-market-track{height:9px;margin-top:9px}.owp-market-sub{display:flex;justify-content:space-between;color:#c4b5fd;font-size:.76rem;text-transform:uppercase;font-weight:900}.owp-market-note{font-size:.80rem;color:#cbd5e1;margin-top:8px;background:rgba(255,255,255,.04);border-left:3px solid rgba(251,113,133,.6);border-radius:8px;padding:8px 10px;line-height:1.35}.owp-market-note span{color:#a7f3d0}
 @media(max-width:640px){.owp-group-card{padding:12px;border-radius:16px}.owp-group-top{display:block}.owp-group-best{text-align:left;margin-top:10px}.owp-market-conf{margin-left:0}.owp-market-proj{font-size:1.8rem}.owp-market-side{font-size:1.05rem}.owp-market-note{font-size:.76rem}}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+.owp-team-logo{overflow:hidden;background:rgba(15,23,42,.88)!important}
+.owp-team-logo-img{width:100%;height:100%;object-fit:contain;padding:4px;box-sizing:border-box;display:block}
+.owp-team-logo-text{font-size:.72rem;font-weight:1000;color:#facc15}
+.owp-opp-logo .owp-team-logo-text{color:#93c5fd}
+.owp-group-card pre,.owp-group-card code{display:none!important}
 </style>
 """, unsafe_allow_html=True)
 
@@ -12947,7 +12978,7 @@ except Exception as _stable_startup_exc:
     st.session_state["wnba_stable_startup_repair_error"] = str(_stable_startup_exc)[:240]
 
 
-tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
+tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Moneyline", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
 
 with tabs[0]:
     st.markdown("<div class='section-title'>PLAYER CARDS / Grouped Markets</div>", unsafe_allow_html=True)
@@ -13001,6 +13032,24 @@ with tabs[2]:
     render_slate_tracker(tracker_board, "main_slate_tracker")
 
 with tabs[3]:
+    st.subheader("Moneyline / Game Script")
+    st.caption("WNBA game-level model: pace, ORtg, DRtg, projected score, spread, total, win probability, blowout risk, and 15k game simulation.")
+    ml_board = load_dataset("projection_board")
+    if ml_board is None or ml_board.empty:
+        st.warning("No projection board cached yet. Refresh Player Cards or a market board first so matchups can be built.")
+    else:
+        render_wnba_ml_system(ml_board, "moneyline_tab")
+        ml_cols = [c for c in [
+            "Team", "Opponent", "Matchup", "WNBA ML Game Script", "Projected Team Score ML",
+            "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML",
+            "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML"
+        ] if c in ml_board.columns]
+        if ml_cols:
+            ml_view = ml_board[ml_cols].drop_duplicates().copy()
+            st.dataframe(ml_view, use_container_width=True, hide_index=True)
+            st.download_button("Download Moneyline/Game Script CSV", ml_view.to_csv(index=False), "wnba_moneyline_game_script.csv", "text/csv")
+
+with tabs[4]:
     st.subheader("Official + Grade")
     st.caption("Save official plays before games. Grade after results are imported. The Results tab shows ✅/❌ by player and market so you can quickly see what cleared the line.")
     grade_tabs = st.tabs(["Save / Grade", "After Game Results ✅❌", "Raw Logs"])
@@ -13087,10 +13136,10 @@ with tabs[3]:
             st.dataframe(learning.tail(300), use_container_width=True)
             st.download_button("Download learning log CSV", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
 
-with tabs[4]:
+with tabs[5]:
     render_data_manager_tab()
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Debug / Status")
     st.caption("Diagnostics only. Heavy imports/rebuilds are in Data Manager and never run automatically.")
     st.markdown("### Data status")
@@ -13150,7 +13199,7 @@ with tabs[5]:
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), use_container_width=True)
 
-with tabs[6]:
+with tabs[7]:
     st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
     st.caption("This page keeps the main UI clean while giving you the same deeper review tools: line movement, closing-line value, projection calibration, and historical model testing.")
 
