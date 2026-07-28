@@ -11804,7 +11804,7 @@ def _apply_winning_play_final_gate(board: pd.DataFrame, base: Optional[pd.DataFr
             row["Tier"] = "WINNING"
             row["PASS Reason"] = ""
         else:
-            row["Official"] = "PASS"
+            row["Official"] = "NO"
             row["Strong Play"] = "TRACK"
             row["Tier"] = "TRACK"
             row["PASS Reason"] = " | ".join(flags)
@@ -11916,9 +11916,11 @@ def _pace_adjusted_matchup_factor(row: pd.Series, market: str) -> Tuple[float, s
 def _component_opportunity_projection(row: pd.Series, br: Optional[pd.Series], market: str) -> Tuple[float, Dict[str, Any]]:
     source_row = row.copy()
     source_row["Market"] = market
-    base_proj = safe_float(row.get("Projection"), np.nan) if str(row.get("Market", "")).upper() == market else np.nan
-    if pd.isna(base_proj):
-        base_proj, _, _ = _strict_component_projection(source_row, br, market, market_shrink=False)
+    # Always rebuild the requested component from the player baseline. Reusing the
+    # visible row projection here caused PTS/REB/AST component bleed.
+    base_proj, _, _ = _strict_component_projection(source_row, br, market, market_shrink=False)
+    if pd.isna(base_proj) and str(row.get("Market", "")).upper() == market:
+        base_proj = safe_float(row.get("Projection"), np.nan)
     if pd.isna(base_proj):
         return np.nan, {"note": "component projection unavailable"}
     opp_factor, opp_note = _pace_adjusted_matchup_factor(row, market)
@@ -12043,6 +12045,27 @@ def _strict_team_context_table() -> pd.DataFrame:
             d["Season"] = 2026
         d["Season"] = pd.to_numeric(d["Season"], errors="coerce")
         frames.append(d)
+    try:
+        master = load_dataset("master_features")
+    except Exception:
+        master = pd.DataFrame()
+    if master is not None and not master.empty and "Team" in master.columns:
+        m = master.copy()
+        m["Team"] = m["Team"].map(lambda x: _team_key_for_matchup(x) or str(x or "").strip().upper())
+        if "Season" not in m.columns:
+            m["Season"] = 2026
+        m["Season"] = pd.to_numeric(m["Season"], errors="coerce")
+        keep = [c for c in ["Team", "Season", "Team_Pace", "Team_ORtg", "Team_DRtg", "Team_NetRtg", "Team_PointsAllowed"] if c in m.columns]
+        if {"Team", "Season"}.issubset(keep):
+            team_ctx = m[keep].copy().rename(columns={
+                "Team_Pace": "Pace",
+                "Team_ORtg": "ORtg",
+                "Team_DRtg": "DRtg",
+                "Team_NetRtg": "NetRtg",
+                "Team_PointsAllowed": "PointsAllowed",
+            })
+            team_ctx = team_ctx.groupby(["Season", "Team"], as_index=False).agg(lambda x: x.dropna().iloc[-1] if len(x.dropna()) else np.nan)
+            frames.append(team_ctx)
     if not frames:
         return pd.DataFrame()
     all_rows = pd.concat(frames, ignore_index=True, sort=False)
