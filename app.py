@@ -32,7 +32,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Stable Projections + Embedded Core Data"
+APP_VERSION = "WNBA v3.5.2 — Component Opportunity + Pace-Adjusted Matchup Engine"
 LINE_PARSER_VERSION = "UD_FULL_GAME_MAINLINE_V2"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
 EMBEDDED_DATA_VERSION = "CORE_DATA_SELF_HEAL_V1"
@@ -9108,7 +9108,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Stable Projections + Embedded Core Data"
+APP_VERSION = "WNBA v3.5.2 — Component Opportunity + Pace-Adjusted Matchup Engine"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -9366,14 +9366,24 @@ def grouped_board_table_view(proj_df: pd.DataFrame) -> pd.DataFrame:
     keep = [c for c in [
         "Player","Team","Opponent","Matchup","Opponent Matchup Grade","Opponent Matchup Score",
         "Opponent Market Rank","Opponent Pace","Opponent DRtg","Market","Projection","Line","Edge",
+        "Projection Before Component Opportunity","Component Opportunity Factor","Component Opportunity Note",
+        "PTS Component Opportunity","REB Component Opportunity","AST Component Opportunity",
+        "PRA Component PTS","PRA Component REB","PRA Component AST","PRA Component Sum","PRA Identity Check",
         "Lean","Over %","Under %","Hit Score","Official Play Score","Strong Play","Strong Play Score",
-        "Tier","MIN Proj","Projected FGA","L5 Avg","L10 Avg","Season Avg","Recent Support",
+        "Winning Play Score","Clean Risk","Tier","MIN Proj","Minutes Median","Minutes Low Outcome",
+        "Minutes High Outcome","Chance Under Expected Minutes","Projected FGA","L5 Avg","L10 Avg","Season Avg","Recent Support",
+        "Opponent Market Specific Grade","Opponent Market Allowed","Opponent Market Allowed L5",
+        "Opponent Market Allowed Rank","Market Rank Data Status","MC Median","MC P25","MC P75",
+        "MC Over %","MC Under %","MC Agreement","MC Volatility Label","Calibration Label",
+        "Calibration Samples","Calibration Win Rate %","Auto Threshold Add",
         "Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Freshness Status",
         "Lineup Confirmed","Late Scratch Risk","Minutes Until Tip","Injury Status","Availability",
-        "Data Integrity","Projection Sanity","Official","Strong Play Missing","PASS Reason","Source"
+        "Player Identity Verified","Market Projection Verified","Pick Side Verified","Projection Integrity",
+        "Projection Integrity Note","Data Integrity","Projection Sanity","Official","No-Bet Risk Flags","Winning Gate Note",
+        "Strong Play Missing","PASS Reason","Source"
     ] if c in df.columns]
     out = df.sort_values(["Player","_market_order","Line"], na_position="last")[keep].copy()
-    for c in ["Projection","Line","Edge","Over %","Under %","Hit Score","Official Play Score","Strong Play Score","MIN Proj","Projected FGA","Opponent Matchup Score","Opponent Market Rank","Opponent Pace","Opponent DRtg","Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Minutes Until Tip"]:
+    for c in ["Projection","Projection Before Component Opportunity","Component Opportunity Factor","PTS Component Opportunity","REB Component Opportunity","AST Component Opportunity","PRA Component PTS","PRA Component REB","PRA Component AST","PRA Component Sum","Line","Edge","Over %","Under %","Hit Score","Official Play Score","Strong Play Score","Winning Play Score","MIN Proj","Minutes Median","Minutes Low Outcome","Minutes High Outcome","Chance Under Expected Minutes","Projected FGA","Opponent Matchup Score","Opponent Market Rank","Opponent Pace","Opponent DRtg","Opponent Market Allowed","Opponent Market Allowed L5","Opponent Market Allowed Rank","MC Median","MC P25","MC P75","MC Over %","MC Under %","Calibration Samples","Calibration Win Rate %","Auto Threshold Add","Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Minutes Until Tip"]:
         if c in out.columns: out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
     return out
 
@@ -10605,8 +10615,8 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v3.4.8 — Working Pull Locked + Stable Single-Pass Projections"
-PROJECTION_ENGINE_VERSION = "V348_STABLE_SINGLE_PASS_V1"
+APP_VERSION = "WNBA v3.5.2 — Component Opportunity + Pace-Adjusted Matchup Engine"
+PROJECTION_ENGINE_VERSION = "V352_COMPONENT_OPPORTUNITY_MATCHUP_V1"
 PROJECTION_ENGINE_NOTE = "Bayesian L5/L10/L20/season baseline + bounded minutes once + verified matchup once + small market shrink; later context is audit-only."
 
 
@@ -11118,15 +11128,18 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v3.4.9 — 2026 Teams + Workload-Led Market-Isolated Projections"
-PROJECTION_ENGINE_VERSION = "V349_WORKLOAD_LED_MARKET_ISOLATED_V1"
+APP_VERSION = "WNBA v3.5.2 — Component Opportunity + Pace-Adjusted Matchup Engine"
+PROJECTION_ENGINE_VERSION = "V352_COMPONENT_OPPORTUNITY_MATCHUP_V1"
 PROJECTION_ENGINE_NOTE = (
     "Each market uses its own workload-adjusted true-recent baseline plus L5/L10/L20/season "
     "shrinkage. Opponent pace/DRtg is joined before one bounded matchup adjustment. "
-    "PRA equals the corrected component sum, and lines do not overwrite the model mean."
+    "PRA equals the corrected component sum, lines do not overwrite the model mean, and "
+    "official plays require 15k Monte Carlo, matchup, minutes, freshness, line value, and calibration agreement."
 )
 OFFICIAL_WNBA_INJURY_URL = "https://www.wnba.com/webview/wnba-injury-report"
 STRONG_PLAY_FRESHNESS_VERSION = "V349_STRONG_TRUST_FRESHNESS_V1"
+WNBA_MONTE_CARLO_SIMS = 15000
+WNBA_WINNING_GATE_VERSION = "V352_COMPONENT_OPPORTUNITY_MATCHUP_GATE"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -11308,6 +11321,660 @@ def _strong_trust_enrich_board(board: pd.DataFrame, mode: Optional[str] = None) 
         row["Strong Trust Version"] = STRONG_PLAY_FRESHNESS_VERSION
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _wnba_opponent_market_rank_table() -> pd.DataFrame:
+    """Market-specific opponent allowed table from player game logs.
+
+    Rows are keyed by defending team. Higher allowed ranks are more favorable
+    for overs. Last-5 values use the team's five most recent defended games.
+    """
+    try:
+        logs = load_dataset("player_game_logs")
+    except Exception:
+        logs = pd.DataFrame()
+    if logs is None or logs.empty:
+        return pd.DataFrame()
+    d = standardize_player_logs(logs) if "standardize_player_logs" in globals() else logs.copy()
+    if d is None or d.empty or "Opponent" not in d.columns:
+        return pd.DataFrame()
+    d = d.copy()
+    d["DefTeam"] = d["Opponent"].map(_team_key_for_matchup)
+    d["OffTeam"] = d.get("Team", "").map(_team_key_for_matchup)
+    if "GameDate" in d.columns:
+        d["GameDate"] = pd.to_datetime(d["GameDate"], errors="coerce")
+    else:
+        d["GameDate"] = pd.NaT
+    for c in ["PTS", "REB", "AST"]:
+        d[c] = pd.to_numeric(d.get(c), errors="coerce").fillna(0.0)
+    d["PRA"] = d["PTS"] + d["REB"] + d["AST"]
+    d = d[d["DefTeam"].astype(str).str.len() > 0].copy()
+    if d.empty:
+        return pd.DataFrame()
+
+    game_cols = ["DefTeam", "GameDate", "OffTeam"]
+    by_game = d.groupby(game_cols, dropna=False).agg(
+        PTSAllowed=("PTS", "sum"),
+        REBAllowed=("REB", "sum"),
+        ASTAllowed=("AST", "sum"),
+        PRAAllowed=("PRA", "sum"),
+    ).reset_index()
+    rows = []
+    for team, g in by_game.sort_values("GameDate").groupby("DefTeam"):
+        rec = {"Team": team, "Opponent Form Games": int(len(g))}
+        tail = g.tail(5)
+        for market in MARKETS:
+            col = f"{market}Allowed"
+            rec[f"{market} Allowed"] = float(g[col].mean()) if col in g.columns and not g.empty else np.nan
+            rec[f"{market} Allowed L5"] = float(tail[col].mean()) if col in tail.columns and not tail.empty else np.nan
+        rows.append(rec)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    n = max(1, len(out))
+    for market in MARKETS:
+        allowed = pd.to_numeric(out.get(f"{market} Allowed"), errors="coerce")
+        l5 = pd.to_numeric(out.get(f"{market} Allowed L5"), errors="coerce")
+        out[f"{market} Allowed Rank"] = allowed.rank(ascending=True, method="min")
+        out[f"{market} Allowed Percentile"] = allowed.rank(pct=True, ascending=True)
+        out[f"{market} Allowed L5 Rank"] = l5.rank(ascending=True, method="min")
+        out[f"{market} Allowed Teams"] = n
+    return out
+
+
+def _attach_market_rank_context(board: pd.DataFrame) -> pd.DataFrame:
+    if board is None or board.empty:
+        return board
+    ranks = _wnba_opponent_market_rank_table()
+    if ranks is None or ranks.empty:
+        out = board.copy()
+        out["Market Rank Data Status"] = "MISSING"
+        out["Market Rank Note"] = "No player game-log opponent allowed table available."
+        return out
+    rank_map = {str(r.get("Team")): r for _, r in ranks.iterrows()}
+    rows = []
+    for _, rr in board.iterrows():
+        row = rr.copy()
+        market = str(row.get("Market", "PTS")).upper()
+        opp = _team_key_for_matchup(row.get("Opponent"))
+        r = rank_map.get(opp)
+        if r is None:
+            row["Market Rank Data Status"] = "MISSING"
+            row["Market Rank Note"] = f"{opp or 'Opponent'} market-rank context unavailable."
+            rows.append(row)
+            continue
+        allowed = safe_float(r.get(f"{market} Allowed"), np.nan)
+        allowed_l5 = safe_float(r.get(f"{market} Allowed L5"), np.nan)
+        rank = safe_float(r.get(f"{market} Allowed Rank"), np.nan)
+        teams = safe_float(r.get(f"{market} Allowed Teams"), np.nan)
+        pct = safe_float(r.get(f"{market} Allowed Percentile"), np.nan)
+        # Higher allowed percentile means the opponent gives up more of that market.
+        grade = "FAVORABLE" if pd.notna(pct) and pct >= 0.67 else "TOUGH" if pd.notna(pct) and pct <= 0.33 else "NEUTRAL"
+        row["Opponent Market Allowed"] = round(allowed, 2) if pd.notna(allowed) else np.nan
+        row["Opponent Market Allowed L5"] = round(allowed_l5, 2) if pd.notna(allowed_l5) else np.nan
+        row["Opponent Market Allowed Rank"] = round(rank, 0) if pd.notna(rank) else np.nan
+        row["Opponent Market Allowed Teams"] = round(teams, 0) if pd.notna(teams) else np.nan
+        row["Opponent Market Allowed Percentile"] = round(pct, 3) if pd.notna(pct) else np.nan
+        row["Opponent Market Specific Grade"] = grade
+        row["Market Rank Data Status"] = "VERIFIED"
+        row["Market Rank Note"] = f"{opp} {market} allowed {allowed:.2f}/game, L5 {allowed_l5:.2f}, rank {rank:.0f}/{teams:.0f} ({grade})." if pd.notna(allowed) and pd.notna(rank) and pd.notna(teams) else f"{opp} {market} market context partial."
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _attach_minutes_distribution(board: pd.DataFrame, base: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if board is None or board.empty:
+        return board
+    lookup = _v344_player_lookup(base) if base is not None and not base.empty else pd.DataFrame()
+    rows = []
+    for _, rr in board.iterrows():
+        row = rr.copy()
+        key = normalize_name(row.get("Matched Player") or row.get("Player"))
+        br = lookup.loc[key] if (not lookup.empty and key in lookup.index) else None
+        mins = []
+        for c in ["MIN_l3", "MIN_l5", "MIN_l10", "MIN_l20", "MIN_avg", "MIN"]:
+            value = _stable_context_value(br, row, [c])
+            if pd.notna(value) and float(value) > 0:
+                mins.append(float(value))
+        proj_min = safe_float(row.get("MIN Proj"), np.nan)
+        if pd.notna(proj_min):
+            mins.append(float(proj_min))
+        if mins:
+            med = float(np.median(mins))
+            vol = float(np.std(mins)) if len(mins) >= 2 else 2.0
+            low = max(0.0, med - 1.15*max(1.2, vol))
+            high = min(40.5, med + 1.15*max(1.2, vol))
+            chance_under = 50.0 if pd.isna(proj_min) or vol <= 0 else float(np.clip(_normal_over_probability(proj_min, med, max(1.0, vol)), 0, 100))
+            # _normal_over_probability returns P(mean outcome > proj_min). Convert to chance minutes fall below projection.
+            chance_under = 100.0 - chance_under
+            row["Minutes Median"] = round(med, 2)
+            row["Minutes Low Outcome"] = round(low, 2)
+            row["Minutes High Outcome"] = round(high, 2)
+            row["Minutes Volatility"] = round(vol, 2)
+            row["Chance Under Expected Minutes"] = round(chance_under, 1)
+            row["Minutes Distribution Note"] = f"median {med:.1f}, low {low:.1f}, high {high:.1f}, volatility {vol:.1f}"
+        else:
+            row["Minutes Distribution Note"] = "minutes distribution unavailable"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _wnba_mc_distribution(row: pd.Series, base: Optional[pd.Series] = None, sims: int = WNBA_MONTE_CARLO_SIMS) -> Dict[str, Any]:
+    market = str(row.get("Market", "PTS")).upper()
+    line = safe_float(row.get("Line"), np.nan)
+    proj = safe_float(row.get("Projection"), np.nan)
+    if pd.isna(line) or pd.isna(proj):
+        return {"MC Sim Passes": 0, "MC Agreement": False, "MC Note": "Monte Carlo unavailable: missing line/projection"}
+    confidence = safe_float(row.get("Final Projection Confidence"), 70.0)
+    sd = safe_float(row.get("Simulation SD"), np.nan)
+    if pd.isna(sd):
+        try:
+            sd = _v344_sd(base, market, proj, confidence)
+        except Exception:
+            sd = {"PTS": 4.8, "REB": 2.35, "AST": 2.15, "PRA": 6.8}.get(market, 4.0)
+    min_vol = safe_float(row.get("Minutes Volatility"), 2.0)
+    matchup_pct = safe_float(row.get("Opponent Market Allowed Percentile"), 0.50)
+    seed = stable_seed(row.get("Player"), row.get("Team"), row.get("Opponent"), market, line, proj, PROJECTION_ENGINE_VERSION)
+    rng = np.random.default_rng(seed)
+    n = int(max(1000, sims))
+    minute_factor = rng.normal(1.0, min(0.08, max(0.018, min_vol/100.0)), n)
+    rate_factor = rng.normal(1.0, {"PTS":0.11, "REB":0.13, "AST":0.14, "PRA":0.10}.get(market, 0.11), n)
+    pace_factor = rng.normal(1.0, 0.018, n)
+    matchup_factor = rng.normal(1.0 + np.clip((matchup_pct - 0.5) * 0.035, -0.018, 0.018), 0.018, n)
+    noise = rng.normal(0.0, max(0.35, sd * 0.58), n)
+    vals = np.clip(proj * minute_factor * rate_factor * pace_factor * matchup_factor + noise, 0, None)
+    over = vals > line
+    over_pct = float(np.mean(over) * 100.0)
+    under_pct = 100.0 - over_pct
+    median = float(np.median(vals))
+    p25 = float(np.percentile(vals, 25))
+    p75 = float(np.percentile(vals, 75))
+    cv = float(np.std(vals) / max(0.5, np.mean(vals)))
+    lean = "OVER" if proj - line > 0 else "UNDER" if proj - line < 0 else "NEUTRAL"
+    mc_side = "OVER" if over_pct >= 50.0 else "UNDER"
+    agreement = lean in {"OVER", "UNDER"} and lean == mc_side and ((median > line) if lean == "OVER" else (median < line))
+    vol_label = "HIGH" if cv >= 0.42 else "LOW" if cv <= 0.22 else "NORMAL"
+    return {
+        "MC Sim Passes": n,
+        "MC Mean": round(float(np.mean(vals)), 2),
+        "MC Median": round(median, 2),
+        "MC P25": round(p25, 2),
+        "MC P75": round(p75, 2),
+        "MC Over %": round(over_pct, 1),
+        "MC Under %": round(under_pct, 1),
+        "MC Side": mc_side,
+        "MC Agreement": bool(agreement),
+        "MC Volatility CV": round(cv, 3),
+        "MC Volatility Label": vol_label,
+        "MC Note": f"{n:,} sims: median {median:.2f}, P25/P75 {p25:.2f}/{p75:.2f}, {mc_side} {max(over_pct, under_pct):.1f}%, volatility {vol_label}",
+    }
+
+
+def _attach_monte_carlo(board: pd.DataFrame, base: Optional[pd.DataFrame], sims: int = WNBA_MONTE_CARLO_SIMS) -> pd.DataFrame:
+    if board is None or board.empty:
+        return board
+    lookup = _v344_player_lookup(base) if base is not None and not base.empty else pd.DataFrame()
+    rows = []
+    for _, rr in board.iterrows():
+        row = rr.copy()
+        key = normalize_name(row.get("Matched Player") or row.get("Player"))
+        br = lookup.loc[key] if (not lookup.empty and key in lookup.index) else None
+        row.update(_wnba_mc_distribution(row, br, sims=sims))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _bucket_label(value: float, cuts: List[float], labels: List[str]) -> str:
+    if pd.isna(value):
+        return "unknown"
+    for cut, label in zip(cuts, labels):
+        if value < cut:
+            return label
+    return labels[-1] if labels else "unknown"
+
+
+def _graded_result_rows() -> pd.DataFrame:
+    rows = []
+    for path in [RESULT_LOG, OFFICIAL_LOG, LEARNING_LOG]:
+        try:
+            data = load_json(path, [])
+            if isinstance(data, list):
+                rows.extend([r for r in data if isinstance(r, dict)])
+        except Exception:
+            pass
+    d = pd.DataFrame(rows)
+    if d.empty:
+        return d
+    result_col = next((c for c in ["Result", "result", "Grade", "graded_result", "Grade Status"] if c in d.columns), None)
+    if result_col:
+        d["ResultKey"] = d[result_col].astype(str).str.upper()
+    else:
+        d["ResultKey"] = ""
+    d = d[d["ResultKey"].str.contains("WIN|LOSS", na=False)].copy()
+    if d.empty:
+        return d
+    if "Market" not in d.columns:
+        d["Market"] = d.get("market", "")
+    if "Lean" not in d.columns:
+        d["Lean"] = d.get("Pick", d.get("pick", d.get("Side", "")))
+    d["Market"] = d["Market"].astype(str).str.upper()
+    d["Lean"] = d["Lean"].astype(str).str.upper().map(lambda x: "OVER" if "OVER" in x else "UNDER" if "UNDER" in x else x)
+    d["EdgeNum"] = pd.to_numeric(d.get("Edge", d.get("edge", d.get("abs_edge", np.nan))), errors="coerce").abs()
+    d["ProbNum"] = pd.to_numeric(d.get("Over %", d.get("Under %", d.get("Probability", d.get("Win Probability %", np.nan)))), errors="coerce")
+    d["Win"] = d["ResultKey"].str.contains("WIN", na=False)
+    return d
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _calibration_summary_table() -> pd.DataFrame:
+    d = _graded_result_rows()
+    if d is None or d.empty:
+        return pd.DataFrame()
+    d = d.copy()
+    d["EdgeBucket"] = d["EdgeNum"].map(lambda x: _bucket_label(x, [0.75, 1.25, 2.0, 3.0], ["e<0.75", "e0.75-1.25", "e1.25-2.0", "e2.0-3.0", "e3+"]))
+    d["ProbBucket"] = d["ProbNum"].map(lambda x: _bucket_label(x, [56, 60, 63, 66], ["p<56", "p56-60", "p60-63", "p63-66", "p66+"]))
+    group_cols = ["Market", "Lean", "EdgeBucket", "ProbBucket"]
+    return d.groupby(group_cols, dropna=False).agg(
+        CalibrationSamples=("Win", "count"),
+        CalibrationWins=("Win", "sum"),
+        CalibrationWinRate=("Win", "mean"),
+    ).reset_index()
+
+
+def _attach_calibration_context(board: pd.DataFrame) -> pd.DataFrame:
+    if board is None or board.empty:
+        return board
+    cal = _calibration_summary_table()
+    if cal is None or cal.empty:
+        out = board.copy()
+        out["Calibration Label"] = "NO_HISTORY"
+        out["Calibration Samples"] = 0
+        out["Calibration Win Rate %"] = np.nan
+        out["Auto Threshold Add"] = 0.0
+        out["Calibration Note"] = "No graded WNBA sample yet."
+        return out
+    lookup = {
+        (str(r.get("Market")), str(r.get("Lean")), str(r.get("EdgeBucket")), str(r.get("ProbBucket"))): r
+        for _, r in cal.iterrows()
+    }
+    rows = []
+    for _, rr in board.iterrows():
+        row = rr.copy()
+        market = str(row.get("Market", "")).upper()
+        lean = str(row.get("Lean", "")).upper()
+        edge = abs(safe_float(row.get("Edge"), np.nan))
+        prob = max(safe_float(row.get("Over %"), 0), safe_float(row.get("Under %"), 0))
+        eb = _bucket_label(edge, [0.75, 1.25, 2.0, 3.0], ["e<0.75", "e0.75-1.25", "e1.25-2.0", "e2.0-3.0", "e3+"])
+        pb = _bucket_label(prob, [56, 60, 63, 66], ["p<56", "p56-60", "p60-63", "p63-66", "p66+"])
+        hit = lookup.get((market, lean, eb, pb))
+        if hit is None:
+            row["Calibration Label"] = "NO_BUCKET_HISTORY"
+            row["Calibration Samples"] = 0
+            row["Calibration Win Rate %"] = np.nan
+            row["Auto Threshold Add"] = 0.0
+            row["Calibration Note"] = f"No graded bucket for {market}/{lean}/{eb}/{pb}."
+        else:
+            n = int(safe_float(hit.get("CalibrationSamples"), 0))
+            wr = safe_float(hit.get("CalibrationWinRate"), np.nan)
+            label = "HOT_BUCKET" if n >= 8 and wr >= 0.60 else "COLD_BUCKET" if n >= 8 and wr < 0.52 else "SMALL_SAMPLE" if n < 8 else "NEUTRAL_BUCKET"
+            add = 0.35 if label == "COLD_BUCKET" else 0.15 if label == "SMALL_SAMPLE" else 0.0
+            row["Calibration Label"] = label
+            row["Calibration Samples"] = n
+            row["Calibration Win Rate %"] = round(wr*100, 1) if pd.notna(wr) else np.nan
+            row["Auto Threshold Add"] = add
+            row["Calibration Note"] = f"{label}: {market}/{lean}/{eb}/{pb}, n={n}, WR {wr*100:.1f}%." if pd.notna(wr) else f"{label}: no WR."
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _final_no_bet_flags(row: pd.Series) -> List[str]:
+    flags = []
+    lean = str(row.get("Lean", "")).upper()
+    market = str(row.get("Market", "")).upper()
+    market_grade = str(row.get("Opponent Market Specific Grade", "")).upper()
+    player = normalize_name(row.get("Player"))
+    matched = normalize_name(row.get("Matched Player") or row.get("Player"))
+    match_score = safe_float(row.get("Match Score"), np.nan)
+    if market not in {"PTS", "REB", "AST", "PRA"}:
+        flags.append("invalid market")
+    if not player or not matched:
+        flags.append("player match missing")
+    if pd.notna(match_score) and match_score < 0.88:
+        flags.append("player match confidence low")
+    if player and matched and name_score(player, matched) < 0.88:
+        flags.append("player identity mismatch")
+    for col in ["L5 Avg", "L10 Avg", "Season Avg", "Projection", "Line"]:
+        if pd.isna(safe_float(row.get(col), np.nan)):
+            flags.append(f"{col} missing")
+    if market == "PRA":
+        comps = [safe_float(row.get(c), np.nan) for c in ["PRA Component PTS", "PRA Component REB", "PRA Component AST"]]
+        proj = safe_float(row.get("Projection"), np.nan)
+        if not all(pd.notna(x) for x in comps):
+            flags.append("PRA components missing")
+        elif pd.notna(proj) and abs(sum(comps) - proj) > 0.75:
+            flags.append("PRA component sum mismatch")
+    elif market in {"PTS", "REB", "AST"}:
+        # A single-stat market should not be using another market's visible baseline.
+        opposite_cols = {
+            "PTS": ["REB Component", "AST Component", "PRA Component Sum"],
+            "REB": ["PTS Component", "AST Component", "PRA Component Sum"],
+            "AST": ["PTS Component", "REB Component", "PRA Component Sum"],
+        }.get(market, [])
+        if any(c in row.index and pd.notna(safe_float(row.get(c), np.nan)) for c in opposite_cols):
+            flags.append("single-stat market has cross-market component bleed")
+    edge = safe_float(row.get("Edge"), np.nan)
+    overp = safe_float(row.get("Over %"), np.nan)
+    underp = safe_float(row.get("Under %"), np.nan)
+    if pd.notna(edge):
+        if edge > 0 and lean != "OVER":
+            flags.append("lean does not match positive edge")
+        if edge < 0 and lean != "UNDER":
+            flags.append("lean does not match negative edge")
+    if lean == "OVER" and pd.notna(overp) and pd.notna(underp) and overp < underp:
+        flags.append("probability disagrees with OVER")
+    if lean == "UNDER" and pd.notna(overp) and pd.notna(underp) and underp < overp:
+        flags.append("probability disagrees with UNDER")
+    if str(row.get("Data Integrity", "")).upper() != "VERIFIED":
+        flags.append("opponent/data context missing")
+    if str(row.get("Market Rank Data Status", "")).upper() != "VERIFIED":
+        flags.append("market-specific opponent rank missing")
+    if lean == "OVER" and market_grade == "TOUGH":
+        flags.append("opponent market rank does not support over")
+    if lean == "UNDER" and market_grade == "FAVORABLE":
+        flags.append("opponent market rank does not support under")
+    if not bool(row.get("MC Agreement", False)):
+        flags.append("Monte Carlo disagrees")
+    if max(safe_float(row.get("MC Over %"), 0), safe_float(row.get("MC Under %"), 0)) < 63:
+        flags.append("Monte Carlo probability below 63%")
+    if str(row.get("MC Volatility Label", "")).upper() == "HIGH":
+        flags.append("simulation volatility high")
+    if safe_float(row.get("Chance Under Expected Minutes"), 0) >= 58:
+        flags.append("minutes downside risk")
+    if str(row.get("Freshness Status", "")).upper() == "STALE":
+        flags.append("data stale")
+    if bool(row.get("Late Scratch Risk", False)):
+        flags.append("late scratch/start check required")
+    if not bool(row.get("Lineup Confirmed", False)) and pd.notna(safe_float(row.get("Minutes Until Tip"), np.nan)) and safe_float(row.get("Minutes Until Tip"), np.nan) <= 120:
+        flags.append("lineup not confirmed near tip")
+    if pd.isna(safe_float(row.get("Opening Line"), np.nan)):
+        flags.append("opening line missing")
+    if pd.isna(safe_float(row.get("CLV"), np.nan)):
+        flags.append("line value missing")
+    if str(row.get("Calibration Label", "")).upper() == "COLD_BUCKET":
+        flags.append("calibration bucket cold")
+    if str(row.get("Injury Status", "")).upper() in {"OUT", "DOUBTFUL", "INACTIVE"}:
+        flags.append("player unavailable")
+    risk, note = _strong_availability_risk(row)
+    if risk:
+        flags.append(note)
+    return list(dict.fromkeys([f for f in flags if f]))
+
+
+def _apply_winning_play_final_gate(board: pd.DataFrame, base: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    rows = []
+    for _, rr in out.iterrows():
+        row = rr.copy()
+        market = str(row.get("Market", "PTS")).upper()
+        lean = str(row.get("Lean", "")).upper()
+        edge_abs = abs(safe_float(row.get("Edge"), np.nan))
+        mc_side_prob = max(safe_float(row.get("MC Over %"), 0), safe_float(row.get("MC Under %"), 0))
+        model_side_prob = max(safe_float(row.get("Over %"), 0), safe_float(row.get("Under %"), 0))
+        side_prob = min(mc_side_prob, model_side_prob) if mc_side_prob > 0 and model_side_prob > 0 else max(mc_side_prob, model_side_prob)
+        confidence = safe_float(row.get("Final Projection Confidence"), 0)
+        minutes_conf = safe_float(row.get("Minutes Confidence"), confidence)
+        auto_add = safe_float(row.get("Auto Threshold Add"), 0.0)
+        edge_req = {"PTS":2.00, "REB":1.20, "AST":1.00, "PRA":3.00}.get(market, 1.5) + auto_add
+        prob_req = 63.0 + (1.0 if str(row.get("Calibration Label", "")).upper() == "SMALL_SAMPLE" else 0.0)
+        flags = _final_no_bet_flags(row)
+        if pd.isna(edge_abs) or edge_abs < edge_req:
+            flags.append(f"edge below winning threshold {edge_req:.2f}")
+        if side_prob < prob_req:
+            flags.append(f"blended/MC probability below {prob_req:.0f}%")
+        if confidence < 80:
+            flags.append("projection confidence below 80%")
+        if minutes_conf < 76:
+            flags.append("minutes confidence below 76%")
+        if lean not in {"OVER", "UNDER"}:
+            flags.append("no clear side")
+        flags = list(dict.fromkeys(flags))
+
+        clean = len(flags) == 0
+        identity_ok = not any(f in flags for f in ["player match missing", "player match confidence low", "player identity mismatch"])
+        market_ok = not any(("market" in f.lower()) or ("PRA" in f) or ("component" in f.lower()) or ("missing" in f and f.split(" ")[0] in {"L5", "L10", "Season", "Projection", "Line"}) for f in flags)
+        side_ok = not any("lean does not match" in f or "probability disagrees" in f for f in flags)
+        edge_score = 0 if pd.isna(edge_abs) else min(100, edge_abs / max(edge_req, 0.1) * 100)
+        market_bonus = {"FAVORABLE": 7 if lean == "OVER" else -4, "TOUGH": 7 if lean == "UNDER" else -4, "NEUTRAL": 0}.get(str(row.get("Opponent Market Specific Grade", "NEUTRAL")).upper(), 0)
+        winning_score = float(np.clip(
+            0.34*side_prob + 0.20*confidence + 0.16*minutes_conf + 0.16*edge_score + 0.14*safe_float(row.get("Strong Play Score"), 50) + market_bonus,
+            0, 100
+        ))
+        row["No-Bet Risk Flags"] = " | ".join(flags)
+        row["Clean Risk"] = "YES" if clean else "NO"
+        row["Player Identity Verified"] = bool(identity_ok)
+        row["Market Projection Verified"] = bool(market_ok)
+        row["Pick Side Verified"] = bool(side_ok)
+        row["Projection Integrity"] = "VERIFIED" if identity_ok and market_ok and side_ok else "BLOCKED"
+        row["Projection Integrity Note"] = "player, market inputs, components, and side agree" if identity_ok and market_ok and side_ok else " | ".join([f for f in flags if any(k in f.lower() for k in ["player", "market", "component", "pra", "lean", "probability", "missing"])][:6])
+        row["Winning Play Score"] = round(winning_score, 1)
+        row["Official Play Score"] = round(winning_score, 1) if clean else min(safe_float(row.get("Official Play Score"), 0), round(winning_score, 1))
+        row["Winning Gate Version"] = WNBA_WINNING_GATE_VERSION
+        row["Winning Gate Note"] = (
+            f"PASS: edge {edge_abs:.2f}/{edge_req:.2f}, prob {side_prob:.1f}/{prob_req:.0f}, MC agreement {row.get('MC Agreement')}, matchup {row.get('Opponent Market Specific Grade')}"
+            if clean else "NO BET: " + " | ".join(flags[:8])
+        )
+        if clean:
+            row["Official"] = f"WINNING {lean}"
+            row["Strong Play"] = f"WINNING {lean}"
+            row["Tier"] = "WINNING"
+            row["PASS Reason"] = ""
+        else:
+            row["Official"] = "PASS"
+            row["Strong Play"] = "TRACK"
+            row["Tier"] = "TRACK"
+            row["PASS Reason"] = " | ".join(flags)
+        rows.append(row)
+    final = pd.DataFrame(rows)
+    return final.sort_values(["Clean Risk", "Winning Play Score", "Official Play Score", "Edge"], ascending=[False, False, False, False])
+
+
+def _role_on_off_factor(row: pd.Series, br: Optional[pd.Series], market: str) -> Tuple[float, str]:
+    """Use explicit role/on-off fields when present; otherwise stay neutral."""
+    factor = 1.0
+    notes = []
+    injury_bump = safe_float(row.get("Injury Ripple Bump"), np.nan)
+    if pd.notna(injury_bump):
+        # InjuryRippleBump is an additive projection bump from prior layers.
+        proj = max(1.0, safe_float(row.get("Projection"), safe_float(br.get(f"{market}_avg"), 10) if br is not None else 10))
+        factor *= float(np.clip(1.0 + injury_bump / proj, 0.94, 1.08))
+        notes.append(f"injury ripple {injury_bump:+.2f}")
+    for col, cap in [
+        ("Usage Bump", 0.08), ("Manual Usage Bump", 0.08), ("OnOff Usage Bump", 0.08),
+        ("Minutes Bump", 0.05), ("Manual Minutes Bump", 0.05), ("OnOff Minutes Bump", 0.05),
+    ]:
+        v = safe_float(row.get(col), np.nan)
+        if pd.notna(v):
+            vv = v if abs(v) <= 1 else v / 100.0
+            factor *= float(np.clip(1.0 + vv, 1.0-cap, 1.0+cap))
+            notes.append(f"{col} {vv:+.1%}")
+    txt = _strong_text_blob(row, ["Injury Context Note", "Projected Rotation Note", "Role", "Starter Status", "Lineup Status"])
+    if any(tag in txt for tag in ["TEAMMATE OUT", "USAGE BUMP", "STARTING IN PLACE", "NEW STARTER"]):
+        cap = 0.045 if market in {"PTS", "PRA"} else 0.030
+        factor *= (1.0 + cap)
+        notes.append("verified role bump text")
+    if any(tag in txt for tag in ["MINUTES LIMIT", "RETURNING", "BENCH", "ROLE DOWN"]):
+        factor *= 0.965
+        notes.append("role/minutes caution")
+    return float(np.clip(factor, 0.90, 1.11)), "; ".join(notes) if notes else "role/on-off neutral"
+
+
+def _opportunity_factor(row: pd.Series, br: Optional[pd.Series], market: str) -> Tuple[float, str]:
+    """Stat-specific opportunity layer: PTS shots, REB miss/rebound environment, AST creation."""
+    if br is None:
+        return 1.0, "no player baseline for opportunity"
+    notes = []
+    factor = 1.0
+
+    def ratio_from(prefix: str, fallback_col: str = "") -> float:
+        l5 = _strict_num_from(br, [f"{prefix}_l5", f"{prefix.lower()}_l5"], np.nan)
+        l10 = _strict_num_from(br, [f"{prefix}_l10", f"{prefix.lower()}_l10"], np.nan)
+        avg = _strict_num_from(br, [f"{prefix}_avg", f"{prefix}", f"{prefix.lower()}_avg"], np.nan)
+        if pd.isna(avg) and fallback_col:
+            avg = safe_float(row.get(fallback_col), np.nan)
+        vals = [x for x in [l5, l10, avg] if pd.notna(x) and float(x) > 0]
+        if len(vals) < 2:
+            return 1.0
+        recent = np.nanmean([l5 if pd.notna(l5) else np.nan, l10 if pd.notna(l10) else np.nan])
+        base = avg if pd.notna(avg) and avg > 0 else np.nanmedian(vals)
+        if pd.isna(recent) or pd.isna(base) or base <= 0:
+            return 1.0
+        return float(np.clip(recent / base, 0.86, 1.16))
+
+    if market in {"PTS", "PRA"}:
+        fga_ratio = ratio_from("FGA", "Projected FGA")
+        fta_ratio = ratio_from("FTA")
+        three_ratio = ratio_from("FG3A")
+        usage_trend = safe_float(row.get("Usage Trend"), np.nan)
+        usage_factor = 1.0 + float(np.clip(usage_trend, -0.08, 0.08)) if pd.notna(usage_trend) else 1.0
+        factor *= float(np.clip(0.62*fga_ratio + 0.18*fta_ratio + 0.10*three_ratio + 0.10*usage_factor, 0.90, 1.10))
+        notes.append(f"shot volume fga {fga_ratio:.3f}, fta {fta_ratio:.3f}, 3pa {three_ratio:.3f}")
+    if market in {"REB", "PRA"}:
+        reb_ratio = ratio_from("REB")
+        opp_drtg = safe_float(row.get("Opponent DRtg"), np.nan)
+        opp_pct = safe_float(row.get("Opponent Market Allowed Percentile"), 0.50)
+        # Higher DRtg and higher REB allowed percentile imply more rebound opportunity.
+        miss_env = 1.0 + float(np.clip((opp_drtg - 103.0) / 100.0 if pd.notna(opp_drtg) else 0.0, -0.025, 0.025))
+        allowed_env = 1.0 + float(np.clip((opp_pct - 0.5) * 0.055, -0.028, 0.028))
+        factor *= float(np.clip(0.70*reb_ratio + 0.15*miss_env + 0.15*allowed_env, 0.91, 1.09))
+        notes.append(f"rebound chances {reb_ratio:.3f}, miss env {miss_env:.3f}")
+    if market in {"AST", "PRA"}:
+        ast_ratio = ratio_from("AST")
+        opp_pct = safe_float(row.get("Opponent Market Allowed Percentile"), 0.50)
+        teammate_make_env = 1.0 + float(np.clip((opp_pct - 0.5) * 0.045, -0.022, 0.022))
+        pace = safe_float(row.get("Opponent Pace"), np.nan)
+        league_pace = 80.0
+        pace_env = 1.0 + float(np.clip((pace - league_pace) / 200.0 if pd.notna(pace) else 0.0, -0.018, 0.018))
+        factor *= float(np.clip(0.70*ast_ratio + 0.15*teammate_make_env + 0.15*pace_env, 0.91, 1.09))
+        notes.append(f"creation {ast_ratio:.3f}, teammate make env {teammate_make_env:.3f}")
+    return float(np.clip(factor, 0.84, 1.18)), "; ".join(notes) if notes else "opportunity neutral"
+
+
+def _pace_adjusted_matchup_factor(row: pd.Series, market: str) -> Tuple[float, str]:
+    allowed = safe_float(row.get("Opponent Market Allowed"), np.nan)
+    allowed_l5 = safe_float(row.get("Opponent Market Allowed L5"), np.nan)
+    opp_pace = safe_float(row.get("Opponent Pace"), np.nan)
+    pct = safe_float(row.get("Opponent Market Allowed Percentile"), np.nan)
+    position_factor = safe_float(row.get("Position Defense Factor"), 1.0)
+    if pd.isna(allowed) or pd.isna(opp_pace) or opp_pace <= 0:
+        return 1.0, "pace-adjusted matchup unavailable"
+    # Per-80 possession allowed proxy. Use season + L5 blend.
+    season_per80 = allowed / opp_pace * 80.0
+    l5_per80 = (allowed_l5 / opp_pace * 80.0) if pd.notna(allowed_l5) else season_per80
+    blended = 0.55*season_per80 + 0.30*l5_per80 + 0.15*allowed
+    # Convert percentile and position factor to a small bounded projection move.
+    pct_move = 0.0 if pd.isna(pct) else float(np.clip((pct - 0.5) * 0.070, -0.035, 0.035))
+    pos_move = float(np.clip(position_factor - 1.0, -0.025, 0.025)) if pd.notna(position_factor) else 0.0
+    factor = float(np.clip(1.0 + pct_move + pos_move, 0.94, 1.06))
+    return factor, f"pace-adjusted {market} allowed {blended:.2f}/80 poss; pct move {pct_move:+.3f}; position {position_factor:.3f}"
+
+
+def _component_opportunity_projection(row: pd.Series, br: Optional[pd.Series], market: str) -> Tuple[float, Dict[str, Any]]:
+    source_row = row.copy()
+    source_row["Market"] = market
+    base_proj = safe_float(row.get("Projection"), np.nan) if str(row.get("Market", "")).upper() == market else np.nan
+    if pd.isna(base_proj):
+        base_proj, _, _ = _strict_component_projection(source_row, br, market, market_shrink=False)
+    if pd.isna(base_proj):
+        return np.nan, {"note": "component projection unavailable"}
+    opp_factor, opp_note = _pace_adjusted_matchup_factor(row, market)
+    oppo_factor, oppo_note = _opportunity_factor(row, br, market)
+    role_factor, role_note = _role_on_off_factor(row, br, market)
+    total = float(np.clip(opp_factor * oppo_factor * role_factor, 0.84, 1.18))
+    projected = float(np.clip(base_proj * total, 0.0, base_proj + {"PTS":4.5, "REB":2.2, "AST":2.0, "PRA":7.0}.get(market, 4.0)))
+    projected = float(max(0.0, min(projected, base_proj + {"PTS":4.5, "REB":2.2, "AST":2.0, "PRA":7.0}.get(market, 4.0))))
+    return projected, {
+        "base": base_proj,
+        "factor": total,
+        "opp_factor": opp_factor,
+        "opportunity_factor": oppo_factor,
+        "role_factor": role_factor,
+        "note": f"{opp_note} | {oppo_note} | {role_note}",
+    }
+
+
+def _apply_component_opportunity_engine(board: pd.DataFrame, base: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if board is None or board.empty:
+        return board
+    lookup = _v344_player_lookup(base) if base is not None and not base.empty else pd.DataFrame()
+    rows = []
+    group_cols = [c for c in ["Matched Player", "Player", "Team", "Opponent", "Slate", "SlateDate"] if c in board.columns]
+    player_col = "Matched Player" if "Matched Player" in board.columns else "Player"
+    group_cols = [player_col] + [c for c in ["Team", "Opponent", "Slate", "SlateDate"] if c in board.columns]
+    component_cache = {}
+    for _, rr in board.iterrows():
+        row = rr.copy()
+        key = normalize_name(row.get("Matched Player") or row.get("Player"))
+        br = lookup.loc[key] if (not lookup.empty and key in lookup.index) else None
+        team = _team_key_for_matchup(row.get("Team"))
+        opp = _team_key_for_matchup(row.get("Opponent"))
+        cache_key = (key, team, opp)
+        if cache_key not in component_cache:
+            comps, metas = {}, {}
+            for m in ["PTS", "REB", "AST"]:
+                p, meta = _component_opportunity_projection(row, br, m)
+                comps[m] = p
+                metas[m] = meta
+            component_cache[cache_key] = (comps, metas)
+        comps, metas = component_cache[cache_key]
+        market = str(row.get("Market", "PTS")).upper()
+        old_projection = safe_float(row.get("Projection"), np.nan)
+        if market == "PRA" and all(pd.notna(comps.get(m)) for m in ["PTS", "REB", "AST"]):
+            new_projection = float(comps["PTS"] + comps["REB"] + comps["AST"])
+            row["PRA Component PTS"] = round(comps["PTS"], 2)
+            row["PRA Component REB"] = round(comps["REB"], 2)
+            row["PRA Component AST"] = round(comps["AST"], 2)
+            row["PRA Component Sum"] = round(new_projection, 2)
+            row["PRA Identity Check"] = True
+            note = "PRA = component opportunity PTS + REB + AST"
+            factor = new_projection / max(1.0, old_projection) if pd.notna(old_projection) else np.nan
+        elif market in comps and pd.notna(comps.get(market)):
+            new_projection = float(comps[market])
+            note = metas[market].get("note", "")
+            factor = metas[market].get("factor", np.nan)
+        else:
+            new_projection = old_projection
+            note = "component opportunity projection unavailable; retained prior projection"
+            factor = 1.0
+        row["Projection Before Component Opportunity"] = round(old_projection, 2) if pd.notna(old_projection) else np.nan
+        row["Projection"] = round(new_projection, 2) if pd.notna(new_projection) else np.nan
+        row["Component Opportunity Factor"] = round(float(factor), 4) if pd.notna(factor) else np.nan
+        row["Component Opportunity Note"] = note
+        row["PTS Component Opportunity"] = round(comps.get("PTS"), 2) if pd.notna(comps.get("PTS")) else np.nan
+        row["REB Component Opportunity"] = round(comps.get("REB"), 2) if pd.notna(comps.get("REB")) else np.nan
+        row["AST Component Opportunity"] = round(comps.get("AST"), 2) if pd.notna(comps.get("AST")) else np.nan
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    out["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+    return out
+
+
+def _apply_full_winning_play_stack(board: pd.DataFrame, base: Optional[pd.DataFrame], mode: Optional[str] = None) -> pd.DataFrame:
+    if board is None or board.empty:
+        return board
+    out = _attach_market_rank_context(board)
+    out = _attach_minutes_distribution(out, base)
+    out = _apply_component_opportunity_engine(out, base)
+    out = _stable_recalculate_side_fields(out, base)
+    out = _attach_monte_carlo(out, base, sims=WNBA_MONTE_CARLO_SIMS)
+    out = _attach_calibration_context(out)
+    out = _stable_recalculate_side_fields(out, base)
+    out = _apply_winning_play_final_gate(out, base)
+    out["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+    out["Winning Gate Version"] = WNBA_WINNING_GATE_VERSION
+    return out
 
 
 def _strict_num_from(row, names, default=np.nan):
@@ -11686,7 +12353,7 @@ def _stable_repair_projection_board(board: pd.DataFrame, base: Optional[pd.DataF
     fixed = _strict_market_isolated_rebuild(fixed, base)
     fixed = _stable_attach_context_audit_only(fixed, base)
     fixed = _strong_trust_enrich_board(fixed, mode)
-    fixed = _stable_recalculate_side_fields(fixed, base)
+    fixed = _apply_full_winning_play_stack(fixed, base, mode)
     fixed["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
     return fixed
 
@@ -11698,7 +12365,7 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
     board = _strict_market_isolated_rebuild(board, base)
     board = _stable_attach_context_audit_only(board, base)
     board = _strong_trust_enrich_board(board, mode or "Today")
-    board = _stable_recalculate_side_fields(board, base)
+    board = _apply_full_winning_play_stack(board, base, mode or "Today")
     if board is not None and not board.empty:
         board["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
         save_dataset("projection_board", board)
@@ -11757,7 +12424,7 @@ with tabs[1]:
         if card_view:
             for _, rr in show.head(40).iterrows():
                 render_card(rr)
-        display_cols = [c for c in ["Tier", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Opening Line", "CLV", "Projection", "Edge", "Lean", "Official", "Official Play Score", "Over %", "Under %", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+        display_cols = [c for c in ["Tier", "Official", "Clean Risk", "Winning Play Score", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Opening Line", "CLV", "Projection", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
         st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
