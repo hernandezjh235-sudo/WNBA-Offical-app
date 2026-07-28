@@ -23,6 +23,7 @@ import base64
 import hashlib
 import difflib
 import unicodedata
+import html
 from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple, Optional, Any
@@ -32,7 +33,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.5.7 — Baseline-Safe Components + Cache Audit"
+APP_VERSION = "WNBA v3.5.9 — Full WNBA ML Game Script + Evidence Cards"
 LINE_PARSER_VERSION = "UD_FULL_GAME_MAINLINE_V2"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
 EMBEDDED_DATA_VERSION = "CORE_DATA_SELF_HEAL_V1"
@@ -2708,6 +2709,8 @@ def learning_adjustment(player, market, base_edge):
 
 
 def xgboost_blend_projection(features: Dict[str, float], baseline: float) -> Tuple[float, str]:
+    if not use_xgb_blend_enabled():
+        return baseline, "XGBoost/GBM blend OFF; baseline projection preserved."
     # Safe fallback: not enough true training labels yet. This approximates a model blend until learning DB grows.
     # It is intentionally small, so it doesn't distort projections.
     usage = safe_float(features.get("UsageProxy"), np.nan)
@@ -2728,13 +2731,32 @@ def xgboost_blend_projection(features: Dict[str, float], baseline: float) -> Tup
 
 def use_xgb_blend_enabled() -> bool:
     """Sidebar-controlled XGBoost/GBM ensemble switch.
-    Default True to preserve current projection behavior, but user can turn it off
-    while the grading database is still small.
+    Default OFF so projections are driven by transparent WNBA baselines,
+    matchup context, Monte Carlo, and the game-script layer unless enabled.
     """
     try:
-        return bool(st.session_state.get("use_xgb_blend", True))
+        return bool(st.session_state.get("use_xgb_blend", False))
     except Exception:
-        return True
+        return False
+
+
+def guarded_xgb_ensemble_projection(row: Dict[str, Any], baseline_projection: float, xgb_projection: float) -> Tuple[float, str]:
+    """Only blend trained ML when it is explicitly enabled and not fighting the core model."""
+    if not use_xgb_blend_enabled():
+        return baseline_projection, "XGBoost/GBM OFF"
+    market = str(row.get("Market", "PTS")).upper()
+    p0 = safe_float(baseline_projection, np.nan)
+    px = safe_float(xgb_projection, np.nan)
+    if pd.isna(p0) or pd.isna(px):
+        return baseline_projection, "XGBoost unavailable"
+    max_gap = {"PTS": 4.0, "REB": 2.2, "AST": 2.0, "PRA": 6.0}.get(market, 3.0)
+    gap = abs(px - p0)
+    if gap > max_gap:
+        return baseline_projection, f"XGBoost blocked: {gap:.2f} gap > {max_gap:.2f}"
+    confidence = safe_float(row.get("Final Projection Confidence"), safe_float(row.get("Data Score"), 70.0))
+    weight = 0.08 if confidence < 75 else 0.12
+    blended = (1.0 - weight) * p0 + weight * px
+    return round(float(blended), 2), f"XGBoost guarded blend {weight:.0%}; gap {gap:.2f}"
 
 
 def monte_carlo(player, market, line, proj, logs, matched_player=""):
@@ -3406,6 +3428,12 @@ def current_model_features_for_row(row: Dict[str, Any]) -> Dict[str, float]:
 
 
 def model_prediction_for_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    if not use_xgb_blend_enabled():
+        return {
+            "XGBoost Projection": np.nan,
+            "XGBoost Note": "XGBoost/GBM OFF by default.",
+            "XGBoost Feature Importance": "Disabled",
+        }
     market = str(row.get("Market", ""))
     logs_path = CACHE_FILES.get("player_game_logs")
     sig = str(logs_path.stat().st_mtime) if logs_path and logs_path.exists() else "none"
@@ -4087,9 +4115,12 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
         row.update(xgb)
         # Ensemble recalibration: blend current projection with trained model when available.
         p0=safe_float(row.get("Projection"), np.nan); px=safe_float(row.get("XGBoost Projection"), np.nan)
-        if use_xgb_blend_enabled() and pd.notna(p0) and pd.notna(px):
-            row["Ensemble Projection"] = round(0.72*p0 + 0.28*px, 2)
-            row["Projection"] = row["Ensemble Projection"]
+        row["XGBoost Blend Status"] = "XGBoost/GBM OFF"
+        if pd.notna(p0):
+            blended, blend_note = guarded_xgb_ensemble_projection(row, p0, px)
+            row["XGBoost Blend Status"] = blend_note
+            row["Ensemble Projection"] = round(blended, 2) if pd.notna(blended) else np.nan
+            row["Projection"] = row["Ensemble Projection"] if pd.notna(row["Ensemble Projection"]) else row["Projection"]
             row["Edge"] = round(row["Projection"] - safe_float(row.get("Line"), np.nan), 2)
         inj = injury_ripple_engine(row, b); row.update(inj)
         opp = opponent_lineup_adjustment(row, b); row.update(opp)
@@ -4816,6 +4847,61 @@ def grade_diagnostics(logs, mode: Optional[str] = None) -> Dict[str, Any]:
     if len(pending) == 0:
         out["Skipped/Notes"].append("No pending plays for the selected grade scope.")
     return out
+
+
+def projection_health_summary(board: pd.DataFrame) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    """High-signal projection health checks before saving or grading."""
+    if board is None or getattr(board, "empty", True):
+        empty = {
+            "Rows": 0, "Projection Integrity VERIFIED": "0/0",
+            "Lineup/minutes ready": "0/0", "Team offense/defense ready": "0/0",
+            "Opponent context ready": "0/0", "XGBoost default safe": "OFF",
+        }
+        return empty, pd.DataFrame()
+    d = board.copy()
+    total = len(d)
+    integrity_ok = d.get("Projection Integrity", pd.Series("", index=d.index)).astype(str).str.upper().eq("VERIFIED")
+    minutes_ok = pd.to_numeric(d.get("MIN Proj", pd.Series(np.nan, index=d.index)), errors="coerce").notna()
+    lineup_flag = d.get("Lineup Confirmed", pd.Series(False, index=d.index)).map(lambda x: _grade_bool(x, False))
+    lineup_ok = lineup_flag | (pd.to_numeric(d.get("Minutes Confidence", pd.Series(np.nan, index=d.index)), errors="coerce") >= 76)
+    team_ok = (
+        pd.to_numeric(d.get("Team ORtg", d.get("Team_ORtg", pd.Series(np.nan, index=d.index))), errors="coerce").notna()
+        | pd.to_numeric(d.get("Projected Team Score ML", pd.Series(np.nan, index=d.index)), errors="coerce").notna()
+    ) & (
+        pd.to_numeric(d.get("Opponent DRtg", pd.Series(np.nan, index=d.index)), errors="coerce").notna()
+        | pd.to_numeric(d.get("Projected Opp Score ML", pd.Series(np.nan, index=d.index)), errors="coerce").notna()
+    )
+    opp_ok = (
+        d.get("Opponent", pd.Series("", index=d.index)).astype(str).str.len().gt(0)
+        & pd.to_numeric(d.get("Opponent Pace", pd.Series(np.nan, index=d.index)), errors="coerce").notna()
+        & pd.to_numeric(d.get("Opponent DRtg", pd.Series(np.nan, index=d.index)), errors="coerce").notna()
+    )
+    xgb_safe = d.get("XGBoost Blend Status", pd.Series("XGBoost/GBM OFF", index=d.index)).astype(str).str.contains("OFF|blocked|guarded", case=False, na=False)
+    def ratio(mask):
+        n = int(mask.sum()) if hasattr(mask, "sum") else 0
+        return f"{n}/{total} ({n/max(1,total):.0%})"
+    summary = {
+        "Rows": total,
+        "Projection Integrity VERIFIED": ratio(integrity_ok),
+        "Lineup/minutes ready": ratio(minutes_ok & lineup_ok),
+        "Team offense/defense ready": ratio(team_ok),
+        "Opponent context ready": ratio(opp_ok),
+        "XGBoost default safe": ratio(xgb_safe),
+    }
+    issue_cols = [c for c in [
+        "Player", "Team", "Opponent", "Market", "Line", "Projection", "Official",
+        "Projection Integrity", "Lineup Confirmed", "Minutes Confidence", "MIN Proj",
+        "Opponent Pace", "Opponent DRtg", "Projected Team Score ML", "Projected Opp Score ML",
+        "XGBoost Blend Status", "Projection Integrity Note", "No-Bet Risk Flags"
+    ] if c in d.columns]
+    issues = d[~(integrity_ok & minutes_ok & team_ok & opp_ok)].copy()
+    return summary, issues[issue_cols].head(150) if issue_cols else issues.head(150)
+
+
+def auto_daily_grade_due(minutes: int = 15) -> bool:
+    """Throttle auto-grading while the app is open; checks all pending saved slates."""
+    last_auto = pd.to_datetime(st.session_state.get("last_auto_final_grade_check", None), errors="coerce")
+    return pd.isna(last_auto) or (pd.Timestamp.now() - last_auto).total_seconds() > minutes * 60
 
 
 # ============================================================
@@ -6280,9 +6366,12 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
         if b is None: b = pd.Series(dtype=object)
         xgb = model_prediction_for_row(row); row.update(xgb)
         p0=safe_float(row.get("Projection"), np.nan); px=safe_float(row.get("XGBoost Projection"), np.nan)
-        if use_xgb_blend_enabled() and pd.notna(p0) and pd.notna(px):
-            row["Ensemble Projection"] = round(0.72*p0 + 0.28*px, 2)
-            row["Projection"] = row["Ensemble Projection"]
+        row["XGBoost Blend Status"] = "XGBoost/GBM OFF"
+        if pd.notna(p0):
+            blended, blend_note = guarded_xgb_ensemble_projection(row, p0, px)
+            row["XGBoost Blend Status"] = blend_note
+            row["Ensemble Projection"] = round(blended, 2) if pd.notna(blended) else np.nan
+            row["Projection"] = row["Ensemble Projection"] if pd.notna(row["Ensemble Projection"]) else row["Projection"]
             row["Edge"] = round(row["Projection"] - safe_float(row.get("Line"), np.nan), 2)
         inj = injury_ripple_engine(row, b); row.update(inj)
         opp = opponent_lineup_adjustment(row, b); row.update(opp)
@@ -8273,10 +8362,27 @@ def _grouped_market_html(r: pd.Series) -> str:
     conf = _fmt_num_compact(r.get("Official Play Score"), 0)
     tier = str(r.get("Tier", ""))
     tracking_status = str(r.get("Tracking Status", "") or "").upper()
-    track_badge = tracking_status if tracking_status in {"TRACK", "OFFICIAL"} else tier
+    if str(official).upper().startswith("LONG STRONG"):
+        rec_badge = "LONG"
+    elif str(official).upper().startswith("STRONG"):
+        rec_badge = "STRONG"
+    elif str(official).upper().startswith("LEAN"):
+        rec_badge = "LEAN"
+    else:
+        rec_badge = tracking_status if tracking_status in {"TRACK", "OFFICIAL"} else tier
+    track_badge = rec_badge
     track_cls = "official" if tracking_status == "OFFICIAL" else "tracked" if tracking_status == "TRACK" else ""
     vol = str(r.get("Volatility", "NA"))
-    note = str(r.get("Biggest Positive", "") or r.get("Projection Explanation", ""))[:130]
+    raw_note = str(r.get("Hit Rate Context", "") or r.get("Recent Support", "") or r.get("Biggest Positive", "") or r.get("Projection Explanation", ""))
+    raw_note = re.sub(r"<[^>]+>", " ", raw_note)
+    raw_note = raw_note.replace("&lt;", " ").replace("&gt;", " ")
+    raw_note = re.sub(r"\s+", " ", raw_note).strip()[:180]
+    note = html.escape(raw_note)
+    game_note = str(r.get("WNBA ML Game Script", "") or r.get("WNBA ML Game Script Note", ""))
+    game_note = re.sub(r"<[^>]+>", " ", game_note).replace("&lt;", " ").replace("&gt;", " ")
+    game_note = html.escape(re.sub(r"\s+", " ", game_note).strip()[:180])
+    vet = html.escape(str(r.get("Veteran Capability", "") or "capability neutral")[:140])
+    evidence = _fmt_num_compact(r.get("Evidence Support Score"), 0)
     edge_cls = "pos" if pd.notna(edge_v) and edge_v > 0 else "neg" if pd.notna(edge_v) and edge_v < 0 else "flat"
     return f"""
       <div class='owp-market-row owp-mkt-{market.lower()}'>
@@ -8293,7 +8399,7 @@ def _grouped_market_html(r: pd.Series) -> str:
         </div>
         <div class='owp-prob-track owp-market-track'><div class='owp-prob-fill' style='width:{fill:.0f}%'></div></div>
         <div class='owp-market-sub'><span>OVER {_fmt_num_compact(overp,0)}%</span><span>UNDER {_fmt_num_compact(underp,0)}%</span></div>
-        <div class='owp-market-note'>{note}</div>
+        <div class='owp-market-note'>{note}<br><span>Veteran/capability: {vet} · Evidence {evidence}</span><br><span>ML script: {game_note}</span></div>
       </div>
     """
 
@@ -8309,6 +8415,7 @@ def render_grouped_player_card(player_df: pd.DataFrame):
     first = player_df.iloc[0]
     player = str(first.get("Player", "Player"))
     team = str(first.get("Team", ""))
+    opp = str(first.get("Opponent", ""))
     matchup = str(first.get("Matchup", "") or first.get("Projection Matchup Used", "") or team)
     pos = str(first.get("PositionGroup", "Role"))
     source_count = ", ".join(sorted(set(player_df.get("Source", pd.Series(dtype=str)).astype(str).replace("nan", "").tolist())))
@@ -8323,10 +8430,13 @@ def render_grouped_player_card(player_df: pd.DataFrame):
     market_html = "".join(_grouped_market_html(r) for _, r in player_df.iterrows())
     tracked_n = int(player_df.get("Tracking Status", pd.Series(dtype=str)).astype(str).str.upper().isin(["TRACK", "OFFICIAL"]).sum())
     tracking_pill = f"<span class='owp-pill owp-pill-track'>TRACKED {tracked_n}/{len(player_df)}</span>" if tracked_n else ""
+    team_logo = html.escape(team[:3].upper() or "WN")
+    opp_logo = html.escape(opp[:3].upper() or "OPP")
     st.markdown(f"""
     <div class='owp-group-card'>
       <div class='owp-group-top'>
-        <div>
+        <div class='owp-player-wrap'>
+          <div class='owp-logo-row'><span class='owp-team-logo'>{team_logo}</span><span class='owp-vs'>vs</span><span class='owp-team-logo owp-opp-logo'>{opp_logo}</span></div>
           <div class='owp-player'>{player}</div>
           <div class='owp-match'>{matchup} <span class='owp-muted'>| {team} | {pos}</span></div>
           <span class='owp-pill owp-pill-source'>{source_count or 'Lines'}</span>
@@ -8334,7 +8444,7 @@ def render_grouped_player_card(player_df: pd.DataFrame):
           <span class='owp-pill owp-pill-score'>Data {data_score}/100</span>
           {tracking_pill}
         </div>
-        <div class='owp-group-best'>Best: {best_mkt} {best_side}<br><span>Min {min_proj}</span></div>
+        <div class='owp-group-best'><span class='owp-best-label'>Best</span><b>{best_mkt} {best_side}</b><br><span>Min {min_proj}</span></div>
       </div>
       {market_html}
     </div>
@@ -8517,6 +8627,7 @@ def render_slate_tracker(board_df: pd.DataFrame, key_prefix: str = "slate_tracke
     if board_df is None or board_df.empty:
         st.warning("No projection board cached yet. Refresh Today or All Lines first.")
         return
+    render_wnba_ml_system(board_df, key_prefix)
     c1, c2 = st.columns(2)
     with c1:
         best_text = build_copy_paste_slate(board_df, best_only=True)
@@ -8529,6 +8640,212 @@ def render_slate_tracker(board_df: pd.DataFrame, key_prefix: str = "slate_tracke
         st.text_area("All projections slate", all_text, height=320, key=f"{key_prefix}_all_text")
         st.download_button("Download all projections.txt", all_text, "wnba_all_projections.txt", "text/plain", key=f"{key_prefix}_all_dl")
     st.info("Save Before tracks the real-line rows for grading. The text slate is for copy/paste and quick tracking; it does not replace the saved official log.")
+
+
+def _ml_team_context() -> pd.DataFrame:
+    try:
+        ctx = _strict_team_context_table()
+    except Exception:
+        ctx = pd.DataFrame()
+    if ctx is None or ctx.empty:
+        return pd.DataFrame()
+    out = ctx.copy()
+    for c in ["Pace", "ORtg", "DRtg", "NetRtg"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out.dropna(subset=["Team"]).drop_duplicates("Team", keep="last")
+
+
+def _project_game_score(team_row: pd.Series, opp_row: pd.Series) -> Tuple[float, float]:
+    pace = np.nanmean([safe_float(team_row.get("Pace"), np.nan), safe_float(opp_row.get("Pace"), np.nan)])
+    if pd.isna(pace):
+        pace = 79.0
+    ortg = safe_float(team_row.get("ORtg"), 101.0)
+    opp_drtg = safe_float(opp_row.get("DRtg"), 101.0)
+    raw = pace * ((ortg + opp_drtg) / 2.0) / 100.0
+    return float(np.clip(raw, 62.0, 102.0)), float(pace)
+
+
+def _simulate_wnba_game(team_row: pd.Series, opp_row: pd.Series, sims: int = 15000, seed_key: str = "") -> Dict[str, Any]:
+    team_mean, pace = _project_game_score(team_row, opp_row)
+    opp_mean, _ = _project_game_score(opp_row, team_row)
+    seed = stable_seed("wnba_game_sim", seed_key, team_row.get("Team"), opp_row.get("Team"), PROJECTION_ENGINE_VERSION)
+    rng = np.random.default_rng(seed)
+    team_net = safe_float(team_row.get("NetRtg"), 0.0)
+    opp_net = safe_float(opp_row.get("NetRtg"), 0.0)
+    quality_gap = float(np.clip((team_net - opp_net) / 7.5, -2.0, 2.0))
+    pace_sd = 2.2
+    eff_sd = 6.5
+    base_total_sd = 9.8
+    sim_pace = rng.normal(pace, pace_sd, int(sims))
+    team_eff = rng.normal((safe_float(team_row.get("ORtg"), 101.0) + safe_float(opp_row.get("DRtg"), 101.0)) / 2.0, eff_sd, int(sims))
+    opp_eff = rng.normal((safe_float(opp_row.get("ORtg"), 101.0) + safe_float(team_row.get("DRtg"), 101.0)) / 2.0, eff_sd, int(sims))
+    team_scores = np.clip(sim_pace * team_eff / 100.0 + rng.normal(quality_gap, base_total_sd / 2.0, int(sims)), 45, 115)
+    opp_scores = np.clip(sim_pace * opp_eff / 100.0 + rng.normal(-quality_gap, base_total_sd / 2.0, int(sims)), 45, 115)
+    margins = team_scores - opp_scores
+    totals = team_scores + opp_scores
+    win_pct = float((margins > 0).mean() * 100.0)
+    total_line = 161.5
+    total_over_pct = float((totals > total_line).mean() * 100.0)
+    spread_mean = float(np.mean(margins))
+    favorite = str(team_row.get("Team")) if spread_mean >= 0 else str(opp_row.get("Team"))
+    return {
+        "Team Sim Score": round(float(np.mean(team_scores)), 1),
+        "Opponent Sim Score": round(float(np.mean(opp_scores)), 1),
+        "Sim Win %": round(win_pct, 1),
+        "Sim Total": round(float(np.mean(totals)), 1),
+        "Sim Total Over %": round(total_over_pct, 1),
+        "Sim Total Under %": round(100.0 - total_over_pct, 1),
+        "Sim Spread": round(spread_mean, 1),
+        "Sim Favorite": favorite,
+        "Sim Pace": round(float(np.mean(sim_pace)), 1),
+        "Sim Count": int(sims),
+    }
+
+
+def _wnba_game_script_context(row: pd.Series) -> Dict[str, Any]:
+    """Small WNBA-specific game model used by both ML cards and prop scoring."""
+    ctx = _ml_team_context()
+    if ctx is None or ctx.empty:
+        return {
+            "ok": False,
+            "factor": 1.0,
+            "support": 0,
+            "note": "WNBA ML game script unavailable",
+        }
+    ctx_map = {str(r.get("Team")): r for _, r in ctx.iterrows()}
+    team = _team_key_for_matchup(row.get("Team"))
+    opp = _team_key_for_matchup(row.get("Opponent"))
+    if not team or not opp or team not in ctx_map or opp not in ctx_map:
+        return {
+            "ok": False,
+            "factor": 1.0,
+            "support": 0,
+            "note": "WNBA ML game script missing team/opponent context",
+        }
+
+    team_score, pace = _project_game_score(ctx_map[team], ctx_map[opp])
+    opp_score, _ = _project_game_score(ctx_map[opp], ctx_map[team])
+    total = team_score + opp_score
+    spread = team_score - opp_score
+    win_prob = float(np.clip(50.0 + spread * 4.0, 18.0, 82.0))
+    blowout_risk = float(np.clip((abs(spread) - 8.0) * 4.5, 0.0, 36.0))
+    pace_move = float(np.clip((pace - 79.0) / 80.0, -0.025, 0.030))
+    team_total_move = float(np.clip((team_score - 79.5) / 240.0, -0.030, 0.035))
+    blowout_move = -float(np.clip(blowout_risk / 1400.0, 0.0, 0.025))
+    market = str(row.get("Market", "")).upper()
+
+    if market == "PTS":
+        factor = 1.0 + 0.45 * pace_move + 0.55 * team_total_move + blowout_move
+    elif market == "AST":
+        factor = 1.0 + 0.40 * pace_move + 0.50 * team_total_move + 0.50 * blowout_move
+    elif market == "REB":
+        # Rebounds need pace/missed shots more than raw team total.
+        opp_drtg = safe_float(ctx_map[opp].get("DRtg"), 101.0)
+        miss_move = float(np.clip((opp_drtg - 101.0) / 320.0, -0.018, 0.020))
+        factor = 1.0 + 0.55 * pace_move + miss_move + 0.70 * blowout_move
+    elif market == "PRA":
+        factor = 1.0 + 0.43 * pace_move + 0.45 * team_total_move + 0.75 * blowout_move
+    else:
+        factor = 1.0 + 0.35 * pace_move + 0.35 * team_total_move + 0.60 * blowout_move
+    factor = float(np.clip(factor, 0.965, 1.040))
+
+    lean = str(row.get("Lean", "")).upper()
+    support = 0
+    high_env = total >= 162.0 or pace >= 80.5 or team_score >= 81.0
+    low_env = total <= 156.0 or pace <= 77.5 or team_score <= 76.5
+    if lean == "OVER" and high_env and blowout_risk < 24:
+        support += 1
+    if lean == "UNDER" and low_env:
+        support += 1
+    if blowout_risk >= 24 and market in {"PTS", "AST", "PRA"}:
+        support -= 1 if lean == "OVER" else 0
+    if lean == "UNDER" and blowout_risk >= 24:
+        support += 1
+
+    fav = team if spread >= 0 else opp
+    note = (
+        f"{team} {team_score:.1f} vs {opp} {opp_score:.1f}; "
+        f"total {total:.1f}; {fav} by {abs(spread):.1f}; "
+        f"{win_prob:.0f}% team win; pace {pace:.1f}; blowout {blowout_risk:.0f}%"
+    )
+    return {
+        "ok": True,
+        "factor": factor,
+        "support": int(np.clip(support, -1, 2)),
+        "note": note,
+        "team_score": team_score,
+        "opp_score": opp_score,
+        "total": total,
+        "spread": spread,
+        "win_prob": win_prob,
+        "pace": pace,
+        "blowout_risk": blowout_risk,
+    }
+
+
+def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system") -> None:
+    st.markdown("#### WNBA ML System")
+    st.caption("Game-level model using team pace, ORtg, DRtg and slate matchup. Separate from player props.")
+    if board_df is None or board_df.empty or not {"Team", "Opponent"}.issubset(board_df.columns):
+        st.info("No team matchups available yet.")
+        return
+    ctx = _ml_team_context()
+    if ctx.empty:
+        st.info("Team context unavailable. Import team stats/master features first.")
+        return
+    ctx_map = {str(r.get("Team")): r for _, r in ctx.iterrows()}
+    pairs = []
+    for _, r in board_df[["Team", "Opponent", "Matchup"] if "Matchup" in board_df.columns else ["Team", "Opponent"]].drop_duplicates().iterrows():
+        a = _team_key_for_matchup(r.get("Team"))
+        b = _team_key_for_matchup(r.get("Opponent"))
+        if not a or not b or a == b:
+            continue
+        key = tuple(sorted([a, b]))
+        if key in {p["key"] for p in pairs}:
+            continue
+        pairs.append({"key": key, "team": a, "opp": b, "matchup": str(r.get("Matchup", f"{a} vs {b}"))})
+    if not pairs:
+        st.info("No unique matchups found.")
+        return
+    cards = []
+    for p in pairs[:8]:
+        a, b = p["team"], p["opp"]
+        if a not in ctx_map or b not in ctx_map:
+            continue
+        ar, br = ctx_map[a], ctx_map[b]
+        a_score, pace = _project_game_score(ar, br)
+        b_score, _ = _project_game_score(br, ar)
+        sim = _simulate_wnba_game(ar, br, sims=WNBA_MONTE_CARLO_SIMS, seed_key=f"{a}-{b}")
+        spread = a_score - b_score
+        total = a_score + b_score
+        ml_team = sim.get("Sim Favorite") or (a if spread >= 0 else b)
+        ml_prob = sim.get("Sim Win %") if ml_team == a else 100.0 - safe_float(sim.get("Sim Win %"), 50.0)
+        total_side = "OVER" if safe_float(sim.get("Sim Total Over %"), 50.0) >= 50 else "UNDER"
+        total_conf = max(safe_float(sim.get("Sim Total Over %"), 50.0), safe_float(sim.get("Sim Total Under %"), 50.0))
+        spread_conf = min(82, 50 + abs(safe_float(sim.get("Sim Spread"), spread)) * 4.5)
+        cards.append(f"""
+        <div class='wnba-ml-card'>
+          <div class='wnba-ml-top'><div><b>{a}</b><span> vs </span><b>{b}</b></div><em>{pace:.1f} poss</em></div>
+          <div class='wnba-ml-score'><span>{a} <b>{a_score:.1f}</b></span><span>{b} <b>{b_score:.1f}</b></span></div>
+          <div class='wnba-ml-sim'>15k sim: {a} {sim.get("Team Sim Score")} · {b} {sim.get("Opponent Sim Score")} · total {sim.get("Sim Total")} · pace {sim.get("Sim Pace")}</div>
+          <div class='wnba-ml-grid'>
+            <div><small>Moneyline</small><b>{ml_team}</b><span>{ml_prob:.0f}% win</span></div>
+            <div><small>Spread</small><b>{ml_team} {abs(safe_float(sim.get("Sim Spread"), spread)):.1f}</b><span>{spread_conf:.0f}% conf</span></div>
+            <div><small>Total</small><b>{sim.get("Sim Total")} {total_side}</b><span>{total_conf:.0f}% conf</span></div>
+          </div>
+        </div>
+        """)
+    if not cards:
+        st.info("No ML cards could be built from current team context.")
+        return
+    st.markdown("""
+    <style>
+    .wnba-ml-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin:10px 0 18px}.wnba-ml-card{background:#0f1320;border:1px solid rgba(250,204,21,.35);border-radius:14px;padding:14px;color:#e5e7eb}.wnba-ml-top{display:flex;justify-content:space-between;gap:10px;color:#facc15}.wnba-ml-top span{color:#94a3b8}.wnba-ml-top em{font-style:normal;color:#a78bfa}.wnba-ml-score{display:flex;justify-content:space-between;margin:12px 0 6px;font-size:1.05rem}.wnba-ml-score b{font-size:1.7rem;color:#facc15}.wnba-ml-sim{margin:0 0 10px;color:#c4b5fd;font-size:.78rem;line-height:1.35}.wnba-ml-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.wnba-ml-grid div{background:rgba(255,255,255,.04);border-radius:10px;padding:8px}.wnba-ml-grid small{display:block;color:#94a3b8;text-transform:uppercase;font-size:.62rem}.wnba-ml-grid b{display:block;color:#f8fafc}.wnba-ml-grid span{font-size:.74rem;color:#a7f3d0}
+    @media(max-width:640px){.wnba-ml-grid{grid-template-columns:1fr}.wnba-ml-score{display:block}.wnba-ml-score span{display:block;margin:4px 0}}
+    </style>
+    <div class='wnba-ml-wrap'>
+    """ + "".join(cards) + "</div>", unsafe_allow_html=True)
 
 def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: str, max_key: str, official_key: str, saved_view: bool = False) -> pd.DataFrame:
     """Render an already-built projection board with fast table / card toggle."""
@@ -9140,7 +9457,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v3.5.7 — Baseline-Safe Components + Cache Audit"
+APP_VERSION = "WNBA v3.5.9 — Full WNBA ML Game Script + Evidence Cards"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -9399,12 +9716,16 @@ def grouped_board_table_view(proj_df: pd.DataFrame) -> pd.DataFrame:
         "Player","Team","Opponent","Matchup","Opponent Matchup Grade","Opponent Matchup Score",
         "Projection Engine Version","Winning Gate Version","Projection Audit",
         "Opponent Market Rank","Opponent Pace","Opponent DRtg","Market","Projection","Line","Edge",
+        "XGBoost Blend Status",
         "Projection Before Component Opportunity","Component Opportunity Factor","Component Opportunity Note",
         "PTS Component Opportunity","REB Component Opportunity","AST Component Opportunity",
         "PRA Component PTS","PRA Component REB","PRA Component AST","PRA Component Sum","PRA Identity Check",
         "Lean","Over %","Under %","Hit Score","Official Play Score","Strong Play","Strong Play Score",
         "Winning Play Score","Clean Risk","Tier","MIN Proj","Minutes Median","Minutes Low Outcome",
         "Minutes High Outcome","Chance Under Expected Minutes","Projected FGA","L5 Avg","L10 Avg","Season Avg","Recent Support",
+        "Hit Rate Context","Veteran Capability","Evidence Support Score",
+        "WNBA ML Game Script","WNBA ML Game Script Factor","Projected Team Score ML","Projected Opp Score ML",
+        "Projected Game Total ML","Projected Spread ML","Team Win Probability ML","Game Pace ML","Blowout Risk ML",
         "Opponent Market Specific Grade","Opponent Market Allowed","Opponent Market Allowed L5",
         "Opponent Market Allowed Rank","Market Rank Data Status","MC Median","MC P25","MC P75",
         "MC Over %","MC Under %","MC Agreement","MC Volatility Label","Calibration Label",
@@ -9416,7 +9737,7 @@ def grouped_board_table_view(proj_df: pd.DataFrame) -> pd.DataFrame:
         "Strong Play Missing","PASS Reason","Source"
     ] if c in df.columns]
     out = df.sort_values(["Player","_market_order","Line"], na_position="last")[keep].copy()
-    for c in ["Projection","Projection Before Component Opportunity","Component Opportunity Factor","PTS Component Opportunity","REB Component Opportunity","AST Component Opportunity","PRA Component PTS","PRA Component REB","PRA Component AST","PRA Component Sum","Line","Edge","Over %","Under %","Hit Score","Official Play Score","Strong Play Score","Winning Play Score","MIN Proj","Minutes Median","Minutes Low Outcome","Minutes High Outcome","Chance Under Expected Minutes","Projected FGA","Opponent Matchup Score","Opponent Market Rank","Opponent Pace","Opponent DRtg","Opponent Market Allowed","Opponent Market Allowed L5","Opponent Market Allowed Rank","MC Median","MC P25","MC P75","MC Over %","MC Under %","Calibration Samples","Calibration Win Rate %","Auto Threshold Add","Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Minutes Until Tip"]:
+    for c in ["Projection","Projection Before Component Opportunity","Component Opportunity Factor","WNBA ML Game Script Factor","Projected Team Score ML","Projected Opp Score ML","Projected Game Total ML","Projected Spread ML","Team Win Probability ML","Game Pace ML","Blowout Risk ML","PTS Component Opportunity","REB Component Opportunity","AST Component Opportunity","PRA Component PTS","PRA Component REB","PRA Component AST","PRA Component Sum","Line","Edge","Over %","Under %","Hit Score","Official Play Score","Strong Play Score","Winning Play Score","MIN Proj","Minutes Median","Minutes Low Outcome","Minutes High Outcome","Chance Under Expected Minutes","Projected FGA","Opponent Matchup Score","Opponent Market Rank","Opponent Pace","Opponent DRtg","Opponent Market Allowed","Opponent Market Allowed L5","Opponent Market Allowed Rank","MC Median","MC P25","MC P75","MC Over %","MC Under %","Calibration Samples","Calibration Win Rate %","Auto Threshold Add","Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Minutes Until Tip"]:
         if c in out.columns: out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
     return out
 
@@ -9725,12 +10046,12 @@ with st.sidebar:
     odds_api_key = ""
     st.caption("Active line sources: Underdog + saved manual lines. Sleeper, Odds API, and SportsGameOdds are disabled.")
     use_remote = st.toggle("Allow SportsDataverse remote downloads", value=True)
-    use_xgb_blend = st.toggle("Use XGBoost/GBM blend", value=True, help="Keep ON when you want the ensemble projection blended in. Turn OFF while testing if graded samples are still too small.")
+    use_xgb_blend = st.toggle("Use XGBoost/GBM blend", value=False, help="Default OFF. Turn ON only after you have enough graded WNBA samples and want a small guarded ensemble signal.")
     st.session_state["use_xgb_blend"] = bool(use_xgb_blend)
-    auto_final_grade = st.toggle("Auto-check final ESPN results + grade", value=False, help="When ON and the app is open, it checks ESPN final boxscores every few minutes and grades only finished games for today. It does not grade future/not-started games.")
+    auto_final_grade = st.toggle("Auto-check final results + grade learning log", value=True, help="Default ON. While the app is open, it checks all pending saved WNBA slates and grades only completed games.")
     st.session_state["auto_final_grade"] = bool(auto_final_grade)
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
-    st.markdown("**Model:** Monte Carlo + Bayesian confidence" + (" + XGBoost/GBM blend" if use_xgb_blend else ""))
+    st.markdown("**Model:** Monte Carlo + Bayesian confidence + WNBA game script" + (" + guarded XGBoost/GBM blend" if use_xgb_blend else ""))
     st.divider()
     if st.button("🔄 Refresh Today — All-in-One", use_container_width=True):
         run_one_click_refresh_today("Today", use_ud)
@@ -9780,12 +10101,10 @@ if logs_global is None:
 
 # MLB-style final-result check: only runs while app is open, throttled so tab switching is safe.
 if st.session_state.get("auto_final_grade", False):
-    last_auto = pd.to_datetime(st.session_state.get("last_auto_final_grade_check", None), errors="coerce")
-    should_check = pd.isna(last_auto) or (pd.Timestamp.now() - last_auto).total_seconds() > 300
-    if should_check:
-        with st.spinner("Checking ESPN final boxscores and grading finished games..."):
+    if auto_daily_grade_due(minutes=15):
+        with st.spinner("Checking final WNBA boxscores and grading pending saved plays..."):
             try:
-                n_auto, dbg_auto = pull_final_results_and_grade("Today")
+                n_auto, dbg_auto = pull_final_results_and_grade(None)
                 st.session_state["last_auto_final_grade_check"] = now_iso()
                 st.session_state["last_auto_final_grade_count"] = int(n_auto)
                 st.session_state["last_auto_final_grade_dbg"] = dbg_auto.to_dict("records") if dbg_auto is not None else []
@@ -9810,8 +10129,9 @@ hero_panel(hero_board_rows, hero_real_lines, hero_no_line, hero_strong)
 
 st.markdown("""
 <style>
-.owp-group-card{border:1px solid rgba(168,85,247,.48);border-left:6px solid #a855f7;border-radius:28px;padding:22px;margin:18px 0;background:linear-gradient(180deg,rgba(17,10,31,.98),rgba(24,10,42,.94));box-shadow:0 0 28px rgba(168,85,247,.12)}
-.owp-group-top{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin-bottom:16px}.owp-group-best{text-align:right;font-weight:1000;color:#e9d5ff;font-size:.95rem}.owp-group-best span{color:#c4b5fd;font-weight:700}.owp-market-row{background:rgba(15,23,42,.58);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:14px;margin:12px 0}.owp-market-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.owp-market-name{font-size:1.05rem;font-weight:1000;color:#fb7185;letter-spacing:.08em}.owp-market-vol{font-size:.75rem;border:1px solid rgba(250,204,21,.55);color:#fde68a;border-radius:999px;padding:2px 8px;font-weight:900}.owp-market-conf{margin-left:auto;border:1px solid rgba(34,197,94,.45);border-radius:999px;padding:3px 10px;font-weight:1000;font-size:.85rem}.owp-market-side{font-weight:1000;font-size:1.35rem}.owp-market-conf.over,.owp-market-side.over,.owp-market-edge.pos{color:#4ade80}.owp-market-conf.under,.owp-market-side.under,.owp-market-edge.neg{color:#fb7185}.owp-market-conf.track,.owp-market-side.track,.owp-market-edge.flat{color:#e9d5ff}.owp-market-main{display:flex;align-items:baseline;gap:12px;margin-top:10px}.owp-market-proj{font-size:2.25rem;font-weight:1000;color:#f8fafc}.owp-market-edge{font-size:1.15rem;font-weight:1000}.owp-market-tier{color:#facc15;font-weight:900}.owp-market-track{height:10px;margin-top:10px}.owp-market-sub{display:flex;justify-content:space-between;color:#c4b5fd;font-size:.82rem;text-transform:uppercase;font-weight:900}.owp-market-note{font-size:.86rem;color:#a8a29e;margin-top:8px;background:rgba(255,255,255,.04);border-left:3px solid rgba(251,113,133,.6);border-radius:8px;padding:8px 10px}
+.owp-group-card{width:100%;box-sizing:border-box;overflow:hidden;border:1px solid rgba(168,85,247,.48);border-left:6px solid #a855f7;border-radius:20px;padding:16px;margin:16px 0;background:linear-gradient(180deg,rgba(17,10,31,.98),rgba(24,10,42,.94));box-shadow:0 0 28px rgba(168,85,247,.12)}
+.owp-group-top{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap}.owp-player-wrap{min-width:0;flex:1}.owp-logo-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}.owp-team-logo{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:50%;background:#111827;border:1px solid rgba(255,255,255,.14);color:#facc15;font-weight:1000;font-size:.78rem}.owp-opp-logo{color:#93c5fd}.owp-vs{font-size:.68rem;color:#a78bfa;font-weight:1000}.owp-group-best{text-align:right;font-weight:1000;color:#e9d5ff;font-size:.95rem;min-width:96px}.owp-group-best b{display:block;color:#f8fafc;font-size:1.05rem}.owp-best-label{display:block;color:#a78bfa;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em}.owp-group-best span{color:#c4b5fd;font-weight:700}.owp-market-row{background:rgba(15,23,42,.68);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:12px;margin:10px 0;box-sizing:border-box}.owp-market-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.owp-market-name{font-size:.95rem;font-weight:1000;color:#fb7185;letter-spacing:.08em}.owp-market-vol{font-size:.68rem;border:1px solid rgba(250,204,21,.55);color:#fde68a;border-radius:999px;padding:2px 7px;font-weight:900}.owp-market-conf{margin-left:auto;border:1px solid rgba(34,197,94,.45);border-radius:999px;padding:3px 8px;font-weight:1000;font-size:.78rem}.owp-market-side{font-weight:1000;font-size:1.2rem}.owp-market-conf.over,.owp-market-side.over,.owp-market-edge.pos{color:#4ade80}.owp-market-conf.under,.owp-market-side.under,.owp-market-edge.neg{color:#fb7185}.owp-market-conf.track,.owp-market-side.track,.owp-market-edge.flat{color:#e9d5ff}.owp-market-main{display:flex;align-items:baseline;gap:10px;margin-top:9px;flex-wrap:wrap}.owp-market-proj{font-size:2rem;font-weight:1000;color:#f8fafc}.owp-market-edge{font-size:1rem;font-weight:1000}.owp-market-tier{color:#facc15;font-weight:900}.owp-market-track{height:9px;margin-top:9px}.owp-market-sub{display:flex;justify-content:space-between;color:#c4b5fd;font-size:.76rem;text-transform:uppercase;font-weight:900}.owp-market-note{font-size:.80rem;color:#cbd5e1;margin-top:8px;background:rgba(255,255,255,.04);border-left:3px solid rgba(251,113,133,.6);border-radius:8px;padding:8px 10px;line-height:1.35}.owp-market-note span{color:#a7f3d0}
+@media(max-width:640px){.owp-group-card{padding:12px;border-radius:16px}.owp-group-top{display:block}.owp-group-best{text-align:left;margin-top:10px}.owp-market-conf{margin-left:0}.owp-market-proj{font-size:1.8rem}.owp-market-side{font-size:1.05rem}.owp-market-note{font-size:.76rem}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -10648,8 +10968,8 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v3.5.7 — Baseline-Safe Components + Cache Audit"
-PROJECTION_ENGINE_VERSION = "V357_BASELINE_SAFE_COMPONENTS_V1"
+APP_VERSION = "WNBA v3.5.9 — Full WNBA ML Game Script + Evidence Cards"
+PROJECTION_ENGINE_VERSION = "V359_WNBA_FULL_ML_GAME_SCRIPT_V1"
 PROJECTION_ENGINE_NOTE = "Bayesian L5/L10/L20/season baseline + bounded minutes once + verified matchup once + small market shrink; later context is audit-only."
 
 
@@ -10848,6 +11168,84 @@ def _strong_recent_support(row: pd.Series, line: float, lean: str) -> Tuple[int,
     return votes, note
 
 
+def _window_hit_rate(values: List[float], line: float, lean: str, n: int) -> Tuple[int, int, float]:
+    vals = [float(v) for v in values[-n:] if pd.notna(v)]
+    if not vals or pd.isna(line) or lean not in {"OVER", "UNDER"}:
+        return 0, 0, np.nan
+    hits = sum(1 for v in vals if (v > line) == (lean == "OVER"))
+    return hits, len(vals), hits / max(1, len(vals)) * 100.0
+
+
+def _player_market_log_values(player: str, market: str, opponent: str = "") -> List[float]:
+    try:
+        logs = load_dataset("player_game_logs")
+    except Exception:
+        logs = pd.DataFrame()
+    if logs is None or logs.empty:
+        return []
+    d = standardize_player_logs(logs)
+    if d is None or d.empty or market not in d.columns:
+        return []
+    key = normalize_name(player)
+    d = d[d["NameKey"].astype(str).eq(key)].copy()
+    if opponent:
+        opp_key = _team_key_for_matchup(opponent)
+        if opp_key:
+            d = d[d.get("Opponent", pd.Series("", index=d.index)).map(_team_key_for_matchup).eq(opp_key)].copy()
+    if d.empty:
+        return []
+    d = d.sort_values("GameDate")
+    return pd.to_numeric(d[market], errors="coerce").dropna().astype(float).tolist()
+
+
+def _hit_rate_context(row: pd.Series, market: str, line: float, lean: str) -> Tuple[int, str]:
+    values = _player_market_log_values(row.get("Player"), market)
+    h2h_values = _player_market_log_values(row.get("Player"), market, row.get("Opponent"))
+    pieces = []
+    support_points = 0
+    for n in [3, 5, 10]:
+        hits, total, pct = _window_hit_rate(values, line, lean, n)
+        if total:
+            pieces.append(f"L{n} {hits}/{total} ({pct:.0f}%)")
+            if pct >= 60:
+                support_points += 1
+    hh, ht, hpct = _window_hit_rate(h2h_values, line, lean, 10)
+    if ht:
+        pieces.append(f"H2H {hh}/{ht} ({hpct:.0f}%)")
+        if hpct >= 60 and ht >= 2:
+            support_points += 1
+    return support_points, " · ".join(pieces) if pieces else "hit-rate history unavailable"
+
+
+def _veteran_capability_context(row: pd.Series, br: Optional[pd.Series], market: str, lean: str, line: float) -> Tuple[int, str]:
+    if br is None:
+        return 0, "baseline missing"
+    games = safe_float(br.get("Games"), safe_float(br.get("GP"), 0))
+    min_avg = safe_float(br.get("MIN_avg"), np.nan)
+    starter_rate = safe_float(br.get("StarterRate"), np.nan)
+    usage = safe_float(br.get("UsageProxy"), safe_float(br.get("USG%"), np.nan))
+    season = safe_float(br.get(f"{market}_avg"), np.nan)
+    l10 = safe_float(br.get(f"{market}_l10"), np.nan)
+    cap = 0
+    tags = []
+    if games >= 55:
+        cap += 1; tags.append("veteran sample")
+    elif games >= 25:
+        tags.append("regular sample")
+    if pd.notna(min_avg) and min_avg >= 26:
+        cap += 1; tags.append(f"{min_avg:.1f} min")
+    if pd.notna(starter_rate) and starter_rate >= 0.55:
+        cap += 1; tags.append("starter role")
+    if pd.notna(usage) and usage >= 12 and market in {"PTS", "PRA"}:
+        cap += 1; tags.append("usage capable")
+    if pd.notna(season) and pd.notna(line):
+        if (season > line) == (lean == "OVER"):
+            cap += 1; tags.append("season supports")
+        elif pd.notna(l10) and (l10 > line) == (lean == "OVER"):
+            cap += 1; tags.append("recent supports")
+    return cap, ", ".join(tags[:5]) if tags else "capability neutral"
+
+
 def _strong_line_context(row: pd.Series, line: float, lean: str) -> Tuple[bool, str]:
     """Use opening/consensus lines when present; neutral when absent."""
     if lean not in {"OVER", "UNDER"} or pd.isna(line):
@@ -10877,11 +11275,11 @@ def _strong_line_context(row: pd.Series, line: float, lean: str) -> Tuple[bool, 
 def _strong_play_gate(row: pd.Series, market: str, lean: str, edge: float, sidep: float, confidence: float, votes: int) -> Dict[str, Any]:
     edge_abs = abs(edge) if pd.notna(edge) else np.nan
     thresholds = {
-        "PTS": {"edge": 2.0, "prob": 62.0, "conf": 80.0, "minutes": 76.0, "votes": 2},
-        "REB": {"edge": 1.2, "prob": 62.0, "conf": 80.0, "minutes": 76.0, "votes": 2},
-        "AST": {"edge": 1.0, "prob": 62.0, "conf": 80.0, "minutes": 76.0, "votes": 2},
-        "PRA": {"edge": 3.0, "prob": 62.0, "conf": 80.0, "minutes": 76.0, "votes": 2},
-    }.get(market, {"edge": 1.5, "prob": 62.0, "conf": 80.0, "minutes": 76.0, "votes": 2})
+        "PTS": {"edge": 1.75, "prob": 61.0, "conf": 76.0, "minutes": 72.0, "votes": 4},
+        "REB": {"edge": 1.00, "prob": 61.0, "conf": 76.0, "minutes": 72.0, "votes": 4},
+        "AST": {"edge": 0.85, "prob": 61.0, "conf": 76.0, "minutes": 72.0, "votes": 4},
+        "PRA": {"edge": 2.50, "prob": 61.0, "conf": 76.0, "minutes": 72.0, "votes": 4},
+    }.get(market, {"edge": 1.25, "prob": 61.0, "conf": 76.0, "minutes": 72.0, "votes": 4})
     integrity = str(row.get("Data Integrity", "LIMITED")).upper()
     sanity = str(row.get("Projection Sanity", "PASS")).upper()
     minutes_conf = safe_float(row.get("Minutes Confidence"), safe_float(row.get("Minutes 2.0 Confidence"), confidence))
@@ -10923,7 +11321,7 @@ def _strong_play_gate(row: pd.Series, market: str, lean: str, edge: float, sidep
     reasons = [
         f"{sidep:.1f}% side probability",
         f"{edge_abs:.2f} edge" if pd.notna(edge_abs) else "edge unavailable",
-        f"{votes}/4 recent support",
+        f"{votes} evidence support",
         f"{confidence:.1f}% projection confidence",
         f"{minutes_conf:.1f}% minutes confidence",
         line_note,
@@ -10981,6 +11379,19 @@ def _stable_recalculate_side_fields(board: pd.DataFrame, base: Optional[pd.DataF
             v = safe_float(row.get(c), np.nan)
             if pd.notna(v): vals.append(v)
         votes, recent_note = _strong_recent_support(row, line, lean)
+        hit_support, hit_note = _hit_rate_context(row, market, line, lean)
+        vet_support, vet_note = _veteran_capability_context(row, br, market, lean, line)
+        game_ctx = _wnba_game_script_context(row)
+        game_support = int(game_ctx.get("support", 0))
+        row["WNBA ML Game Script"] = game_ctx.get("note", "WNBA ML game script unavailable")
+        row["WNBA ML Game Script Factor"] = round(safe_float(game_ctx.get("factor"), 1.0), 4)
+        row["Projected Team Score ML"] = round(safe_float(game_ctx.get("team_score"), np.nan), 1) if game_ctx.get("ok") else np.nan
+        row["Projected Opp Score ML"] = round(safe_float(game_ctx.get("opp_score"), np.nan), 1) if game_ctx.get("ok") else np.nan
+        row["Projected Game Total ML"] = round(safe_float(game_ctx.get("total"), np.nan), 1) if game_ctx.get("ok") else np.nan
+        row["Projected Spread ML"] = round(safe_float(game_ctx.get("spread"), np.nan), 1) if game_ctx.get("ok") else np.nan
+        row["Team Win Probability ML"] = round(safe_float(game_ctx.get("win_prob"), np.nan), 1) if game_ctx.get("ok") else np.nan
+        row["Game Pace ML"] = round(safe_float(game_ctx.get("pace"), np.nan), 1) if game_ctx.get("ok") else np.nan
+        row["Blowout Risk ML"] = round(safe_float(game_ctx.get("blowout_risk"), np.nan), 1) if game_ctx.get("ok") else np.nan
 
         integrity = str(row.get("Data Integrity", "LIMITED")).upper()
         official_edge = {"PTS":2.00,"REB":1.20,"AST":1.00,"PRA":3.00}.get(market,1.50)
@@ -10992,15 +11403,31 @@ def _stable_recalculate_side_fields(board: pd.DataFrame, base: Optional[pd.DataF
         if sidep < official_prob: reasons.append("probability below official threshold")
         if votes < 2: reasons.append("recent/season support is weak")
         if confidence < 80: reasons.append("projection confidence below 80%")
-        strong_gate = _strong_play_gate(row, market, lean, edge, sidep, confidence, votes)
+        evidence_votes = votes + hit_support + min(2, vet_support) + game_support
+        row["Hit Rate Context"] = hit_note
+        row["Veteran Capability"] = vet_note
+        row["Evidence Support Score"] = evidence_votes
+        strong_gate = _strong_play_gate(row, market, lean, edge, sidep, confidence, evidence_votes)
         if strong_gate["missing"]:
             reasons.extend(strong_gate["missing"].split(" · "))
-        official = strong_gate["label"] if strong_gate["passed"] else "PASS"
+        lean_edge_req = {"PTS":1.15,"REB":0.70,"AST":0.60,"PRA":1.80}.get(market,1.0)
+        lean_ok = (
+            lean in {"OVER", "UNDER"}
+            and pd.notna(edge)
+            and abs(edge) >= lean_edge_req
+            and sidep >= 57.0
+            and confidence >= 68.0
+            and evidence_votes >= 3
+            and integrity == "VERIFIED"
+        )
+        strong_ok = lean_ok and abs(edge) >= {"PTS":1.60,"REB":0.95,"AST":0.85,"PRA":2.40}.get(market,1.25) and sidep >= 60.0 and evidence_votes >= 4
+        official = strong_gate["label"] if strong_gate["passed"] else (f"STRONG {lean}" if strong_ok else f"LEAN {lean}" if lean_ok else "PASS")
 
         # Preserve the calibrated score formula but force it to use the selected side.
         edge_scale = {"PTS":6.0,"REB":11.0,"AST":11.0,"PRA":3.8}.get(market,6.0)
         edge_score = float(np.clip(50 + abs(edge if pd.notna(edge) else 0)*edge_scale, 0, 100))
-        hit_score = float(np.clip(0.46*sidep + 0.24*confidence + 0.16*edge_score + 0.14*(40+votes*13), 0, 100))
+        script_score = float(np.clip(50 + game_support * 14, 25, 78))
+        hit_score = float(np.clip(0.42*sidep + 0.22*confidence + 0.15*edge_score + 0.13*(40+votes*13) + 0.08*script_score, 0, 100))
 
         row["Edge"] = round(edge, 2) if pd.notna(edge) else np.nan
         row["Lean"] = lean
@@ -11014,8 +11441,8 @@ def _stable_recalculate_side_fields(board: pd.DataFrame, base: Optional[pd.DataF
         row["Strong Play Score"] = strong_gate["score"]
         row["Strong Play Reasons"] = strong_gate["reasons"]
         row["Strong Play Missing"] = strong_gate["missing"]
-        row["Recent Support"] = recent_note
-        row["Tier"] = "LONG" if official.startswith("LONG STRONG") else "TRACK"
+        row["Recent Support"] = f"{recent_note} | {hit_note} | ML script: {game_ctx.get('note', 'unavailable')}"
+        row["Tier"] = "LONG" if official.startswith("LONG STRONG") else "STRONG" if official.startswith("STRONG") else "LEAN" if official.startswith("LEAN") else "TRACK"
         row["PASS Reason"] = " · ".join(dict.fromkeys(reasons))
         repaired.append(row)
 
@@ -11161,8 +11588,8 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v3.5.7 — Baseline-Safe Components + Cache Audit"
-PROJECTION_ENGINE_VERSION = "V357_BASELINE_SAFE_COMPONENTS_V1"
+APP_VERSION = "WNBA v3.5.9 — Full WNBA ML Game Script + Evidence Cards"
+PROJECTION_ENGINE_VERSION = "V359_WNBA_FULL_ML_GAME_SCRIPT_V1"
 PROJECTION_ENGINE_NOTE = (
     "Each market uses its own workload-adjusted true-recent baseline plus L5/L10/L20/season "
     "shrinkage. Opponent pace/DRtg is joined before one bounded matchup adjustment. "
@@ -11172,7 +11599,7 @@ PROJECTION_ENGINE_NOTE = (
 OFFICIAL_WNBA_INJURY_URL = "https://www.wnba.com/webview/wnba-injury-report"
 STRONG_PLAY_FRESHNESS_VERSION = "V349_STRONG_TRUST_FRESHNESS_V1"
 WNBA_MONTE_CARLO_SIMS = 15000
-WNBA_WINNING_GATE_VERSION = "V357_BASELINE_SAFE_COMPONENTS_GATE"
+WNBA_WINNING_GATE_VERSION = "V359_WNBA_ML_EVIDENCE_GATE"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -11813,9 +12240,22 @@ def _apply_winning_play_final_gate(board: pd.DataFrame, base: Optional[pd.DataFr
             row["Tier"] = "WINNING"
             row["PASS Reason"] = ""
         else:
-            row["Official"] = "NO"
-            row["Strong Play"] = "TRACK"
-            row["Tier"] = "TRACK"
+            prior_official = str(row.get("Official", "")).upper()
+            fatal_terms = [
+                "player unavailable", "late scratch", "player match missing",
+                "player identity mismatch", "projection sanity", "no clear side",
+                "probability disagrees", "lean does not match",
+            ]
+            fatal = any(any(term in f.lower() for term in fatal_terms) for f in flags)
+            playable_prior = prior_official.startswith(("LONG STRONG", "STRONG", "LEAN"))
+            if playable_prior and not fatal:
+                row["Official"] = prior_official
+                row["Strong Play"] = prior_official
+                row["Tier"] = "LONG" if prior_official.startswith("LONG STRONG") else "STRONG" if prior_official.startswith("STRONG") else "LEAN"
+            else:
+                row["Official"] = "NO"
+                row["Strong Play"] = "TRACK"
+                row["Tier"] = "TRACK"
             row["PASS Reason"] = " | ".join(flags)
         rows.append(row)
     final = pd.DataFrame(rows)
@@ -11985,7 +12425,9 @@ def _baseline_safe_component_projection(row: pd.Series, br: Optional[pd.Series],
         minute_factor = float(np.clip(row_min / avg_min, 0.88, 1.10))
     matchup_factor, matchup_note = _pace_adjusted_matchup_factor(row, market)
     matchup_factor = float(np.clip(matchup_factor, 0.97, 1.03))
-    total_factor = float(np.clip(minute_factor * matchup_factor, 0.86, 1.12))
+    game_ctx = _wnba_game_script_context(pd.Series({**row.to_dict(), "Market": market}))
+    game_factor = safe_float(game_ctx.get("factor"), 1.0)
+    total_factor = float(np.clip(minute_factor * matchup_factor * game_factor, 0.86, 1.12))
     projected = base_proj * total_factor
     caps = {"PTS": (0.0, 42.0, 5.5), "REB": (0.0, 19.0, 3.2), "AST": (0.0, 15.0, 2.8), "PRA": (0.0, 60.0, 8.0)}
     lo, hard_hi, bump_cap = caps.get(market, (0.0, 45.0, 4.0))
@@ -11997,7 +12439,9 @@ def _baseline_safe_component_projection(row: pd.Series, br: Optional[pd.Series],
         "factor": total_factor,
         "minute_factor": minute_factor,
         "matchup_factor": matchup_factor,
-        "note": f"baseline-safe {market}; minutes {minute_factor:.3f}; {matchup_note}",
+        "game_script_factor": game_factor,
+        "game_script_note": game_ctx.get("note", "WNBA ML game script neutral"),
+        "note": f"baseline-safe {market}; minutes {minute_factor:.3f}; {matchup_note}; game script {game_factor:.3f} ({game_ctx.get('note', 'neutral')})",
     }
 
 
@@ -12046,6 +12490,10 @@ def _apply_component_opportunity_engine(board: pd.DataFrame, base: Optional[pd.D
         row["Projection"] = round(new_projection, 2) if pd.notna(new_projection) else np.nan
         row["Component Opportunity Factor"] = round(float(factor), 4) if pd.notna(factor) else np.nan
         row["Component Opportunity Note"] = note
+        game_meta = metas.get(market, {}) if isinstance(metas, dict) and market in metas else {}
+        if isinstance(game_meta, dict):
+            row["WNBA ML Game Script Factor"] = round(safe_float(game_meta.get("game_script_factor"), 1.0), 4)
+            row["WNBA ML Game Script Note"] = game_meta.get("game_script_note", "")
         row["PTS Component Opportunity"] = round(comps.get("PTS"), 2) if pd.notna(comps.get("PTS")) else np.nan
         row["REB Component Opportunity"] = round(comps.get("REB"), 2) if pd.notna(comps.get("REB")) else np.nan
         row["AST Component Opportunity"] = round(comps.get("AST"), 2) if pd.notna(comps.get("AST")) else np.nan
@@ -12535,11 +12983,16 @@ with tabs[1]:
         if sort_cols:
             show = show.sort_values(sort_cols, ascending=False)
         st.metric("Best Bet Rows", len(show))
+        health, health_issues = projection_health_summary(show)
+        with st.expander("Best Bets export integrity check", expanded=False):
+            st.json(health)
+            if health_issues is not None and not health_issues.empty:
+                st.dataframe(health_issues, use_container_width=True, hide_index=True)
         card_view = st.toggle("Show player cards", value=True, key="best_bets_card_view")
         if card_view:
             for _, rr in show.head(40).iterrows():
                 render_card(rr)
-        display_cols = [c for c in ["Tier", "Official", "Clean Risk", "Winning Play Score", "Projection Engine Version", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Opening Line", "CLV", "Projection", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+        display_cols = [c for c in ["Tier", "Official", "Clean Risk", "Winning Play Score", "Projection Engine Version", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Opening Line", "CLV", "Projection", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
         st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
@@ -12559,6 +13012,16 @@ with tabs[3]:
         with st.expander("AutoGrader status / why it may grade 0", expanded=False):
             st.json(diag)
             st.caption("If Matched Completed Logs is 0, import/refresh final player logs first. ESPN screenshots confirm results, but the app needs those stats in the player logs table to auto-grade.")
+        health, health_issues = projection_health_summary(board)
+        with st.expander("Projection health before save", expanded=True):
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Integrity", health.get("Projection Integrity VERIFIED", "0/0"))
+            h2.metric("Lineup/minutes", health.get("Lineup/minutes ready", "0/0"))
+            h3.metric("Team off/def", health.get("Team offense/defense ready", "0/0"))
+            h4.metric("Opponent ctx", health.get("Opponent context ready", "0/0"))
+            st.caption(f"XGBoost safety: {health.get('XGBoost default safe', 'OFF')}. Save only when the plays you trust show VERIFIED/context-ready, especially near lock.")
+            if health_issues is not None and not health_issues.empty:
+                st.dataframe(health_issues, use_container_width=True, hide_index=True)
         c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("💾 Save official before games", use_container_width=True):
@@ -12577,6 +13040,8 @@ with tabs[3]:
                     st.dataframe(dbg, use_container_width=True, hide_index=True)
         with c3:
             st.metric("Current board", 0 if board.empty else len(board))
+            st.metric("Last auto graded", st.session_state.get("last_auto_final_grade_count", "N/A"))
+            st.caption(f"Last auto check: {st.session_state.get('last_auto_final_grade_check', 'not yet')}")
         st.info("The grader now pulls final ESPN boxscores automatically, falls back to the official WNBA feed, and grades only completed games. Future/not-started games remain pending.")
     official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
     learning = pd.DataFrame(load_json(LEARNING_LOG, []))
