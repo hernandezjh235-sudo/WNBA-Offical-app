@@ -7775,6 +7775,43 @@ def render_source_status_card(lines: pd.DataFrame, ud_debug: pd.DataFrame, sl_de
     </div>
     """, unsafe_allow_html=True)
 
+
+def render_line_audit_panel(lines: pd.DataFrame, board: Optional[pd.DataFrame] = None, ud_debug: Optional[pd.DataFrame] = None, label: str = "Line Audit") -> None:
+    """Visible line-source audit so cached/live/manual line issues are obvious."""
+    with st.expander(label, expanded=False):
+        l = lines.copy() if lines is not None and not getattr(lines, "empty", True) else pd.DataFrame()
+        b = board.copy() if board is not None and not getattr(board, "empty", True) else pd.DataFrame()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Last pull", st.session_state.get("wnba_last_refresh", "not yet"))
+        c2.metric("Line rows", 0 if l.empty else len(l))
+        c3.metric("Board rows", 0 if b.empty else len(b))
+        missing_lines = 0
+        if not b.empty and "Line" in b.columns:
+            missing_lines = int(pd.to_numeric(b["Line"], errors="coerce").isna().sum())
+        c4.metric("Missing lines", missing_lines)
+        if not l.empty and "Source" in l.columns:
+            src_counts = l["Source"].astype(str).value_counts().rename_axis("Source").reset_index(name="Rows")
+            st.dataframe(src_counts, use_container_width=True, hide_index=True)
+        if not b.empty:
+            audit_cols = [c for c in [
+                "Player", "Team", "Opponent", "Market", "Line", "Projection", "Edge", "Lean",
+                "Source", "Opening Line", "CLV", "Line Age Minutes", "Line Snapshot Count",
+                "Freshness Status", "Matchup", "Raw"
+            ] if c in b.columns]
+            if audit_cols:
+                bad = b.copy()
+                if "Line" in bad.columns:
+                    numeric_line = pd.to_numeric(bad["Line"], errors="coerce")
+                    bad = bad[numeric_line.isna() | numeric_line.le(0) | bad.get("Source", pd.Series("", index=bad.index)).astype(str).str.upper().str.contains("NO LINE|BASELINE", na=False)]
+                if bad.empty:
+                    st.caption("No missing/invalid line rows detected in the current board.")
+                else:
+                    st.warning("Rows below have missing/fallback/invalid line data.")
+                    st.dataframe(bad[audit_cols].head(80), use_container_width=True, hide_index=True)
+        if ud_debug is not None and not getattr(ud_debug, "empty", True):
+            st.markdown("**Underdog pull/debug**")
+            st.dataframe(ud_debug.tail(80), use_container_width=True, hide_index=True)
+
 def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame, force_market: Optional[str] = None):
     market_label = f" — {force_market}" if force_market else ""
     st.markdown(f"<div class='section-title'>{mode}{market_label} Board</div>", unsafe_allow_html=True)
@@ -8277,15 +8314,25 @@ def refresh_today_pipeline(mode: str, use_ud_flag: bool = True) -> Dict[str, Any
 def run_one_click_refresh_today(mode: str = "Today", use_ud_flag: bool = True) -> Dict[str, Any]:
     status = {"Mode": mode, "Status": "started"}
     started = time.time()
+    progress = st.progress(0, text="Starting refresh...")
+    status_box = st.empty()
     try:
+        progress.progress(15, text="Loading WNBA baselines...")
+        status_box.info("Loading WNBA baselines...")
         master, _, dbg = ensure_online_wnba_master_features(force_official=False)
         status["Database"] = f"ready {0 if master is None or master.empty else len(master):,} players"
         st.session_state["wnba_online_master_debug"] = dbg
+        progress.progress(45, text="Refreshing schedule, context and lines...")
+        status_box.info("Refreshing schedule, context and lines...")
         pipe_status = refresh_today_pipeline(mode, use_ud_flag)
         status.update(pipe_status or {})
         status["Status"] = status.get("Status", "complete")
+        progress.progress(100, text=f"Refresh complete: {status.get('Cards', 0)} projection rows.")
+        status_box.success(f"Refresh complete: {status.get('Cards', 0)} projection rows.")
     except Exception as e:
         status["Status"] = f"one-click error: {str(e)[:160]}"
+        progress.progress(100, text="Refresh stopped with an error.")
+        status_box.error(status["Status"])
     status["Seconds"] = round(time.time() - started, 2)
     st.session_state["wnba_refresh_today_status"] = status
     st.session_state["wnba_last_refresh"] = now_iso()
@@ -8402,6 +8449,17 @@ def _grouped_market_html(r: pd.Series) -> str:
     vet = html.escape(str(r.get("Veteran Capability", "") or "capability neutral")[:140])
     evidence = _fmt_num_compact(r.get("Evidence Support Score"), 0)
     edge_cls = "pos" if pd.notna(edge_v) and edge_v > 0 else "neg" if pd.notna(edge_v) and edge_v < 0 else "flat"
+    source = html.escape(str(r.get("Source", "Unknown") or "Unknown"))
+    opening = _fmt_num_compact(r.get("Opening Line"), 1)
+    clv = _fmt_num_compact(r.get("CLV"), 1)
+    line_age = _fmt_num_compact(r.get("Line Age Minutes"), 0)
+    line_meta = f"Source {source}"
+    if opening != "—":
+        line_meta += f" · Open {opening}"
+    if clv != "—":
+        line_meta += f" · CLV {clv}"
+    if line_age != "—":
+        line_meta += f" · Age {line_age}m"
     return f"""
       <div class='owp-market-row owp-mkt-{market.lower()}'>
         <div class='owp-market-head'>
@@ -8410,11 +8468,13 @@ def _grouped_market_html(r: pd.Series) -> str:
           <span class='owp-market-conf {side_cls}'>HIGH {conf}%</span>
           <span class='owp-market-side {side_cls}'>{side_txt}</span>
         </div>
-        <div class='owp-market-main'>
-          <span class='owp-market-proj'>{proj}</span>
-          <span class='owp-market-edge {edge_cls}'>{edge} vs {line}</span>
-          <span class='owp-market-tier {track_cls}'>{track_badge}</span>
+        <div class='owp-market-values'>
+          <div class='owp-value-box'><small>Projection</small><b>{proj}</b></div>
+          <div class='owp-value-box line'><small>Line</small><b>{line}</b></div>
+          <div class='owp-value-box'><small>Edge</small><b class='{edge_cls}'>{edge}</b></div>
+          <div class='owp-value-box pick'><small>Pick</small><b>{side_txt}</b><span>{track_badge}</span></div>
         </div>
+        <div class='owp-line-meta'>{line_meta}</div>
         <div class='owp-prob-track owp-market-track'><div class='owp-prob-fill' style='width:{fill:.0f}%'></div></div>
         <div class='owp-market-sub'><span>OVER {_fmt_num_compact(overp,0)}%</span><span>UNDER {_fmt_num_compact(underp,0)}%</span></div>
         <div class='owp-market-note'>{note}<br><span>Veteran/capability: {vet} · Evidence {evidence}</span><br><span>ML script: {game_note}</span></div>
@@ -8457,6 +8517,10 @@ def render_grouped_player_card(player_df: pd.DataFrame):
     market_html = "".join(_grouped_market_html(r) for _, r in player_df.iterrows())
     tracked_n = int(player_df.get("Tracking Status", pd.Series(dtype=str)).astype(str).str.upper().isin(["TRACK", "OFFICIAL"]).sum())
     tracking_pill = f"<span class='owp-pill owp-pill-track'>TRACKED {tracked_n}/{len(player_df)}</span>" if tracked_n else ""
+    line_vals = pd.to_numeric(player_df.get("Line", pd.Series(np.nan, index=player_df.index)), errors="coerce")
+    source_vals = player_df.get("Source", pd.Series("", index=player_df.index)).astype(str).str.upper()
+    bad_line_n = int((line_vals.isna() | line_vals.le(0) | source_vals.str.contains("NO LINE|BASELINE", na=False)).sum())
+    line_warn = f"<span class='owp-pill owp-pill-warn'>CHECK LINES {bad_line_n}</span>" if bad_line_n else ""
     team_logo = _team_logo_html(team)
     opp_logo = _team_logo_html(opp, "owp-opp-logo")
     st.markdown(f"""
@@ -8470,13 +8534,14 @@ def render_grouped_player_card(player_df: pd.DataFrame):
           <span class='owp-pill owp-pill-role'>Lineup/Role {role}</span>
           <span class='owp-pill owp-pill-score'>Data {data_score}/100</span>
           {tracking_pill}
+          {line_warn}
         </div>
       </div>
       {market_html}
     </div>
     """, unsafe_allow_html=True)
     with st.expander(f"Advanced details — {player} all markets", expanded=False):
-        show_cols = [c for c in ["Market","Projection","Line","Edge","Lean","Over %","Under %","Official Play Score","Tier","Source","Opponent","HomeAway","Projection Explanation"] if c in player_df.columns]
+        show_cols = [c for c in ["Market","Projection","Line","Edge","Lean","Over %","Under %","Official Play Score","Tier","Source","Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Freshness Status","Opponent","HomeAway","Matchup","Raw","Projection Explanation"] if c in player_df.columns]
         st.dataframe(player_df[show_cols], use_container_width=True, hide_index=True)
 
 
@@ -8977,13 +9042,9 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     st.markdown(f"<div class='section-title'>{mode} — Grouped Player Cards</div>", unsafe_allow_html=True)
     top_cols = st.columns([1.2, 1.0, 1.0, 2.0])
     with top_cols[0]:
-        refresh_label = "🔄 Refresh Live Today" if mode == "Today" else f"🔄 Refresh Live {mode}"
+        refresh_label = "🔄 Refresh Everything Today" if mode == "Today" else f"🔄 Refresh Everything {mode}"
         if st.button(refresh_label, key=f"group_refresh_{mode}", use_container_width=True):
-            st.session_state[f"wnba_force_live_{mode}"] = True
-            if mode == "Today":
-                run_one_click_refresh_today(mode, use_ud_flag)
-            else:
-                clear_line_pull_caches(); pull_board_lines(use_ud_flag, False, False, ""); st.session_state["wnba_last_refresh"] = now_iso()
+            run_full_refresh_with_progress(mode, use_ud_flag, logs_global, master_global)
             st.rerun()
     with top_cols[1]:
         meta = saved_board_meta()
@@ -9008,8 +9069,8 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
         st.success(f"Loaded saved board from {meta.get('SavedAt', 'saved snapshot')} — no live refresh needed.")
         bc1, bc2, bc3 = st.columns([1.2, 1.2, 1.4])
         with bc1:
-            if st.button("🔄 Refresh live lines", key=f"saved_refresh_live_{mode}", use_container_width=True):
-                st.session_state[f"wnba_force_live_{mode}"] = True
+            if st.button("🔄 Refresh Everything", key=f"saved_refresh_live_{mode}", use_container_width=True):
+                run_full_refresh_with_progress(mode, use_ud_flag, logs_global, master_global)
                 st.rerun()
         with bc2:
             if st.button("🧹 Clear saved board", key=f"clear_saved_board_{mode}", use_container_width=True):
@@ -9022,6 +9083,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
         with bc3:
             st.caption("Saved boards stay available after closing/reopening the app as long as Streamlit keeps the app files/cache.")
         saved_df = _v345_post_context_finalizer(saved_df, master_global)
+        render_line_audit_panel(load_dataset("saved_lines"), saved_df, st.session_state.get("wnba_ud_debug", pd.DataFrame()), "Line Audit — saved board")
         return _render_grouped_projection_df(saved_df, mode, f"saved_group_search_{mode}", f"saved_group_max_{mode}", f"saved_group_official_only_{mode}", saved_view=True)
 
     # Keep Player Cards synchronized with Best Bets. On normal app open, show
@@ -9031,6 +9093,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     if not force_live and cached_board is not None and not cached_board.empty:
         st.success(f"Loaded {len(cached_board):,} rows from the last-good {cached_label} — the same lines shown in Best Bets.")
         st.caption("Tap Refresh Live to request a new Underdog board. Cached rows are displayed exactly as saved; no line is re-selected here.")
+        render_line_audit_panel(st.session_state.get("wnba_lines_all", pd.DataFrame()), cached_board, st.session_state.get("wnba_ud_debug", pd.DataFrame()), f"Line Audit — cached {cached_label}")
         return _render_grouped_projection_df(cached_board, mode, f"cache_group_search_{mode}", f"cache_group_max_{mode}", f"cache_group_official_only_{mode}", saved_view=True)
 
     lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, False, False, "")
@@ -9050,6 +9113,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
             st.session_state[f"wnba_force_live_{mode}"] = False
             st.warning("The live Underdog request returned 0 rows, so Player Cards is showing the last-good board instead of going blank.")
             st.success(f"Fallback loaded {len(cached_board):,} rows from the {cached_label}. These are the same lines used by Best Bets.")
+            render_line_audit_panel(lines_all, cached_board, ud_debug, f"Line Audit — fallback {cached_label}")
             return _render_grouped_projection_df(cached_board, mode, f"fallback_group_search_{mode}", f"fallback_group_max_{mode}", f"fallback_group_official_only_{mode}", saved_view=True)
         st.error("No live lines were returned and no last-good projection cache is available. Check Debug / Status for the Underdog response.")
         return pd.DataFrame()
@@ -9084,6 +9148,8 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
             st.success(f"Saved {n:,} board rows. Next app open will load this board without refreshing.")
     with save_cols[1]:
         st.caption("Save Board keeps the pulled lines + projections available after closing/reopening, similar to the MLB app.")
+
+    render_line_audit_panel(lines, proj_df, ud_debug, "Line Audit — live board")
 
     # Fast table / grouped cards toggle. Default to Fast table for speed; switch to
     # Player cards only when you want the full visual cards.
@@ -10108,10 +10174,10 @@ with st.sidebar:
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
     st.markdown("**Model:** Monte Carlo + Bayesian confidence + WNBA game script" + (" + guarded XGBoost/GBM blend" if use_xgb_blend else ""))
     st.divider()
-    if st.button("🔄 Refresh Today — All-in-One", use_container_width=True):
+    if st.button("🔄 Refresh Everything Today", use_container_width=True):
         run_one_click_refresh_today("Today", use_ud)
         st.rerun()
-    st.caption("Railway-safe: the page loads first, then this one button automatically pulls schedule, online stats, opponent context, Underdog/manual lines, and rebuilds every projection. Data Manager is not required.")
+    st.caption("One refresh button: schedule, online stats, opponent context, Underdog/manual lines, projections, and cache.")
 
 @st.cache_data(show_spinner=False)
 def get_global_datasets() -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -10197,6 +10263,18 @@ st.markdown("""
 .owp-team-logo-text{font-size:.72rem;font-weight:1000;color:#facc15}
 .owp-opp-logo .owp-team-logo-text{color:#93c5fd}
 .owp-group-card pre,.owp-group-card code{display:none!important}
+.owp-pill-warn{border-color:rgba(251,191,36,.85)!important;color:#fbbf24!important;background:rgba(251,191,36,.10)!important}
+.owp-market-values{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}
+.owp-value-box{background:rgba(2,6,23,.48);border:1px solid rgba(148,163,184,.14);border-radius:10px;padding:8px 10px;min-width:0}
+.owp-value-box small{display:block;color:#94a3b8;text-transform:uppercase;font-size:.62rem;font-weight:900;letter-spacing:.04em}
+.owp-value-box b{display:block;color:#f8fafc;font-size:1.35rem;line-height:1.1;margin-top:3px}
+.owp-value-box.line{border-color:rgba(250,204,21,.45);background:rgba(250,204,21,.08)}
+.owp-value-box.line b{color:#facc15}
+.owp-value-box.pick b{color:#4ade80}
+.owp-value-box.pick span{display:block;color:#facc15;font-size:.72rem;font-weight:900}
+.owp-value-box b.pos{color:#4ade80}.owp-value-box b.neg{color:#fb7185}.owp-value-box b.flat{color:#e9d5ff}
+.owp-line-meta{margin-top:7px;color:#c4b5fd;font-size:.76rem;font-weight:800}
+@media(max-width:640px){.owp-market-values{grid-template-columns:repeat(2,minmax(0,1fr))}.owp-value-box b{font-size:1.18rem}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -11567,6 +11645,105 @@ def _stable_load_or_repair_cached_board(mode: str, base: Optional[pd.DataFrame])
         except Exception as exc:
             st.session_state["wnba_projection_cache_repair_error"] = str(exc)[:220]
     return board, label
+
+
+def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """One visible refresh path: schedule/context, lines, projections, cache."""
+    progress = st.progress(0, text="Starting full refresh...")
+    status_box = st.empty()
+    status: Dict[str, Any] = {"Mode": mode, "Status": "started"}
+    started = time.time()
+
+    def step(pct: int, msg: str) -> None:
+        progress.progress(pct, text=msg)
+        status_box.info(msg)
+
+    try:
+        step(8, "Clearing old line pull cache...")
+        clear_line_pull_caches()
+        st.session_state.pop("wnba_lines_all", None)
+
+        step(20, "Refreshing schedule and team context...")
+        sched, sched_dbg = update_schedule_cache_with_espn(mode)
+        status["Games"] = 0 if sched is None or sched.empty else len(sched)
+        status["Schedule Loaded"] = "YES" if status["Games"] else "NO/CACHED"
+        st.session_state["wnba_schedule_debug"] = sched_dbg
+        try:
+            game_ctx, game_dbg = build_game_context_cache(mode, force_official=True)
+            daily_ctx, daily_dbg = build_daily_team_context_cache_v2(mode, force=True)
+            status["Game Context Rows"] = 0 if game_ctx is None or game_ctx.empty else len(game_ctx)
+            status["Daily Context Rows"] = 0 if daily_ctx is None or daily_ctx.empty else len(daily_ctx)
+            st.session_state["wnba_game_context_debug"] = game_dbg
+            st.session_state["wnba_daily_team_context_v2_debug"] = daily_dbg
+        except Exception as exc:
+            status["Context Warning"] = str(exc)[:160]
+
+        step(38, "Loading/rebuilding player baselines...")
+        logs = logs_global if logs_global is not None and not logs_global.empty else load_dataset("player_game_logs")
+        master = master_global if master_global is not None and not master_global.empty else load_dataset("master_features")
+        if (master is None or master.empty) and logs is not None and not logs.empty:
+            try:
+                master, _team_ranks = build_master_features()
+            except Exception:
+                master = pd.DataFrame()
+        status["Database Players"] = 0 if master is None or master.empty else len(master)
+
+        step(58, "Pulling current lines...")
+        lines_all, ud_debug, manual_debug = pull_board_lines(use_ud_flag, False, False, "")
+        lines, slate_note = filter_lines_for_slate(lines_all, mode)
+        status["Line Rows"] = 0 if lines is None or lines.empty else len(lines)
+        status["Underdog Lines"] = int((lines.get("Source", pd.Series(dtype=str)).astype(str) == "Underdog").sum()) if lines is not None and not lines.empty else 0
+        status["Slate Note"] = slate_note
+        st.session_state["wnba_ud_debug"] = ud_debug
+        st.session_state["wnba_sl_debug"] = manual_debug
+
+        if lines is None or lines.empty:
+            status["Status"] = "no lines returned"
+            status["Seconds"] = round(time.time() - started, 2)
+            st.session_state["wnba_refresh_today_status"] = status
+            step(100, "Refresh finished: no lines returned. Last-good board will be used if available.")
+            return pd.DataFrame(), status
+        if logs is None or logs.empty or master is None or master.empty:
+            status["Status"] = "lines loaded, database missing"
+            status["Seconds"] = round(time.time() - started, 2)
+            st.session_state["wnba_refresh_today_status"] = status
+            step(100, "Refresh finished: lines loaded, but player database is missing.")
+            return pd.DataFrame(), status
+
+        step(78, "Building projections from current lines...")
+        board = make_projection_board(lines[lines["Market"].isin(MARKETS)], logs, master, mode)
+        if board is None or board.empty:
+            status["Status"] = "projection build returned 0 rows"
+            status["Seconds"] = round(time.time() - started, 2)
+            st.session_state["wnba_refresh_today_status"] = status
+            step(100, "Refresh finished: projection build returned 0 rows.")
+            return pd.DataFrame(), status
+        board["Slate"] = mode
+        board["SlateDate"] = str(slate_target_date(mode) or "ALL")
+        board = enrich_board_with_matchups(board, mode)
+        board["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+
+        step(92, "Saving refreshed board/cache...")
+        save_dataset("projection_board", board)
+        try:
+            save_board_snapshot(board, lines_all, mode)
+        except Exception as exc:
+            status["Save Snapshot Warning"] = str(exc)[:160]
+        st.session_state[f"wnba_force_live_{mode}"] = False
+        st.session_state["wnba_last_refresh"] = now_iso()
+        status["Cards"] = len(board)
+        status["Status"] = "complete"
+        status["Seconds"] = round(time.time() - started, 2)
+        st.session_state["wnba_refresh_today_status"] = status
+        step(100, f"Refresh complete: {len(board):,} projection rows built.")
+        return board, status
+    except Exception as exc:
+        status["Status"] = f"refresh error: {str(exc)[:180]}"
+        status["Seconds"] = round(time.time() - started, 2)
+        st.session_state["wnba_refresh_today_status"] = status
+        progress.progress(100, text="Refresh stopped with an error.")
+        status_box.error(status["Status"])
+        return pd.DataFrame(), status
 
 
 def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame):
