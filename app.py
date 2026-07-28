@@ -32,7 +32,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.5.2 — Component Opportunity + Pace-Adjusted Matchup Engine"
+APP_VERSION = "WNBA v3.5.6 — No-Bleed Components + Hard Sanity Gates"
 LINE_PARSER_VERSION = "UD_FULL_GAME_MAINLINE_V2"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
 EMBEDDED_DATA_VERSION = "CORE_DATA_SELF_HEAL_V1"
@@ -9140,7 +9140,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v3.5.2 — Component Opportunity + Pace-Adjusted Matchup Engine"
+APP_VERSION = "WNBA v3.5.6 — No-Bleed Components + Hard Sanity Gates"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -10647,8 +10647,8 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v3.5.2 — Component Opportunity + Pace-Adjusted Matchup Engine"
-PROJECTION_ENGINE_VERSION = "V352_COMPONENT_OPPORTUNITY_MATCHUP_V1"
+APP_VERSION = "WNBA v3.5.6 — No-Bleed Components + Hard Sanity Gates"
+PROJECTION_ENGINE_VERSION = "V356_NO_BLEED_COMPONENTS_SANITY_V1"
 PROJECTION_ENGINE_NOTE = "Bayesian L5/L10/L20/season baseline + bounded minutes once + verified matchup once + small market shrink; later context is audit-only."
 
 
@@ -11160,8 +11160,8 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v3.5.2 — Component Opportunity + Pace-Adjusted Matchup Engine"
-PROJECTION_ENGINE_VERSION = "V352_COMPONENT_OPPORTUNITY_MATCHUP_V1"
+APP_VERSION = "WNBA v3.5.6 — No-Bleed Components + Hard Sanity Gates"
+PROJECTION_ENGINE_VERSION = "V356_NO_BLEED_COMPONENTS_SANITY_V1"
 PROJECTION_ENGINE_NOTE = (
     "Each market uses its own workload-adjusted true-recent baseline plus L5/L10/L20/season "
     "shrinkage. Opponent pace/DRtg is joined before one bounded matchup adjustment. "
@@ -11171,7 +11171,7 @@ PROJECTION_ENGINE_NOTE = (
 OFFICIAL_WNBA_INJURY_URL = "https://www.wnba.com/webview/wnba-injury-report"
 STRONG_PLAY_FRESHNESS_VERSION = "V349_STRONG_TRUST_FRESHNESS_V1"
 WNBA_MONTE_CARLO_SIMS = 15000
-WNBA_WINNING_GATE_VERSION = "V352_COMPONENT_OPPORTUNITY_MATCHUP_GATE"
+WNBA_WINNING_GATE_VERSION = "V356_NO_BLEED_COMPONENTS_SANITY_GATE"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -11679,22 +11679,30 @@ def _final_no_bet_flags(row: pd.Series) -> List[str]:
     for col in ["L5 Avg", "L10 Avg", "Season Avg", "Projection", "Line"]:
         if pd.isna(safe_float(row.get(col), np.nan)):
             flags.append(f"{col} missing")
+    proj = safe_float(row.get("Projection"), np.nan)
+    line = safe_float(row.get("Line"), np.nan)
+    max_reasonable = {"PTS": 45.0, "REB": 22.0, "AST": 18.0, "PRA": 65.0}.get(market, 50.0)
+    if pd.notna(proj) and proj > max_reasonable:
+        flags.append(f"projection exceeds WNBA sanity cap {max_reasonable:.0f}")
+    if pd.notna(proj) and pd.notna(line):
+        max_edge = {"PTS": 18.0, "REB": 10.0, "AST": 9.0, "PRA": 28.0}.get(market, 15.0)
+        if abs(proj - line) > max_edge:
+            flags.append(f"edge exceeds WNBA sanity cap {max_edge:.0f}")
     if market == "PRA":
         comps = [safe_float(row.get(c), np.nan) for c in ["PRA Component PTS", "PRA Component REB", "PRA Component AST"]]
-        proj = safe_float(row.get("Projection"), np.nan)
         if not all(pd.notna(x) for x in comps):
             flags.append("PRA components missing")
         elif pd.notna(proj) and abs(sum(comps) - proj) > 0.75:
             flags.append("PRA component sum mismatch")
+        elif all(pd.notna(x) for x in comps):
+            if max(comps) - min(comps) < 0.10 and proj > 25:
+                flags.append("PRA component bleed detected")
+            if comps[1] > 22 or comps[2] > 18:
+                flags.append("PRA component exceeds WNBA sanity cap")
     elif market in {"PTS", "REB", "AST"}:
-        # A single-stat market should not be using another market's visible baseline.
-        opposite_cols = {
-            "PTS": ["REB Component", "AST Component", "PRA Component Sum"],
-            "REB": ["PTS Component", "AST Component", "PRA Component Sum"],
-            "AST": ["PTS Component", "REB Component", "PRA Component Sum"],
-        }.get(market, [])
-        if any(c in row.index and pd.notna(safe_float(row.get(c), np.nan)) for c in opposite_cols):
-            flags.append("single-stat market has cross-market component bleed")
+        comps = [safe_float(row.get(c), np.nan) for c in ["PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity"]]
+        if all(pd.notna(x) for x in comps) and max(comps) - min(comps) < 0.10 and max(comps) > 12:
+            flags.append("single-stat component bleed detected")
     edge = safe_float(row.get("Edge"), np.nan)
     overp = safe_float(row.get("Over %"), np.nan)
     underp = safe_float(row.get("Under %"), np.nan)
@@ -11915,11 +11923,18 @@ def _pace_adjusted_matchup_factor(row: pd.Series, market: str) -> Tuple[float, s
 
 def _component_opportunity_projection(row: pd.Series, br: Optional[pd.Series], market: str) -> Tuple[float, Dict[str, Any]]:
     source_row = row.copy()
+    current_market = str(row.get("Market", "")).upper()
     source_row["Market"] = market
+    if current_market != market:
+        # Prevent cross-market bleed: when building REB/AST/PRA components from a
+        # PTS row, the visible PTS Projection cannot be used as a fallback.
+        source_row["Projection"] = np.nan
+        for col in ["L5 Avg", "L10 Avg", "L20 Avg", "Season Avg"]:
+            source_row[col] = np.nan
     # Always rebuild the requested component from the player baseline. Reusing the
     # visible row projection here caused PTS/REB/AST component bleed.
     base_proj, _, _ = _strict_component_projection(source_row, br, market, market_shrink=False)
-    if pd.isna(base_proj) and str(row.get("Market", "")).upper() == market:
+    if pd.isna(base_proj) and current_market == market:
         base_proj = safe_float(row.get("Projection"), np.nan)
     if pd.isna(base_proj):
         return np.nan, {"note": "component projection unavailable"}
@@ -11947,6 +11962,7 @@ def _apply_component_opportunity_engine(board: pd.DataFrame, base: Optional[pd.D
     group_cols = [c for c in ["Matched Player", "Player", "Team", "Opponent", "Slate", "SlateDate"] if c in board.columns]
     player_col = "Matched Player" if "Matched Player" in board.columns else "Player"
     group_cols = [player_col] + [c for c in ["Team", "Opponent", "Slate", "SlateDate"] if c in board.columns]
+    market_rows = _strict_player_market_rows(board)
     component_cache = {}
     for _, rr in board.iterrows():
         row = rr.copy()
@@ -11958,7 +11974,8 @@ def _apply_component_opportunity_engine(board: pd.DataFrame, base: Optional[pd.D
         if cache_key not in component_cache:
             comps, metas = {}, {}
             for m in ["PTS", "REB", "AST"]:
-                p, meta = _component_opportunity_projection(row, br, m)
+                source_row = _strict_market_source_row(row, m, market_rows)
+                p, meta = _component_opportunity_projection(source_row, br, m)
                 comps[m] = p
                 metas[m] = meta
             component_cache[cache_key] = (comps, metas)
