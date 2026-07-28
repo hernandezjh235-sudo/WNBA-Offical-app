@@ -189,6 +189,11 @@ TEAM_ESPN_LOGO_SLUGS = {
     "IND": "ind", "LVA": "lv", "LAS": "la", "MIN": "min", "NYL": "ny",
     "PHX": "phx", "SEA": "sea", "WAS": "wsh", "POR": "por", "TOR": "tor",
 }
+TEAM_NICKNAMES = {
+    "ATL": "Dream", "CHI": "Sky", "CON": "Sun", "DAL": "Wings", "GSV": "Valkyries",
+    "IND": "Fever", "LVA": "Aces", "LAS": "Sparks", "MIN": "Lynx", "NYL": "Liberty",
+    "PHX": "Mercury", "SEA": "Storm", "WAS": "Mystics", "POR": "Fire", "TOR": "Tempo",
+}
 
 def team_abbr_for_logo(team: Any) -> str:
     t = str(team or "").strip().upper()
@@ -8806,8 +8811,8 @@ def _wnba_game_script_context(row: pd.Series) -> Dict[str, Any]:
 
 
 def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system") -> None:
-    st.markdown("#### WNBA ML System")
-    st.caption("Game-level model using team pace, ORtg, DRtg and slate matchup. Separate from player props.")
+    st.markdown("#### WNBA Moneyline / Game Script")
+    st.caption("Game-level model using pace, ORtg, DRtg, projected score, 15k simulation, spread, total and blowout risk.")
     if board_df is None or board_df.empty or not {"Team", "Opponent"}.issubset(board_df.columns):
         st.info("No team matchups available yet.")
         return
@@ -8841,32 +8846,60 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system")
         spread = a_score - b_score
         total = a_score + b_score
         ml_team = sim.get("Sim Favorite") or (a if spread >= 0 else b)
-        ml_prob = sim.get("Sim Win %") if ml_team == a else 100.0 - safe_float(sim.get("Sim Win %"), 50.0)
+        a_win = safe_float(sim.get("Sim Win %"), 50.0)
+        b_win = 100.0 - a_win
+        ml_prob = a_win if ml_team == a else b_win
+        dog_team = b if ml_team == a else a
+        dog_prob = b_win if ml_team == a else a_win
         total_side = "OVER" if safe_float(sim.get("Sim Total Over %"), 50.0) >= 50 else "UNDER"
         total_conf = max(safe_float(sim.get("Sim Total Over %"), 50.0), safe_float(sim.get("Sim Total Under %"), 50.0))
-        spread_conf = min(82, 50 + abs(safe_float(sim.get("Sim Spread"), spread)) * 4.5)
-        cards.append(f"""
-        <div class='wnba-ml-card'>
-          <div class='wnba-ml-top'><div><b>{a}</b><span> vs </span><b>{b}</b></div><em>{pace:.1f} poss</em></div>
-          <div class='wnba-ml-score'><span>{a} <b>{a_score:.1f}</b></span><span>{b} <b>{b_score:.1f}</b></span></div>
-          <div class='wnba-ml-sim'>15k sim: {a} {sim.get("Team Sim Score")} · {b} {sim.get("Opponent Sim Score")} · total {sim.get("Sim Total")} · pace {sim.get("Sim Pace")}</div>
-          <div class='wnba-ml-grid'>
-            <div><small>Moneyline</small><b>{ml_team}</b><span>{ml_prob:.0f}% win</span></div>
-            <div><small>Spread</small><b>{ml_team} {abs(safe_float(sim.get("Sim Spread"), spread)):.1f}</b><span>{spread_conf:.0f}% conf</span></div>
-            <div><small>Total</small><b>{sim.get("Sim Total")} {total_side}</b><span>{total_conf:.0f}% conf</span></div>
-          </div>
-        </div>
-        """)
+        sim_spread = safe_float(sim.get("Sim Spread"), spread)
+        spread_conf = min(82, 50 + abs(sim_spread) * 4.5)
+        blowout = float(np.clip((abs(sim_spread) - 8.0) * 4.5, 0.0, 36.0))
+        total_line = 161.5
+        total_edge = safe_float(sim.get("Sim Total"), total) - total_line
+        total_bar = float(np.clip(total_conf, 0, 100))
+        a_logo = _team_logo_html(a, "wnba-ml-logo")
+        b_logo = _team_logo_html(b, "wnba-ml-logo")
+        a_nick = html.escape(TEAM_NICKNAMES.get(a, a))
+        b_nick = html.escape(TEAM_NICKNAMES.get(b, b))
+        fav_label = html.escape(str(ml_team))
+        ml_note = f"{fav_label} FAV" if ml_prob >= 50 else "NO CLEAR FAV"
+        cards.append(
+            "<div class='wnba-ml-card'>"
+            "<div class='wnba-ml-teams'>"
+            f"<div class='wnba-ml-team'>{a_logo}<b>{html.escape(a)}</b><span>{a_nick}</span><strong>{a_score:.1f}</strong><em>{a_win:.0f}% win</em></div>"
+            f"<div class='wnba-ml-mid'><span>{safe_float(sim.get('Sim Pace'), pace):.1f} POSS</span><div class='wnba-ml-poss'><i style='width:{ml_prob:.0f}%'></i></div><small>{ml_prob:.0f}%/{dog_prob:.0f}%</small><b>{ml_note}</b></div>"
+            f"<div class='wnba-ml-team'>{b_logo}<b>{html.escape(b)}</b><span>{b_nick}</span><strong>{b_score:.1f}</strong><em>{b_win:.0f}% win</em></div>"
+            "</div>"
+            "<div class='wnba-ml-total'>"
+            f"<div><small>Game Total</small><strong>{safe_float(sim.get('Sim Total'), total):.1f}</strong><span class='{'over' if total_side == 'OVER' else 'under'}'>{total_edge:+.1f} vs {total_line:.1f}</span></div>"
+            f"<b class='wnba-ml-total-side'>{total_side}</b><em>HIGH {total_conf:.0f}%</em>"
+            f"<div class='wnba-ml-total-bar'><i style='width:{total_bar:.0f}%'></i></div><p>OVER {safe_float(sim.get('Sim Total Over %'), 50):.0f}% <span>UNDER {safe_float(sim.get('Sim Total Under %'), 50):.0f}%</span></p>"
+            "</div>"
+            "<div class='wnba-ml-bottom'>"
+            f"<div><small>Spread</small><b>{fav_label}</b><span>{fav_label} -{abs(sim_spread):.1f}</span><em>{spread_conf:.0f}% conf</em></div>"
+            f"<div><small>Moneyline</small><b>{fav_label}</b><span>{ml_prob:.0f}% WIN</span><em>{dog_team} {dog_prob:.0f}%</em></div>"
+            f"<div><small>Pace</small><b>{safe_float(sim.get('Sim Pace'), pace):.1f}</b><span>model pace</span></div>"
+            f"<div><small>ORtg</small><b>{safe_float(ar.get('ORtg'), np.nan):.1f}</b><span>{a} offense</span></div>"
+            f"<div><small>Blowout</small><b>{blowout:.0f}%</b><span>risk</span></div>"
+            "</div>"
+            f"<div class='wnba-ml-sim'>15k sim: {html.escape(a)} {sim.get('Team Sim Score')} · {html.escape(b)} {sim.get('Opponent Sim Score')} · total {sim.get('Sim Total')} · winner {fav_label}</div>"
+            "</div>"
+        )
     if not cards:
         st.info("No ML cards could be built from current team context.")
         return
-    st.markdown("""
-    <style>
-    .wnba-ml-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin:10px 0 18px}.wnba-ml-card{background:#0f1320;border:1px solid rgba(250,204,21,.35);border-radius:14px;padding:14px;color:#e5e7eb}.wnba-ml-top{display:flex;justify-content:space-between;gap:10px;color:#facc15}.wnba-ml-top span{color:#94a3b8}.wnba-ml-top em{font-style:normal;color:#a78bfa}.wnba-ml-score{display:flex;justify-content:space-between;margin:12px 0 6px;font-size:1.05rem}.wnba-ml-score b{font-size:1.7rem;color:#facc15}.wnba-ml-sim{margin:0 0 10px;color:#c4b5fd;font-size:.78rem;line-height:1.35}.wnba-ml-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.wnba-ml-grid div{background:rgba(255,255,255,.04);border-radius:10px;padding:8px}.wnba-ml-grid small{display:block;color:#94a3b8;text-transform:uppercase;font-size:.62rem}.wnba-ml-grid b{display:block;color:#f8fafc}.wnba-ml-grid span{font-size:.74rem;color:#a7f3d0}
-    @media(max-width:640px){.wnba-ml-grid{grid-template-columns:1fr}.wnba-ml-score{display:block}.wnba-ml-score span{display:block;margin:4px 0}}
-    </style>
-    <div class='wnba-ml-wrap'>
-    """ + "".join(cards) + "</div>", unsafe_allow_html=True)
+    ml_html = "<style>"
+    ml_html += ".wnba-ml-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin:10px 0 18px}"
+    ml_html += ".wnba-ml-card{background:#0b0f18;border:1px solid rgba(250,204,21,.50);border-radius:16px;padding:18px;color:#e5e7eb;box-shadow:0 18px 42px rgba(0,0,0,.35);overflow:hidden}"
+    ml_html += ".wnba-ml-teams{display:grid;grid-template-columns:1fr 120px 1fr;gap:14px;align-items:start}.wnba-ml-team{text-align:center}.wnba-ml-team .owp-team-logo{margin:0 auto 8px;width:46px;height:46px}.wnba-ml-team b{display:block;font-size:1.6rem;color:#f8fafc}.wnba-ml-team span{display:block;color:#64748b;font-size:.82rem}.wnba-ml-team strong{display:block;color:#fbbf24;font-size:2.4rem;font-weight:400;line-height:1.1;margin-top:8px}.wnba-ml-team em{display:block;color:#94a3b8;font-style:normal;font-size:.82rem}"
+    ml_html += ".wnba-ml-mid{text-align:center;padding-top:40px}.wnba-ml-mid span{display:block;color:#64748b;font-size:.76rem;font-weight:900}.wnba-ml-mid small{display:block;color:#94a3b8;margin-top:3px}.wnba-ml-mid b{display:block;color:#fbbf24;font-size:.78rem;margin-top:4px}.wnba-ml-poss{height:7px;background:#1f2937;border-radius:999px;overflow:hidden;margin:6px 0}.wnba-ml-poss i{display:block;height:100%;background:#fbbf24;border-radius:999px}"
+    ml_html += ".wnba-ml-total{margin-top:18px;background:#101722;border-radius:12px;padding:14px;position:relative}.wnba-ml-total small{display:block;color:#64748b;text-transform:uppercase;font-size:.68rem}.wnba-ml-total strong{font-size:2.7rem;color:#fb3f7c;font-weight:400}.wnba-ml-total span{margin-left:10px;color:#4ade80;font-weight:900}.wnba-ml-total span.under{color:#60a5fa}.wnba-ml-total-side{position:absolute;right:18px;top:22px;color:#fbbf24;font-size:1.25rem}.wnba-ml-total em{position:absolute;right:18px;top:52px;color:#fef3c7;border:1px solid rgba(250,204,21,.55);border-radius:999px;padding:2px 8px;font-style:normal;font-size:.72rem}.wnba-ml-total-bar{height:8px;background:#1f2937;border-radius:999px;overflow:hidden;margin-top:10px}.wnba-ml-total-bar i{display:block;height:100%;background:#fbbf24}.wnba-ml-total p{display:flex;justify-content:space-between;color:#fbbf24;font-size:.72rem;margin:6px 0 0}.wnba-ml-total p span{margin:0;color:#94a3b8}"
+    ml_html += ".wnba-ml-bottom{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:10px}.wnba-ml-bottom div{background:#101722;border-radius:9px;padding:9px;text-align:center;min-width:0}.wnba-ml-bottom small{display:block;color:#64748b;text-transform:uppercase;font-size:.62rem}.wnba-ml-bottom b{display:block;color:#fbbf24}.wnba-ml-bottom span,.wnba-ml-bottom em{display:block;color:#94a3b8;font-size:.72rem;font-style:normal}.wnba-ml-sim{margin-top:10px;color:#c4b5fd;font-size:.78rem;line-height:1.35}"
+    ml_html += "@media(max-width:700px){.wnba-ml-wrap{grid-template-columns:1fr}.wnba-ml-teams{grid-template-columns:1fr}.wnba-ml-mid{padding-top:0}.wnba-ml-bottom{grid-template-columns:1fr 1fr}.wnba-ml-total-side,.wnba-ml-total em{position:static;display:inline-block;margin-left:8px}.wnba-ml-total strong{font-size:2.2rem}}"
+    ml_html += "</style><div class='wnba-ml-wrap'>" + "".join(cards) + "</div>"
+    st.components.v1.html(ml_html, height=min(900, 390 * len(cards) + 80), scrolling=True)
 
 def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: str, max_key: str, official_key: str, saved_view: bool = False) -> pd.DataFrame:
     """Render an already-built projection board with fast table / card toggle."""
