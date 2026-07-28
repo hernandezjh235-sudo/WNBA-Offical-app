@@ -34,7 +34,7 @@ import requests
 import streamlit as st
 
 APP_VERSION = "WNBA v3.5.9 — Full WNBA ML Game Script + Evidence Cards"
-LINE_PARSER_VERSION = "UD_FULL_GAME_MAINLINE_V2"
+LINE_PARSER_VERSION = "UD_PLAYER_BASELINE_MAINLINE_V3"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
 EMBEDDED_DATA_VERSION = "CORE_DATA_SELF_HEAL_V1"
 
@@ -1973,6 +1973,98 @@ def rel_id(obj, names):
     return None
 
 
+def expected_mainline_for_player(master: pd.DataFrame, name_key: str, market: str) -> float:
+    """Estimate the normal full-game prop line range for duplicate-line selection."""
+    if master is None or master.empty or not name_key:
+        return np.nan
+    m = str(market or "").upper()
+    d = master.copy()
+    if "NameKey" not in d.columns:
+        if "Player" not in d.columns:
+            return np.nan
+        d["NameKey"] = d["Player"].map(normalize_name)
+    d = d[d["NameKey"].astype(str) == str(name_key)]
+    if d.empty:
+        return np.nan
+    r = d.iloc[0]
+
+    def val(col):
+        return safe_float(r.get(col), np.nan)
+
+    if m == "PRA" and all(pd.isna(val(f"PRA_{s}")) for s in ["avg", "l10", "l5", "l3"]):
+        pts = np.nanmean([val("PTS_avg"), val("PTS_l10"), val("PTS_l5")])
+        reb = np.nanmean([val("REB_avg"), val("REB_l10"), val("REB_l5")])
+        ast = np.nanmean([val("AST_avg"), val("AST_l10"), val("AST_l5")])
+        total = pts + reb + ast
+        return float(total) if pd.notna(total) and total > 0 else np.nan
+
+    vals = [
+        (val(f"{m}_avg"), 0.35),
+        (val(f"{m}_l20"), 0.15),
+        (val(f"{m}_l10"), 0.25),
+        (val(f"{m}_l5"), 0.18),
+        (val(f"{m}_l3"), 0.07),
+    ]
+    nums = [(v, w) for v, w in vals if pd.notna(v) and v > 0]
+    if not nums:
+        return np.nan
+    return float(sum(v * w for v, w in nums) / sum(w for _, w in nums))
+
+
+def select_primary_prop_lines(df: pd.DataFrame, master: pd.DataFrame = None, group_source: bool = False) -> pd.DataFrame:
+    """Collapse duplicate sportsbook rows to the most realistic full-game main line.
+
+    Underdog can expose alternate ladders alongside the main line. The old rule
+    picked the lowest half-point line, which made star props wrong (for example
+    10.5 PTS instead of 20.5 PTS). This scores each candidate against the
+    player's own baseline, then falls back to normal WNBA market ranges.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "NameKey" not in out.columns and "Player" in out.columns:
+        out["NameKey"] = out["Player"].map(normalize_name)
+    out["Line"] = pd.to_numeric(out["Line"], errors="coerce")
+    out = out.dropna(subset=["NameKey", "Market", "Line"]).copy()
+    if out.empty:
+        return out
+
+    typical = {"PTS": 12.5, "REB": 4.5, "AST": 3.5, "PRA": 21.5}
+    plausible = {"PTS": (3.5, 35.5), "REB": (1.5, 15.5), "AST": (1.5, 12.5), "PRA": (8.5, 55.5)}
+
+    def score_row(r):
+        market = str(r.get("Market", "")).upper()
+        line = safe_float(r.get("Line"), np.nan)
+        if pd.isna(line):
+            return 9999.0
+        expected = expected_mainline_for_player(master, str(r.get("NameKey", "")), market)
+        target = expected if pd.notna(expected) and expected > 0 else typical.get(market, line)
+        lo, hi = plausible.get(market, (0.5, 80.0))
+        penalty = 0.0
+        if line < lo:
+            penalty += (lo - line) * 3.0
+        if line > hi:
+            penalty += (line - hi) * 3.0
+        if abs(line - round(line)) < 1e-9:
+            penalty += 2.5
+        return abs(line - target) + penalty
+
+    out["_mainline_expected"] = out.apply(lambda r: expected_mainline_for_player(master, str(r.get("NameKey", "")), str(r.get("Market", ""))), axis=1)
+    out["_mainline_score"] = out.apply(score_row, axis=1)
+    sort_cols = ["NameKey", "Market"]
+    if group_source and "Source" in out.columns:
+        sort_cols.append("Source")
+    out = out.sort_values(sort_cols + ["_mainline_score", "Line"], ascending=True)
+    keep_cols = sort_cols
+    out = out.drop_duplicates(subset=keep_cols, keep="first")
+    out["Line Selection"] = np.where(
+        pd.to_numeric(out.get("_mainline_expected"), errors="coerce").notna(),
+        "PLAYER_BASELINE_MAINLINE",
+        "MARKET_RANGE_MAINLINE",
+    )
+    return out.drop(columns=["_mainline_expected", "_mainline_score"], errors="ignore")
+
+
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_underdog_board():
     """Underdog WNBA parser with deep decode mode.
@@ -2412,17 +2504,9 @@ def fetch_underdog_board():
     if rows:
         df = pd.DataFrame(rows)
         df = df[pd.to_numeric(df["Line"], errors="coerce").between(0.5, 80)].copy()
-        # One main line per Player+Market. Underdog may include alternate ladders
-        # or combo lines for the same player. Real main WNBA props are almost always .5.
-        # Pick the LOWEST half-point line per player/market after unsupported combo
-        # markets are filtered. This selects 11.5 over 18.5 for PTS, 8.5 over 11.5 for REB, etc.
-        df["_line_num"] = pd.to_numeric(df["Line"], errors="coerce")
-        df["_is_half"] = df["_line_num"].map(lambda x: 1 if pd.notna(x) and abs((x * 2) - round(x * 2)) < 1e-9 and abs(x - round(x)) > 1e-9 else 0)
-        # Penalize whole-number values like 4/5/7 that often come from sort/rank/stat IDs.
-        df["_line_priority"] = df["_is_half"] * 1000 - df["_line_num"].clip(0, 80)
-        df = df.sort_values(["NameKey", "Market", "_line_priority"], ascending=[True, True, False])
-        df = df.drop_duplicates(subset=["NameKey", "Market"], keep="first").drop(columns=["_line_num", "_is_half", "_line_priority"], errors="ignore")
-        debug.append({"source":"Underdog", "url":"parser", "status":"ok", "rows":len(df), "message":f"accepted {len(df)} real main-line rows; decode rows {len(decode_df)}"})
+        before_n = len(df)
+        df = select_primary_prop_lines(df, master, group_source=False)
+        debug.append({"source":"Underdog", "url":"parser", "status":"ok", "rows":len(df), "message":f"accepted {len(df)} player-baseline main-line rows from {before_n} candidates; decode rows {len(decode_df)}"})
         return df.reset_index(drop=True), pd.DataFrame(debug)
 
     debug.append({"source":"Underdog", "url":"parser", "status":"no accepted rows", "rows":0, "message":f"decode rows {len(decode_df)}; active teams {sorted(ACTIVE_TEAMS) if ACTIVE_TEAMS else 'not detected'}"})
@@ -2679,7 +2763,8 @@ def aggregate_lines(use_ud=True, use_sleeper=False, manual_df=None, use_odds_api
         if s in ["Manual", "CSV Upload"]: return 2
         return 9
     board["Priority"] = board["Source"].map(source_priority)
-    board = board.sort_values(["NameKey", "Market", "Priority", "Line"]).drop_duplicates(subset=["NameKey", "Market", "Source", "Line"], keep="first")
+    board = board.sort_values(["NameKey", "Market", "Priority"])
+    board = select_primary_prop_lines(board, load_dataset("master_features"), group_source=True)
     return board.sort_values(["NameKey", "Market", "Priority"]), ud_debug, pd.DataFrame(manual_debug)
 
 # ============================================================
@@ -7071,7 +7156,9 @@ WNBA_TEAM_KEY_MAP = {
     "MIN": "MIN", "MINNESOTA": "MIN", "MINNESOTA LYNX": "MIN",
     "NY": "NYL", "NYL": "NYL", "NEW YORK": "NYL", "NEW YORK LIBERTY": "NYL",
     "PHX": "PHX", "PHO": "PHX", "PHOENIX": "PHX", "PHOENIX MERCURY": "PHX",
+    "POR": "POR", "PORTLAND": "POR", "PORTLAND FIRE": "POR",
     "SEA": "SEA", "SEATTLE": "SEA", "SEATTLE STORM": "SEA",
+    "TOR": "TOR", "TORONTO": "TOR", "TORONTO TEMPO": "TOR",
     "WAS": "WAS", "WSH": "WAS", "WASHINGTON": "WAS", "WASHINGTON MYSTICS": "WAS",
 }
 
@@ -8503,7 +8590,7 @@ def render_grouped_player_card(player_df: pd.DataFrame):
     order = {m:i for i,m in enumerate(MARKETS)}
     player_df = player_df.copy()
     player_df["_market_order"] = player_df.get("Market", "").astype(str).str.upper().map(order).fillna(99)
-    player_df = player_df.sort_values(["_market_order", "Line"])
+    player_df = player_df.sort_values(["_market_order"])
     first = player_df.iloc[0]
     player = str(first.get("Player", "Player"))
     team = str(first.get("Team", ""))
@@ -8541,7 +8628,7 @@ def render_grouped_player_card(player_df: pd.DataFrame):
     </div>
     """, unsafe_allow_html=True)
     with st.expander(f"Advanced details — {player} all markets", expanded=False):
-        show_cols = [c for c in ["Market","Projection","Line","Edge","Lean","Over %","Under %","Official Play Score","Tier","Source","Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Freshness Status","Opponent","HomeAway","Matchup","Raw","Projection Explanation"] if c in player_df.columns]
+        show_cols = [c for c in ["Market","Projection","Line","Edge","Lean","Over %","Under %","Official Play Score","Tier","Source","Line Selection","Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Freshness Status","Opponent","HomeAway","Matchup","Raw","Projection Explanation"] if c in player_df.columns]
         st.dataframe(player_df[show_cols], use_container_width=True, hide_index=True)
 
 
@@ -8562,7 +8649,7 @@ def grouped_board_table_view(proj_df: pd.DataFrame) -> pd.DataFrame:
     ] if c in df.columns]
     if not keep:
         return df
-    out = df.sort_values(["Player", "_market_order", "Line"], na_position="last")[keep].copy()
+    out = df.sort_values(["Player", "_market_order"], na_position="last")[keep].copy()
     for c in ["Projection", "Line", "Edge", "Over %", "Under %", "Official Play Score", "MIN Proj"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
@@ -8744,7 +8831,33 @@ def _ml_team_context() -> pd.DataFrame:
     for c in ["Pace", "ORtg", "DRtg", "NetRtg"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
+    out["Team"] = out["Team"].map(_team_key_for_matchup)
     return out.dropna(subset=["Team"]).drop_duplicates("Team", keep="last")
+
+
+def _ml_fallback_team_row(team: str, ctx: pd.DataFrame) -> pd.Series:
+    """League-average team row so Moneyline can show every scheduled game."""
+    team = _team_key_for_matchup(team)
+    if ctx is not None and not ctx.empty and "Team" in ctx.columns:
+        hit = ctx[ctx["Team"].astype(str) == team]
+        if not hit.empty:
+            return hit.iloc[0]
+        pace = pd.to_numeric(ctx.get("Pace", pd.Series(dtype=float)), errors="coerce").median()
+        ortg = pd.to_numeric(ctx.get("ORtg", pd.Series(dtype=float)), errors="coerce").median()
+        drtg = pd.to_numeric(ctx.get("DRtg", pd.Series(dtype=float)), errors="coerce").median()
+    else:
+        pace = ortg = drtg = np.nan
+    pace = 78.0 if pd.isna(pace) else pace
+    ortg = 101.0 if pd.isna(ortg) else ortg
+    drtg = 101.0 if pd.isna(drtg) else drtg
+    return pd.Series({
+        "Team": team,
+        "Pace": safe_float(pace, 78.0),
+        "ORtg": safe_float(ortg, 101.0),
+        "DRtg": safe_float(drtg, 101.0),
+        "NetRtg": 0.0,
+        "Moneyline Context": "league-average fallback",
+    })
 
 
 def _project_game_score(team_row: pd.Series, opp_row: pd.Series) -> Tuple[float, float]:
@@ -8792,6 +8905,46 @@ def _simulate_wnba_game(team_row: pd.Series, opp_row: pd.Series, sims: int = 150
         "Sim Pace": round(float(np.mean(sim_pace)), 1),
         "Sim Count": int(sims),
     }
+
+
+def _moneyline_pairs_from_schedule(mode: str = "Today") -> List[Dict[str, Any]]:
+    sched = schedule_for_slate(mode)
+    if sched is None or sched.empty:
+        return []
+    pairs = []
+    for _, r in sched.iterrows():
+        away = _team_key_for_matchup(r.get("Away"))
+        home = _team_key_for_matchup(r.get("Home"))
+        if not away or not home or away == home:
+            continue
+        pairs.append({
+            "key": tuple(sorted([away, home])),
+            "team": away,
+            "opp": home,
+            "matchup": f"{away} @ {home}",
+            "source": "schedule",
+            "game_date": str(r.get("GameDate", ""))[:19],
+        })
+    return pairs
+
+
+def _moneyline_pairs_from_board(board_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if board_df is None or board_df.empty or not {"Team", "Opponent"}.issubset(board_df.columns):
+        return []
+    pairs = []
+    cols = ["Team", "Opponent", "Matchup"] if "Matchup" in board_df.columns else ["Team", "Opponent"]
+    seen = set()
+    for _, r in board_df[cols].drop_duplicates().iterrows():
+        a = _team_key_for_matchup(r.get("Team"))
+        b = _team_key_for_matchup(r.get("Opponent"))
+        if not a or not b or a == b:
+            continue
+        key = tuple(sorted([a, b]))
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append({"key": key, "team": a, "opp": b, "matchup": str(r.get("Matchup", f"{a} @ {b}")), "source": "prop board", "game_date": ""})
+    return pairs
 
 
 def _wnba_game_script_context(row: pd.Series) -> Dict[str, Any]:
@@ -8875,36 +9028,36 @@ def _wnba_game_script_context(row: pd.Series) -> Dict[str, Any]:
     }
 
 
-def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system") -> None:
+def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system", mode: str = "Today") -> None:
     st.markdown("#### WNBA Moneyline / Game Script")
     st.caption("Game-level model using pace, ORtg, DRtg, projected score, 15k simulation, spread, total and blowout risk.")
-    if board_df is None or board_df.empty or not {"Team", "Opponent"}.issubset(board_df.columns):
-        st.info("No team matchups available yet.")
-        return
     ctx = _ml_team_context()
     if ctx.empty:
         st.info("Team context unavailable. Import team stats/master features first.")
         return
-    ctx_map = {str(r.get("Team")): r for _, r in ctx.iterrows()}
+
+    schedule_pairs = _moneyline_pairs_from_schedule(mode)
+    board_pairs = _moneyline_pairs_from_board(board_df)
     pairs = []
-    for _, r in board_df[["Team", "Opponent", "Matchup"] if "Matchup" in board_df.columns else ["Team", "Opponent"]].drop_duplicates().iterrows():
-        a = _team_key_for_matchup(r.get("Team"))
-        b = _team_key_for_matchup(r.get("Opponent"))
-        if not a or not b or a == b:
+    seen = set()
+    for p in schedule_pairs + board_pairs:
+        key = p.get("key")
+        if not key or key in seen:
             continue
-        key = tuple(sorted([a, b]))
-        if key in {p["key"] for p in pairs}:
-            continue
-        pairs.append({"key": key, "team": a, "opp": b, "matchup": str(r.get("Matchup", f"{a} vs {b}"))})
+        seen.add(key)
+        pairs.append(p)
     if not pairs:
-        st.info("No unique matchups found.")
+        st.info("No unique matchups found. Hit Refresh Everything Today so the app pulls today's schedule and lines.")
         return
+    if schedule_pairs:
+        st.caption(f"Moneyline games: {len(pairs)} total ({len(schedule_pairs)} from {mode} schedule, {max(0, len(pairs)-len(schedule_pairs))} extra from prop board).")
+    else:
+        st.warning("Moneyline is using prop-board matchups only because today's schedule cache is empty. Hit Refresh Everything Today to rebuild all scheduled games.")
+
     cards = []
-    for p in pairs[:8]:
+    for p in pairs[:12]:
         a, b = p["team"], p["opp"]
-        if a not in ctx_map or b not in ctx_map:
-            continue
-        ar, br = ctx_map[a], ctx_map[b]
+        ar, br = _ml_fallback_team_row(a, ctx), _ml_fallback_team_row(b, ctx)
         a_score, pace = _project_game_score(ar, br)
         b_score, _ = _project_game_score(br, ar)
         sim = _simulate_wnba_game(ar, br, sims=WNBA_MONTE_CARLO_SIMS, seed_key=f"{a}-{b}")
@@ -8928,10 +9081,13 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system")
         b_logo = _team_logo_html(b, "wnba-ml-logo")
         a_nick = html.escape(TEAM_NICKNAMES.get(a, a))
         b_nick = html.escape(TEAM_NICKNAMES.get(b, b))
+        source_note = html.escape(str(p.get("source", "schedule")))
+        game_date_note = html.escape(str(p.get("game_date", "")))
         fav_label = html.escape(str(ml_team))
         ml_note = f"{fav_label} FAV" if ml_prob >= 50 else "NO CLEAR FAV"
         cards.append(
             "<div class='wnba-ml-card'>"
+            f"<div class='wnba-ml-source'>{source_note}{' · ' + game_date_note if game_date_note else ''}</div>"
             "<div class='wnba-ml-teams'>"
             f"<div class='wnba-ml-team'>{a_logo}<b>{html.escape(a)}</b><span>{a_nick}</span><strong>{a_score:.1f}</strong><em>{a_win:.0f}% win</em></div>"
             f"<div class='wnba-ml-mid'><span>{safe_float(sim.get('Sim Pace'), pace):.1f} POSS</span><div class='wnba-ml-poss'><i style='width:{ml_prob:.0f}%'></i></div><small>{ml_prob:.0f}%/{dog_prob:.0f}%</small><b>{ml_note}</b></div>"
@@ -8958,6 +9114,7 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system")
     ml_html = "<style>"
     ml_html += ".wnba-ml-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:16px;margin:10px 0 18px;background:#070912;padding:4px}"
     ml_html += ".wnba-ml-card{background:linear-gradient(180deg,#0b0f18 0%,#0f1722 100%);border:1px solid rgba(250,204,21,.56);border-radius:16px;padding:18px;color:#e5e7eb;box-shadow:0 18px 42px rgba(0,0,0,.35);overflow:hidden;position:relative}"
+    ml_html += ".wnba-ml-source{position:absolute;top:8px;left:12px;color:#94a3b8;font-size:.68rem;text-transform:uppercase;letter-spacing:.04em}"
     ml_html += ".wnba-ml-card:before{content:'';position:absolute;inset:0;border-radius:16px;background:radial-gradient(circle at 18% 8%,rgba(250,204,21,.12),transparent 28%),radial-gradient(circle at 82% 8%,rgba(96,165,250,.10),transparent 32%);pointer-events:none}.wnba-ml-card>*{position:relative;z-index:1}"
     ml_html += ".wnba-ml-teams{display:grid;grid-template-columns:minmax(0,1fr) 118px minmax(0,1fr);gap:14px;align-items:start}.wnba-ml-team{text-align:center;min-width:0}.wnba-ml-team .owp-team-logo{display:flex;align-items:center;justify-content:center;margin:0 auto 8px;width:58px;height:58px;border-radius:16px;background:#101722;border:1px solid rgba(250,204,21,.32);overflow:hidden;box-shadow:inset 0 0 18px rgba(255,255,255,.04)}.wnba-ml-team .owp-team-logo-img{width:100%;height:100%;object-fit:contain;display:block;padding:7px;box-sizing:border-box}.wnba-ml-team .owp-team-logo-text{font-size:.78rem;font-weight:1000;color:#fbbf24}.wnba-ml-team b{display:block;font-size:1.75rem;color:#f8fafc;line-height:1}.wnba-ml-team span{display:block;color:#7c8798;font-size:.82rem;margin-top:3px}.wnba-ml-team strong{display:block;color:#fbbf24;font-size:2.55rem;font-weight:400;line-height:1.1;margin-top:8px}.wnba-ml-team em{display:block;color:#94a3b8;font-style:normal;font-size:.82rem}"
     ml_html += ".wnba-ml-mid{text-align:center;padding-top:40px}.wnba-ml-mid span{display:block;color:#64748b;font-size:.76rem;font-weight:900}.wnba-ml-mid small{display:block;color:#94a3b8;margin-top:3px}.wnba-ml-mid b{display:block;color:#fbbf24;font-size:.78rem;margin-top:4px}.wnba-ml-poss{height:7px;background:#1f2937;border-radius:999px;overflow:hidden;margin:6px 0}.wnba-ml-poss i{display:block;height:100%;background:#fbbf24;border-radius:999px}"
@@ -13246,10 +13403,14 @@ with tabs[3]:
     st.subheader("Moneyline / Game Script")
     st.caption("WNBA game-level model: pace, ORtg, DRtg, projected score, spread, total, win probability, blowout risk, and 15k game simulation.")
     ml_board = load_dataset("projection_board")
+    if st.button("🔄 Refresh Everything Today", key="moneyline_refresh_everything_today", use_container_width=True):
+        run_full_refresh_with_progress("Today", use_ud, logs_global, master_global)
+        st.rerun()
     if ml_board is None or ml_board.empty:
-        st.warning("No projection board cached yet. Refresh Player Cards or a market board first so matchups can be built.")
+        st.warning("No projection board cached yet. Showing schedule-based Moneyline cards if today's schedule is available.")
+        render_wnba_ml_system(pd.DataFrame(), "moneyline_tab", mode="Today")
     else:
-        render_wnba_ml_system(ml_board, "moneyline_tab")
+        render_wnba_ml_system(ml_board, "moneyline_tab", mode="Today")
         ml_cols = [c for c in [
             "Team", "Opponent", "Matchup", "WNBA ML Game Script", "Projected Team Score ML",
             "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML",
