@@ -586,12 +586,31 @@ def coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 # ============================================================
 def classify_filename(name: str) -> Optional[str]:
     n = name.lower()
+    exact = {
+        "wnba_player_game_logs.csv": "player_game_logs",
+        "wnba_player_season_stats.csv": "player_season_stats",
+        "wnba_team_season_stats.csv": "team_season_stats",
+        "wnba_team_ranks.csv": "team_ranks",
+        "wnba_schedules.csv": "schedules",
+        "wnba_rosters.csv": "rosters",
+        "wnba_game_rosters.csv": "game_rosters",
+        "wnba_lineups.csv": "lineups",
+        "wnba_shots.csv": "shots",
+        "wnba_master_features.csv": "master_features",
+    }
+    base = Path(n).name
+    if base in exact:
+        return exact[base]
     if "player_game_logs" in n or "player_gamelogs" in n or "game_log" in n:
         return "player_game_logs"
     if "player_season" in n or "athlete_season" in n:
         return "player_season_stats"
     if "team_season" in n:
         return "team_season_stats"
+    if "team_rank" in n:
+        return "team_ranks"
+    if "master_feature" in n:
+        return "master_features"
     if "game_rosters" in n or "game_roster" in n:
         return "game_rosters"
     if "rosters" in n or "roster" in n:
@@ -625,6 +644,47 @@ def read_any_file(raw: bytes, name: str) -> pd.DataFrame:
     if lname.endswith(".json"):
         return pd.read_json(io.BytesIO(raw))
     raise ValueError(f"Unsupported file type: {name}")
+
+
+def import_uploaded_dataset_files(uploaded_files) -> pd.DataFrame:
+    """Import multiple uploaded dataset files, including a ZIP of CSV/parquet files."""
+    rows = []
+    expanded = []
+    for f in uploaded_files or []:
+        try:
+            raw = f.read()
+            name = getattr(f, "name", "upload")
+            if str(name).lower().endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(raw), "r") as z:
+                    for info in z.infolist():
+                        if info.is_dir():
+                            continue
+                        inner_name = Path(info.filename).name
+                        if not inner_name.lower().endswith((".csv", ".parquet", ".xlsx", ".xls", ".json")):
+                            continue
+                        expanded.append((inner_name, z.read(info.filename)))
+            else:
+                expanded.append((name, raw))
+        except Exception as e:
+            rows.append({"file": getattr(f, "name", "upload"), "dataset": "error", "status": str(e)[:180], "rows": 0})
+
+    for name, raw in expanded:
+        try:
+            dataset_key = classify_filename(name)
+            if not dataset_key:
+                rows.append({"file": name, "dataset": "unknown", "status": "skipped: could not classify", "rows": 0})
+                continue
+            df = read_any_file(raw, name)
+            exact_cache_name = Path(str(name).lower()).name == Path(CACHE_FILES.get(dataset_key, "")).name.lower()
+            std = df if exact_cache_name or dataset_key in {"master_features", "team_ranks"} else standardize_dataset(dataset_key, df)
+            if std is not None and not std.empty:
+                save_dataset(dataset_key, std)
+                rows.append({"file": name, "dataset": dataset_key, "status": "saved direct cache" if exact_cache_name else "saved", "rows": len(std)})
+            else:
+                rows.append({"file": name, "dataset": dataset_key, "status": "standardized empty", "rows": 0})
+        except Exception as e:
+            rows.append({"file": name, "dataset": "error", "status": str(e)[:180], "rows": 0})
+    return pd.DataFrame(rows)
 
 
 def is_manifest_only(df: pd.DataFrame) -> bool:
@@ -7798,26 +7858,10 @@ def render_data_manager_tab():
             pass
 
     st.markdown("### Manual upload/import backup")
-    uploaded = st.file_uploader("Upload SportsDataverse CSV/Parquet files", type=["csv", "parquet", "xlsx", "json"], accept_multiple_files=True, key="dm_manual_upload_visible")
+    uploaded = st.file_uploader("Upload SportsDataverse CSV/Parquet/ZIP files", type=["csv", "parquet", "xlsx", "json", "zip"], accept_multiple_files=True, key="dm_manual_upload_visible")
     if uploaded and st.button("Import uploaded files", use_container_width=True, key="dm_import_uploads_visible"):
-        rows = []
-        for f in uploaded:
-            try:
-                raw = f.read()
-                dataset_key = classify_filename(f.name)
-                if not dataset_key:
-                    rows.append({"file": f.name, "dataset": "unknown", "status": "skipped: could not classify", "rows": 0})
-                    continue
-                df = read_any_file(raw, f.name)
-                std = standardize_dataset(dataset_key, df)
-                if std is not None and not std.empty:
-                    save_dataset(dataset_key, std)
-                    rows.append({"file": f.name, "dataset": dataset_key, "status": "saved", "rows": len(std)})
-                else:
-                    rows.append({"file": f.name, "dataset": dataset_key, "status": "standardized empty", "rows": 0})
-            except Exception as e:
-                rows.append({"file": getattr(f, 'name', 'upload'), "dataset": "error", "status": str(e)[:180], "rows": 0})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        rows = import_uploaded_dataset_files(uploaded)
+        st.dataframe(rows, use_container_width=True)
         try:
             master, _ = build_master_features()
             st.success(f"Uploaded files imported and master rebuilt: {len(master)} rows")
@@ -8748,22 +8792,10 @@ def render_data_manager_tab():
                 st.info("No report yet. Build features first.")
 
     st.markdown("### Manual upload/import backup")
-    uploaded = st.file_uploader("Upload SportsDataverse CSV/Parquet files", type=["csv", "parquet", "xlsx", "json"], accept_multiple_files=True, key="dm_manual_upload_visible_nologo")
+    uploaded = st.file_uploader("Upload SportsDataverse CSV/Parquet/ZIP files", type=["csv", "parquet", "xlsx", "json", "zip"], accept_multiple_files=True, key="dm_manual_upload_visible_nologo")
     if uploaded and st.button("Import uploaded files", use_container_width=True, key="dm_import_uploads_visible_nologo"):
-        rows = []
-        for f in uploaded:
-            try:
-                raw = f.read(); dataset_key = classify_filename(f.name)
-                if not dataset_key:
-                    rows.append({"file": f.name, "dataset": "unknown", "status": "skipped: could not classify", "rows": 0}); continue
-                df = read_any_file(raw, f.name); std = standardize_dataset(dataset_key, df)
-                if std is not None and not std.empty:
-                    save_dataset(dataset_key, std); rows.append({"file": f.name, "dataset": dataset_key, "status": "saved", "rows": len(std)})
-                else:
-                    rows.append({"file": f.name, "dataset": dataset_key, "status": "standardized empty", "rows": 0})
-            except Exception as e:
-                rows.append({"file": getattr(f, 'name', 'upload'), "dataset": "error", "status": str(e)[:180], "rows": 0})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        rows = import_uploaded_dataset_files(uploaded)
+        st.dataframe(rows, use_container_width=True)
         master, _, dbg = ensure_online_wnba_master_features(force_official=False)
         st.success(f"Files imported and master ready: {0 if master is None else len(master)} rows")
 
