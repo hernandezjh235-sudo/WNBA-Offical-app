@@ -5117,42 +5117,6 @@ def build_after_game_results_table(source_df: pd.DataFrame) -> pd.DataFrame:
     return df[cols]
 
 
-def result_record_summary(df: pd.DataFrame) -> Dict[str, Any]:
-    if df is None or df.empty or "Result" not in df.columns:
-        return {"total": 0, "wins": 0, "losses": 0, "pushes": 0, "voids": 0, "decisions": 0, "win_rate": np.nan}
-    result = df["Result"].astype(str).str.upper()
-    wins = int(result.eq("WIN").sum())
-    losses = int(result.eq("LOSS").sum())
-    pushes = int(result.eq("PUSH").sum())
-    voids = int(result.eq("VOID").sum())
-    decisions = wins + losses
-    return {
-        "total": int(len(df)),
-        "wins": wins,
-        "losses": losses,
-        "pushes": pushes,
-        "voids": voids,
-        "decisions": decisions,
-        "win_rate": (wins / decisions) if decisions else np.nan,
-    }
-
-
-def attach_result_symbols(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    if "Result" not in out.columns:
-        out["Result"] = ""
-    result = out["Result"].astype(str).str.upper()
-    out["✅/❌"] = np.select(
-        [result.eq("WIN"), result.eq("LOSS"), result.eq("PUSH"), result.eq("VOID"), result.eq("PENDING")],
-        ["✅", "❌", "➖", "🚫", "⏳"],
-        default="",
-    )
-    cols = ["✅/❌"] + [c for c in out.columns if c != "✅/❌"]
-    return out[cols]
-
-
 def make_backup_zip() -> bytes:
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
@@ -6079,15 +6043,13 @@ def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, stron
     st.markdown("""
     <div class='owp-hero'>
       <div class='owp-title'>💜 WNBA PROP ENGINE v3.6.1<br/>MAIN-LINE GUARD + FULL MONEYLINE SLATE</div>
-      <div class='owp-subtitle'>Railway-safe load → Refresh only when clicked → Save every real-line projection → Grade</div>
+      <div class='owp-subtitle'>Railway-safe load → One-click automatic online refresh → Save every real-line projection → Grade</div>
     </div>
     """, unsafe_allow_html=True)
-    c0, c1, c2 = st.columns([0.8, 1.2, 1.4])
-    with c0:
-        refresh_mode = st.selectbox("Refresh slate", ["Today", "Tomorrow"], index=0, key="hero_refresh_slate")
+    c1, c2 = st.columns(2)
     with c1:
-        if st.button(f"🔄 REFRESH {refresh_mode.upper()} — Schedule + Lines + Board", use_container_width=True, key="hero_refresh_live_board"):
-            st.session_state["wnba_run_top_refresh_mode"] = refresh_mode
+        if st.button("🔄 REFRESH TODAY — Schedule + Lines + Board", use_container_width=True, key="hero_refresh_live_board"):
+            st.session_state["wnba_run_top_refresh_today"] = True
             st.rerun()
     with c2:
         if st.button("💾 SAVE OFFICIAL BEFORE-GAME SNAPSHOT", use_container_width=True, key="hero_save_official_before"):
@@ -6683,52 +6645,6 @@ def _slate_team_set(mode: str) -> set:
         return set()
 
 
-def _slate_matchup_set(mode: str) -> set:
-    """Return canonical away @ home matchups for the selected slate."""
-    try:
-        sched = schedule_for_slate(mode)
-        target = slate_target_date(mode)
-        if (sched is None or sched.empty) and target is not None and "fetch_espn_wnba_schedule_for_date" in globals():
-            espn, _dbg = fetch_espn_wnba_schedule_for_date(target)
-            if espn is not None and not espn.empty:
-                sched = espn.copy()
-        if sched is None or sched.empty:
-            return set()
-        away_col = next((c for c in ["Away", "AwayTeam", "Visitor", "VisitorTeam"] if c in sched.columns), None)
-        home_col = next((c for c in ["Home", "HomeTeam"] if c in sched.columns), None)
-        if not away_col or not home_col:
-            return set()
-        out = set()
-        for _, rr in sched.iterrows():
-            away = team_abbrev(rr.get(away_col))
-            home = team_abbrev(rr.get(home_col))
-            if away and home:
-                out.add(f"{away} @ {home}".upper())
-                out.add(f"{away} VS {home}".upper())
-                out.add(f"{home} VS {away}".upper())
-        return out
-    except Exception:
-        return set()
-
-
-def filter_projection_board_for_slate(board: pd.DataFrame, mode: str) -> pd.DataFrame:
-    """Final display guard so cached boards cannot leak into the wrong slate."""
-    if board is None or board.empty or mode == "All Lines":
-        return board.copy() if board is not None else pd.DataFrame()
-    target = slate_target_date(mode)
-    d = board.copy()
-    keep = pd.Series(False, index=d.index)
-    if target is not None and "SlateDate" in d.columns:
-        keep = keep | d["SlateDate"].astype(str).eq(str(target))
-    if "Slate" in d.columns:
-        keep = keep | d["Slate"].astype(str).str.lower().eq(str(mode).lower())
-    slate_matchups = _slate_matchup_set(mode)
-    if slate_matchups and "Matchup" in d.columns:
-        matchup_text = d["Matchup"].astype(str).str.upper().str.replace(" VS ", " @ ", regex=False)
-        keep = keep | matchup_text.isin(slate_matchups)
-    return d[keep].copy()
-
-
 def filter_lines_for_slate(lines: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame, str]:
     """Strictly filter sportsbook/manual lines to the selected slate.
 
@@ -6748,7 +6664,6 @@ def filter_lines_for_slate(lines: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame
 
     d = lines.copy()
     slate_teams = _slate_team_set(mode)
-    slate_matchups = _slate_matchup_set(mode) if "_slate_matchup_set" in globals() else set()
     start_dates = line_start_date_series(d)
     has_dates = start_dates.notna()
 
@@ -6768,21 +6683,21 @@ def filter_lines_for_slate(lines: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame
     if "Slate" in d.columns:
         keep = keep | (d["Slate"].astype(str).str.lower() == str(mode).lower())
 
-    # 3) Underdog WNBA often lacks start time. Prefer verified matchup pairs,
-    # then fall back to teams only when the row has no matchup text.
-    if slate_matchups or slate_teams:
-        matchup_match = pd.Series(False, index=d.index)
-        if slate_matchups and "Matchup" in d.columns:
-            matchup_text = d["Matchup"].astype(str).str.upper().str.replace(" VS ", " @ ", regex=False)
-            matchup_match = matchup_text.isin(slate_matchups)
+    # 3) Underdog WNBA often lacks start time. In that case, only keep rows
+    # whose team/opponent/matchup belongs to the verified Today/Tomorrow teams.
+    if slate_teams:
         team_match = pd.Series(False, index=d.index)
         for c in ["Team", "Opponent"]:
             if c in d.columns:
                 team_match = team_match | d[c].astype(str).map(team_abbrev).isin(slate_teams)
-        row_has_matchup = d.get("Matchup", pd.Series("", index=d.index)).astype(str).str.strip().ne("")
-        no_matchup_team_fallback = (~row_has_matchup) & team_match
-        # Only apply schedule fallback to rows without dates; dated rows must match target.
-        keep = keep | ((~has_dates) & (matchup_match | no_matchup_team_fallback))
+        if "Matchup" in d.columns:
+            matchup_text = d["Matchup"].astype(str).str.upper()
+            mkeep = pd.Series(False, index=d.index)
+            for t in slate_teams:
+                mkeep = mkeep | matchup_text.str.contains(t, regex=False, na=False)
+            team_match = team_match | mkeep
+        # Only apply team fallback to rows without dates; dated rows must match target.
+        keep = keep | ((~has_dates) & team_match)
 
     filtered = d[keep].copy()
     if not filtered.empty:
@@ -8060,7 +7975,15 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     market_key = force_market or "ALL"
     top_cols = st.columns([1.1, 1.1, 1.2, 1.2, 2.0])
     with top_cols[0]:
-        st.info("Use the top refresh button only.")
+        refresh_label = "🔄 Refresh Today — All-in-One" if mode == "Today" else f"🔄 Refresh {mode} — All-in-One"
+        if st.button(refresh_label, key=f"refresh_{mode}_{market_key}"):
+            if mode == "Today":
+                run_one_click_refresh_today(mode, use_ud_flag)
+            else:
+                clear_line_pull_caches()
+                pull_board_lines(use_ud_flag, False, False, "")
+                st.session_state["wnba_last_refresh"] = now_iso()
+            st.rerun()
     with top_cols[1]:
         st.caption("Schedule, context, lines, database, and board rebuild are included in Refresh Today.")
     with top_cols[2]:
@@ -8672,6 +8595,16 @@ def _grouped_market_html(r: pd.Series) -> str:
     track_badge = rec_badge
     track_cls = "official" if tracking_status == "OFFICIAL" else "tracked" if tracking_status == "TRACK" else ""
     vol = str(r.get("Volatility", "NA"))
+    raw_note = str(r.get("Hit Rate Context", "") or r.get("Recent Support", "") or r.get("Biggest Positive", "") or r.get("Projection Explanation", ""))
+    raw_note = re.sub(r"<[^>]+>", " ", raw_note)
+    raw_note = raw_note.replace("&lt;", " ").replace("&gt;", " ")
+    raw_note = re.sub(r"\s+", " ", raw_note).strip()[:180]
+    note = html.escape(raw_note)
+    game_note = str(r.get("WNBA ML Game Script", "") or r.get("WNBA ML Game Script Note", ""))
+    game_note = re.sub(r"<[^>]+>", " ", game_note).replace("&lt;", " ").replace("&gt;", " ")
+    game_note = html.escape(re.sub(r"\s+", " ", game_note).strip()[:180])
+    vet = html.escape(str(r.get("Veteran Capability", "") or "capability neutral")[:140])
+    evidence = _fmt_num_compact(r.get("Evidence Support Score"), 0)
     edge_cls = "pos" if pd.notna(edge_v) and edge_v > 0 else "neg" if pd.notna(edge_v) and edge_v < 0 else "flat"
     source = html.escape(str(r.get("Source", "Unknown") or "Unknown"))
     opening = _fmt_num_compact(r.get("Opening Line"), 1)
@@ -8701,32 +8634,9 @@ def _grouped_market_html(r: pd.Series) -> str:
         <div class='owp-line-meta'>{line_meta}</div>
         <div class='owp-prob-track owp-market-track'><div class='owp-prob-fill' style='width:{fill:.0f}%'></div></div>
         <div class='owp-market-sub'><span>OVER {_fmt_num_compact(overp,0)}%</span><span>UNDER {_fmt_num_compact(underp,0)}%</span></div>
+        <div class='owp-market-note'>{note}<br><span>Veteran/capability: {vet} · Evidence {evidence}</span><br><span>ML script: {game_note}</span></div>
       </div>
     """
-
-
-def _market_why_df(r: pd.Series) -> pd.DataFrame:
-    rows = []
-    for label, col in [
-        ("Projection reason", "Projection Explanation"),
-        ("Recent / hit-rate support", "Hit Rate Context"),
-        ("Recent support", "Recent Support"),
-        ("Veteran / capability", "Veteran Capability"),
-        ("Game script", "WNBA ML Game Script"),
-        ("Game script note", "WNBA ML Game Script Note"),
-        ("Risk / no-bet flags", "No-Bet Risk Flags"),
-        ("Pass / gate note", "PASS Reason"),
-        ("Winning gate", "Winning Gate Note"),
-        ("Line selection", "Line Selection"),
-        ("UD line kind", "UD Line Kind"),
-        ("Projection integrity", "Projection Integrity Note"),
-    ]:
-        val = str(r.get(col, "") or "").strip()
-        if val and val.lower() not in {"nan", "none"}:
-            rows.append({"Field": label, "Value": re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", val)).strip()})
-    if not rows:
-        rows.append({"Field": "Details", "Value": "No extra notes available for this market."})
-    return pd.DataFrame(rows)
 
 
 def _team_logo_html(team: Any, extra_cls: str = "") -> str:
@@ -8787,13 +8697,6 @@ def render_grouped_player_card(player_df: pd.DataFrame):
       {market_html}
     </div>
     """, unsafe_allow_html=True)
-    for _, rr in player_df.iterrows():
-        m = str(rr.get("Market", "PROP")).upper()
-        lean = str(rr.get("Lean", "TRACK")).upper()
-        proj = _fmt_num_compact(rr.get("Projection"), 1)
-        line = _fmt_num_compact(rr.get("Line"), 1)
-        with st.expander(f"Why — {player} {m}: proj {proj} vs line {line} ({lean})", expanded=False):
-            st.dataframe(_market_why_df(rr), use_container_width=True, hide_index=True)
     with st.expander(f"Advanced details — {player} all markets", expanded=False):
         show_cols = [c for c in ["Market","Projection","Line","Edge","Lean","Over %","Under %","Official Play Score","Tier","Source","Line Selection","UD Candidate Order","UD Base Score","UD Line Kind","UD Two Sided","Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Freshness Status","Opponent","HomeAway","Matchup","Raw","Projection Explanation"] if c in player_df.columns]
         st.dataframe(player_df[show_cols], use_container_width=True, hide_index=True)
@@ -8892,11 +8795,8 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
     sort_df["_abs_edge"] = pd.to_numeric(sort_df.get("Edge", np.nan), errors="coerce").abs()
     sort_df["_score"] = pd.to_numeric(sort_df.get("Official Play Score", np.nan), errors="coerce")
     player_order = sort_df.groupby("Player", dropna=False).agg(MaxScore=("_score","max"), MaxEdge=("_abs_edge","max")).reset_index().sort_values(["MaxScore","MaxEdge"], ascending=False)["Player"].head(max_players).tolist()
-    for i in range(0, len(player_order), 2):
-        cols = st.columns(2)
-        for j, player in enumerate(player_order[i:i+2]):
-            with cols[j]:
-                render_grouped_player_card(view_df[view_df["Player"] == player])
+    for player in player_order:
+        render_grouped_player_card(view_df[view_df["Player"] == player])
     return view_df
 
 
@@ -9377,10 +9277,6 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
 
 def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: str, max_key: str, official_key: str, saved_view: bool = False) -> pd.DataFrame:
     """Render an already-built projection board with fast table / card toggle."""
-    proj_df = filter_projection_board_for_slate(proj_df, mode)
-    if proj_df is None or proj_df.empty:
-        st.info(f"No {mode.lower()} projection rows in the current cache. Use the refresh button for that slate, or open All Lines.")
-        return pd.DataFrame()
     key_prefix = f"saved_group_{mode}" if saved_view else f"live_group_{mode}"
     return render_grouped_table_or_cards(proj_df, mode, key_prefix, default_cards=False)
 
@@ -9459,7 +9355,10 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     st.markdown(f"<div class='section-title'>{mode} — Grouped Player Cards</div>", unsafe_allow_html=True)
     top_cols = st.columns([1.2, 1.0, 1.0, 2.0])
     with top_cols[0]:
-        st.info("Use the top refresh button only.")
+        refresh_label = "🔄 Refresh Everything Today" if mode == "Today" else f"🔄 Refresh Everything {mode}"
+        if st.button(refresh_label, key=f"group_refresh_{mode}", use_container_width=True):
+            run_full_refresh_with_progress(mode, use_ud_flag, logs_global, master_global)
+            st.rerun()
     with top_cols[1]:
         meta = saved_board_meta()
         st.metric("Last refresh", st.session_state.get("wnba_last_refresh", meta.get("SavedAt", "not yet")))
@@ -9483,7 +9382,9 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
         st.success(f"Loaded saved board from {meta.get('SavedAt', 'saved snapshot')} — no live refresh needed.")
         bc1, bc2, bc3 = st.columns([1.2, 1.2, 1.4])
         with bc1:
-            st.info("Use the top refresh button only.")
+            if st.button("🔄 Refresh Everything", key=f"saved_refresh_live_{mode}", use_container_width=True):
+                run_full_refresh_with_progress(mode, use_ud_flag, logs_global, master_global)
+                st.rerun()
         with bc2:
             if st.button("🧹 Clear saved board", key=f"clear_saved_board_{mode}", use_container_width=True):
                 for _p in [SAVED_BOARD_FILE, SAVED_LINES_FILE, SAVED_BOARD_META_FILE]:
@@ -10581,7 +10482,7 @@ with st.sidebar:
     use_remote = st.toggle("Allow SportsDataverse remote downloads", value=True)
     use_xgb_blend = st.toggle("Use XGBoost/GBM blend", value=False, help="Default OFF. Turn ON only after you have enough graded WNBA samples and want a small guarded ensemble signal.")
     st.session_state["use_xgb_blend"] = bool(use_xgb_blend)
-    auto_final_grade = st.toggle("Auto-check final results + grade learning log", value=False, help="Default OFF. Turn ON only when you want the app to check pending saved WNBA slates and grade completed games while the app is open.")
+    auto_final_grade = st.toggle("Auto-check final results + grade learning log", value=True, help="Default ON. While the app is open, it checks all pending saved WNBA slates and grades only completed games.")
     st.session_state["auto_final_grade"] = bool(auto_final_grade)
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
     st.markdown("**Model:** Monte Carlo + Bayesian confidence + WNBA game script" + (" + guarded XGBoost/GBM blend" if use_xgb_blend else ""))
@@ -12155,9 +12056,8 @@ def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd
         return pd.DataFrame(), status
 
 
-_top_refresh_mode = st.session_state.pop("wnba_run_top_refresh_mode", None)
-if _top_refresh_mode:
-    run_full_refresh_with_progress(str(_top_refresh_mode), use_ud, logs_global, master_global)
+if st.session_state.pop("wnba_run_top_refresh_today", False):
+    run_full_refresh_with_progress("Today", use_ud, logs_global, master_global)
 
 
 def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame):
@@ -12177,27 +12077,58 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     with top_cols[3]:
         st.caption(f"Grouped layout: one player card contains PTS / REB / AST / PRA. Line pull locked: {WORKING_PULL_LOCK}. Projection engine: {PROJECTION_ENGINE_VERSION}.")
 
+    force_live = False
     prefer_projection_cache = bool(st.session_state.get("wnba_prefer_projection_cache_after_refresh", False))
     saved_df = load_board_snapshot(mode)
     if not prefer_projection_cache and saved_df is not None and not saved_df.empty:
-        saved_df = filter_projection_board_for_slate(saved_df, mode)
         saved_df = _stable_repair_projection_board(saved_df, master_global)
         saved_df.to_csv(CACHE_FILES["projection_board"], index=False)
         st.success("Loaded saved lines and rebuilt them with the stable single-pass projection engine.")
         return _render_grouped_projection_df(saved_df, mode, f"saved_group_search_{mode}", f"saved_group_max_{mode}", f"saved_group_official_only_{mode}", saved_view=True)
 
     cached_board, cached_label = _stable_load_or_repair_cached_board(mode, master_global)
-    cached_board = filter_projection_board_for_slate(cached_board, mode)
-    if cached_board is not None and not cached_board.empty:
+    if not force_live and cached_board is not None and not cached_board.empty:
         if prefer_projection_cache:
             st.session_state["wnba_prefer_projection_cache_after_refresh"] = False
         st.success(f"Loaded {len(cached_board):,} rows from the last-good {cached_label}. Player Cards and Best Bets now use the same repaired board.")
         return _render_grouped_projection_df(cached_board, mode, f"cache_group_search_{mode}", f"cache_group_max_{mode}", f"cache_group_official_only_{mode}", saved_view=True)
 
+    lines_all, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud_flag, False, False, "")
+    lines, slate_note = filter_lines_for_slate(lines_all, mode)
+    render_source_status_card(lines_all, ud_debug, sl_debug, False, "")
     if mode == "Today":
         render_refresh_today_status()
-    st.info(f"No cached {mode.lower()} board is available. Nothing was pulled automatically. Use the refresh button to update schedule, lines, and projections.")
-    return pd.DataFrame()
+    st.caption(slate_note)
+    if lines is None or lines.empty:
+        cached_board, cached_label = _stable_load_or_repair_cached_board(mode, master_global)
+        if cached_board is not None and not cached_board.empty:
+            st.session_state[f"wnba_force_live_{mode}"] = False
+            st.warning("Live Underdog returned 0 rows, so the last-good lines were retained and projections were rebuilt with the stable engine.")
+            return _render_grouped_projection_df(cached_board, mode, f"fallback_group_search_{mode}", f"fallback_group_max_{mode}", f"fallback_group_official_only_{mode}", saved_view=True)
+        st.error("No live lines were returned and no last-good board is available. Check Debug / Status.")
+        return pd.DataFrame()
+
+    st.session_state["wnba_current_mode"] = mode
+    proj_df = make_projection_board(lines[lines["Market"].isin(MARKETS)], logs_global, master_global, mode)
+    if proj_df is None or proj_df.empty:
+        st.warning("Lines loaded, but no projection match was built. Check unmatched player names in Debug / Status.")
+        return pd.DataFrame()
+    proj_df["Slate"] = mode
+    proj_df["SlateDate"] = str(slate_target_date(mode) or "ALL")
+    proj_df = enrich_board_with_matchups(proj_df, mode)  # display/matchup labels only; no projection multiplier here
+    proj_df["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+    CACHE_FILES["projection_board"].parent.mkdir(exist_ok=True)
+    proj_df.to_csv(CACHE_FILES["projection_board"], index=False)
+    st.session_state[f"wnba_force_live_{mode}"] = False
+
+    save_cols = st.columns([1.2, 2.8])
+    with save_cols[0]:
+        if st.button("💾 Save Board", key=f"save_board_snapshot_{mode}", use_container_width=True):
+            n = save_board_snapshot(proj_df, lines_all, mode)
+            st.success(f"Saved {n:,} board rows with the stable projection version.")
+    with save_cols[1]:
+        st.caption("The working Underdog lines are preserved. Projection context is applied once; extra context fields are audit-only.")
+    return render_grouped_table_or_cards(proj_df, mode, f"live_group_{mode}", default_cards=False)
 
 
 # ============================================================
@@ -13801,34 +13732,35 @@ with tabs[4]:
             if status_filter and "Result" in show_results.columns:
                 show_results = show_results[show_results["Result"].astype(str).isin(status_filter)]
             c1, c2, c3, c4 = st.columns(4)
-            summary = result_record_summary(show_results)
-            c1.metric("Final graded rows", summary["total"])
-            c2.metric("✅ Wins", summary["wins"])
-            c3.metric("❌ Losses", summary["losses"])
-            c4.metric("➖ Pushes / 🚫 Voids", f"{summary['pushes']} / {summary['voids']}")
-            if summary["decisions"]:
-                st.metric("Final win rate", f"{summary['wins']}-{summary['losses']} ({summary['win_rate']:.1%})")
+            total = len(show_results)
+            wins = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "WIN").sum()) if total else 0
+            losses = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "LOSS").sum()) if total else 0
+            pushes = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "PUSH").sum()) if total else 0
+            voids = int((show_results.get("Result", pd.Series(dtype=str)).astype(str) == "VOID").sum()) if total else 0
+            decisions = wins + losses
+            c1.metric("Graded", total)
+            c2.metric("✅ Wins", wins)
+            c3.metric("❌ Losses", losses)
+            c4.metric("🚫 Voids / Pushes", f"{voids} / {pushes}")
+            if decisions:
+                st.metric("Win rate (voids/pushes excluded)", f"{wins}/{decisions} ({wins/decisions:.1%})")
             st.dataframe(show_results, use_container_width=True)
             st.download_button("Download after-game results CSV", show_results.to_csv(index=False), "wnba_after_game_results.csv", "text/csv")
     with grade_tabs[2]:
         if not official.empty:
             st.markdown("### Official snapshot log")
-            official_show = attach_result_symbols(official.tail(300))
-            st.dataframe(official_show, use_container_width=True)
-            st.download_button("Download official log CSV", attach_result_symbols(official).to_csv(index=False), "wnba_official_pick_log.csv", "text/csv")
+            st.dataframe(official.tail(300), use_container_width=True)
+            st.download_button("Download official log CSV", official.to_csv(index=False), "wnba_official_pick_log.csv", "text/csv")
         else:
             st.info("No official plays saved yet.")
         if not learning.empty:
             st.markdown("### Learning log")
             if "Result" in learning.columns:
-                learning_summary = result_record_summary(learning)
-                if learning_summary["decisions"]:
-                    st.metric("Learning final win rate", f"{learning_summary['wins']}-{learning_summary['losses']} ({learning_summary['win_rate']:.1%})")
-                else:
-                    st.metric("Learning final win rate", "0-0")
-            learning_show = attach_result_symbols(learning.tail(300))
-            st.dataframe(learning_show, use_container_width=True)
-            st.download_button("Download learning log CSV", attach_result_symbols(learning).to_csv(index=False), "wnba_learning_log.csv", "text/csv")
+                total = len(learning)
+                wins = (learning["Result"] == "WIN").sum()
+                st.metric("Learning win rate", f"{wins}/{total} ({wins/total:.1%})" if total else "0/0")
+            st.dataframe(learning.tail(300), use_container_width=True)
+            st.download_button("Download learning log CSV", learning.to_csv(index=False), "wnba_learning_log.csv", "text/csv")
 
 with tabs[5]:
     render_data_manager_tab()
@@ -13911,8 +13843,8 @@ with tabs[7]:
         st.metric("Line snapshots", int(len(pd.DataFrame(load_json(LINE_HISTORY_FILE, [])))))
     with r4:
         if not learning_df.empty and "Result" in learning_df.columns:
-            report_summary = result_record_summary(learning_df)
-            st.metric("Tracked win rate", f"{report_summary['wins']}-{report_summary['losses']} ({report_summary['win_rate']:.1%})" if report_summary["decisions"] else "0-0")
+            wr = (learning_df["Result"] == "WIN").sum() / max(1, (learning_df["Result"].isin(["WIN", "LOSS"])).sum())
+            st.metric("Tracked win rate", f"{wr:.1%}")
         else:
             st.metric("Tracked win rate", "N/A")
 
@@ -13927,8 +13859,7 @@ with tabs[7]:
     refreshed_official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
     if not refreshed_official.empty:
         cols = [c for c in ["SavedAt", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Projection", "Lean", "Actual", "Result", "ClosingLine", "CLV", "GradeNote"] if c in refreshed_official.columns]
-        refreshed_show = attach_result_symbols(refreshed_official.tail(250)[cols] if cols else refreshed_official.tail(250))
-        st.dataframe(refreshed_show, use_container_width=True)
+        st.dataframe(refreshed_official.tail(250)[cols] if cols else refreshed_official.tail(250), use_container_width=True)
 
     st.markdown("### 2) Line Movement + CLV Dashboard")
     lm_df = line_movement_report()
