@@ -10625,6 +10625,15 @@ def _grouped_market_html(r: pd.Series) -> str:
     extra=f"<br/><b>Market defense:</b> Rank {rank}/{teams} (1 toughest) · DRtg {drtg} · Pace {pace}<br/><b>Position matchup:</b> {pos}"
     return html.replace("<br/><b>Workload:</b>",extra+"<br/><b>Workload:</b>")
 
+
+# Compact player cards: keep projections visible; move reasoning to Why expanders.
+_grouped_market_html_with_notes = _grouped_market_html
+
+def _grouped_market_html(r: pd.Series) -> str:
+    card_html = _grouped_market_html_with_notes(r)
+    return re.sub(r"\s*<div class='owp-market-note'>.*?</div>", "", card_html, flags=re.S)
+
+
 with st.sidebar:
     st.header("Setup")
     season_now = st.number_input("Current season", min_value=2020, max_value=2032, value=datetime.now().year, step=1)
@@ -10738,6 +10747,9 @@ st.markdown("""
 .owp-value-box.pick span{display:block;color:#facc15;font-size:.72rem;font-weight:900}
 .owp-value-box b.pos{color:#4ade80}.owp-value-box b.neg{color:#fb7185}.owp-value-box b.flat{color:#e9d5ff}
 .owp-line-meta{margin-top:7px;color:#c4b5fd;font-size:.76rem;font-weight:800}
+.owp-market-note{display:none!important}
+.owp-group-card{padding-bottom:10px!important}
+.owp-market-row{margin:8px 0!important}
 @media(max-width:640px){.owp-market-values{grid-template-columns:repeat(2,minmax(0,1fr))}.owp-value-box b{font-size:1.18rem}}
 </style>
 """, unsafe_allow_html=True)
