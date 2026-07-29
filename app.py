@@ -8746,6 +8746,10 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
     with st.expander("Board coverage — teams / matchups / markets", expanded=False):
         if "Matchup" in view_df.columns:
             st.dataframe(view_df["Matchup"].astype(str).replace("", "Unknown").value_counts().rename_axis("Matchup").reset_index(name="Rows"), use_container_width=True, hide_index=True)
+        if "Slate Missing From Player Props" in view_df.columns:
+            missing_props = str(view_df["Slate Missing From Player Props"].dropna().astype(str).iloc[0]) if len(view_df["Slate Missing From Player Props"].dropna()) else ""
+            if missing_props:
+                st.warning(f"Schedule has no pulled player props for: {missing_props}. Moneyline can still show those games.")
         if "Team" in view_df.columns:
             st.dataframe(view_df["Team"].astype(str).map(team_abbrev).value_counts().rename_axis("Team").reset_index(name="Rows"), use_container_width=True, hide_index=True)
         if all(c in view_df.columns for c in ["Player", "Team", "Opponent", "Market", "Line", "Source"]):
@@ -13466,7 +13470,105 @@ def _stable_repair_projection_board(board: pd.DataFrame, base: Optional[pd.DataF
     fixed = _strong_trust_enrich_board(fixed, mode)
     fixed = _apply_full_winning_play_stack(fixed, base, mode)
     fixed["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+    fixed["LineParserVersion"] = LINE_PARSER_VERSION
     return fixed
+
+
+LINE_AUDIT_COLUMNS = [
+    "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided",
+    "Parser Mode", "Raw", "Start", "Underdog Line", "Sleeper Line", "Manual Line",
+    "Best Over Line", "Best Under Line", "Line Source Reliability"
+]
+
+
+def _reattach_line_audit_columns(board: pd.DataFrame, lines: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Carry Underdog main-line proof columns into projection exports without changing picks."""
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    out["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+    out["LineParserVersion"] = LINE_PARSER_VERSION
+    if "Projection Integrity" not in out.columns:
+        out["Projection Integrity"] = np.where(out.get("Data Integrity", pd.Series("", index=out.index)).astype(str).str.upper().eq("VERIFIED"), "VERIFIED", "CHECK")
+    if "Projection Integrity Note" not in out.columns:
+        out["Projection Integrity Note"] = "projection board exported with line audit"
+
+    if lines is None or lines.empty:
+        for col in LINE_AUDIT_COLUMNS:
+            if col not in out.columns:
+                out[col] = np.nan
+        return out
+
+    src = lines.copy()
+    if "NameKey" not in src.columns and "Player" in src.columns:
+        src["NameKey"] = src["Player"].map(normalize_name)
+    if "NameKey" not in out.columns and "Player" in out.columns:
+        out["NameKey"] = out["Player"].map(normalize_name)
+    src["Market"] = src.get("Market", pd.Series("", index=src.index)).astype(str).str.upper()
+    out["Market"] = out.get("Market", pd.Series("", index=out.index)).astype(str).str.upper()
+    src["Line"] = pd.to_numeric(src.get("Line", pd.Series(np.nan, index=src.index)), errors="coerce")
+    out["Line"] = pd.to_numeric(out.get("Line", pd.Series(np.nan, index=out.index)), errors="coerce")
+    if "Team" in src.columns:
+        src["_audit_team"] = src["Team"].map(_team_key_for_matchup)
+    if "Team" in out.columns:
+        out["_audit_team"] = out["Team"].map(_team_key_for_matchup)
+
+    keep = [c for c in ["NameKey", "Market", "Line", "_audit_team"] + LINE_AUDIT_COLUMNS if c in src.columns]
+    if not {"NameKey", "Market", "Line"}.issubset(keep):
+        return out.drop(columns=["_audit_team"], errors="ignore")
+    src = src[keep].copy()
+    sort_cols = [c for c in ["NameKey", "Market", "Line", "_audit_team", "UD Base Score", "UD Candidate Order"] if c in src.columns]
+    if "UD Base Score" in src.columns:
+        src["_audit_base_sort"] = pd.to_numeric(src["UD Base Score"], errors="coerce").fillna(0)
+    else:
+        src["_audit_base_sort"] = 0
+    if "UD Candidate Order" in src.columns:
+        src["_audit_order_sort"] = pd.to_numeric(src["UD Candidate Order"], errors="coerce").fillna(999999)
+    else:
+        src["_audit_order_sort"] = 999999
+    src = src.sort_values(["_audit_base_sort", "_audit_order_sort"], ascending=[False, True])
+    join_keys = ["NameKey", "Market", "Line"]
+    if "_audit_team" in src.columns and "_audit_team" in out.columns and src["_audit_team"].notna().any():
+        join_keys.append("_audit_team")
+    src = src.drop_duplicates(subset=join_keys, keep="first").drop(columns=["_audit_base_sort", "_audit_order_sort"], errors="ignore")
+
+    out["_audit_idx"] = np.arange(len(out))
+    merged = out.merge(src, on=join_keys, how="left", suffixes=("", "_line_audit"))
+    merged = merged.sort_values("_audit_idx")
+    for col in LINE_AUDIT_COLUMNS:
+        audit_col = f"{col}_line_audit"
+        if audit_col in merged.columns:
+            if col in merged.columns:
+                current = merged[col]
+                blank = current.isna() | current.astype(str).str.strip().isin(["", "nan", "None"])
+                merged.loc[blank, col] = merged.loc[blank, audit_col]
+            else:
+                merged[col] = merged[audit_col]
+    return merged.drop(columns=[c for c in merged.columns if c.endswith("_line_audit")] + ["_audit_idx", "_audit_team"], errors="ignore")
+
+
+def _attach_player_prop_slate_coverage(board: pd.DataFrame, mode: Optional[str] = None) -> pd.DataFrame:
+    """Expose games with schedule/moneyline coverage but no pulled player props."""
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    expected = set()
+    try:
+        if "_moneyline_pairs_from_schedule" in globals():
+            for pair in _moneyline_pairs_from_schedule(mode or "Today"):
+                away = _team_key_for_matchup(pair.get("away"))
+                home = _team_key_for_matchup(pair.get("home"))
+                if away and home:
+                    expected.add(f"{away} @ {home}")
+    except Exception:
+        expected = set()
+    got = set(out.get("Matchup", pd.Series(dtype=str)).dropna().astype(str).str.strip())
+    if expected:
+        missing = sorted(expected - got)
+        out["Slate Games Expected"] = len(expected)
+        out["Slate Missing From Player Props"] = ", ".join(missing)
+        out["Slate Player Prop Coverage"] = "COMPLETE" if not missing else "MISSING_PROP_LINES"
+    return out
 
 
 def make_projection_board(lines, logs, base, mode: Optional[str] = None):
@@ -13478,6 +13580,8 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
     board = _strong_trust_enrich_board(board, mode or "Today")
     board = _apply_full_winning_play_stack(board, base, mode or "Today")
     if board is not None and not board.empty:
+        board = _reattach_line_audit_columns(board, lines)
+        board = _attach_player_prop_slate_coverage(board, mode or "Today")
         board["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
         board["LineParserVersion"] = LINE_PARSER_VERSION
         save_dataset("projection_board", board)
@@ -13544,7 +13648,7 @@ with tabs[1]:
         if card_view:
             for _, rr in show.head(40).iterrows():
                 render_card(rr)
-        display_cols = [c for c in ["Tier", "Official", "Clean Risk", "Winning Play Score", "Projection Engine Version", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Opening Line", "CLV", "Projection", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+        display_cols = [c for c in ["Tier", "Official", "Clean Risk", "Winning Play Score", "Projection Engine Version", "LineParserVersion", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided", "Slate Player Prop Coverage", "Slate Missing From Player Props", "Opening Line", "CLV", "Projection", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
         st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
