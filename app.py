@@ -39,7 +39,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.7.0 — Production Reliability V1"
+APP_VERSION = "WNBA v3.7.2 — Production Reliability V1 + Final Runtime Order Fix"
 LINE_PARSER_VERSION = "UD_BASE_CARD_MAINLINE_V5"
 
 # Display and slate filtering must use the bettor's local calendar date, not
@@ -7282,6 +7282,47 @@ def _legacy_make_projection_board_v3(lines, logs, base, mode: Optional[str] = No
 
 
 # ============================================================
+# Projection builder runtime-order dispatcher
+# ============================================================
+# Streamlit executes top-level refresh/UI code while the file is still being
+# evaluated.  The full production implementation is defined later because it
+# depends on downstream feature helpers.  Keep one public function available
+# from this point forward so early refresh actions never raise NameError.
+# Once the final implementation is defined, this dispatcher automatically uses
+# it.  Before then, it creates a clearly marked bootstrap board that the startup
+# production-contract repair finalizes later in the same run.
+_production_make_projection_board_impl = None
+
+def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+    impl = globals().get("_production_make_projection_board_impl")
+    if callable(impl):
+        return impl(lines, logs, base, mode)
+
+    selected_mode = mode or str(st.session_state.get("wnba_current_mode", "Today"))
+    st.session_state["wnba_current_mode"] = selected_mode
+    try:
+        board = _legacy_make_projection_board_v3(lines, logs, base, selected_mode)
+        if board is None or board.empty:
+            return pd.DataFrame()
+        board = board.copy()
+        board["Projection Engine Version"] = "BOOTSTRAP_PENDING_PRODUCTION_FINALIZATION"
+        board["Production Bootstrap Status"] = "PENDING_FINAL_CONTRACT_REPAIR"
+        board["Slate"] = selected_mode
+        board["SlateDate"] = str(slate_target_date(selected_mode) or "ALL") if "slate_target_date" in globals() else "PENDING"
+        try:
+            _prod_log("WARNING", "projection_bootstrap_builder_used", mode=selected_mode, rows=len(board))
+        except Exception:
+            pass
+        return board
+    except Exception as exc:
+        try:
+            _prod_log_exception("projection_bootstrap_failed", exc, mode=selected_mode)
+        except Exception:
+            pass
+        raise
+
+
+# ============================================================
 # Streamlit app
 # ============================================================
 st.set_page_config(page_title="ONE WAY PICKZ WNBA", page_icon="🏀", layout="wide")
@@ -10713,7 +10754,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v3.7.0 — Production Reliability V1"
+APP_VERSION = "WNBA v3.7.2 — Production Reliability V1 + Final Runtime Order Fix"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -12254,7 +12295,7 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v3.7.0 — Production Reliability V1"
+APP_VERSION = "WNBA v3.7.2 — Production Reliability V1 + Final Runtime Order Fix"
 PROJECTION_ENGINE_VERSION = "V361_WNBA_MAINLINE_FULL_SLATE_V1"
 PROJECTION_ENGINE_NOTE = "Bayesian L5/L10/L20/season baseline + bounded minutes once + verified matchup once + small market shrink; later context is audit-only."
 
@@ -12890,14 +12931,6 @@ def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd
         return pd.DataFrame(), status
 
 
-_top_refresh_mode = st.session_state.pop("wnba_run_top_refresh_mode", None)
-if _top_refresh_mode:
-    # The player-card renderer below only builds one selected slate. Sync it to
-    # the refresh button so refreshing Today immediately displays Today.
-    st.session_state["player_cards_slate_selector"] = str(_top_refresh_mode)
-    run_full_refresh_with_progress(str(_top_refresh_mode), use_ud, logs_global, master_global)
-
-
 def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame):
     """Player Cards synchronized with Best Bets, using one stable projection pass only."""
     st.markdown(f"<div class='section-title'>{mode} — Grouped Player Cards</div>", unsafe_allow_html=True)
@@ -12947,7 +12980,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v3.7.0 — Production Reliability V1"
+APP_VERSION = "WNBA v3.7.2 — Production Reliability V1 + Final Runtime Order Fix"
 PROJECTION_ENGINE_VERSION = "V361_WNBA_MAINLINE_FULL_SLATE_V1"
 PROJECTION_ENGINE_NOTE = (
     "Each market uses its own workload-adjusted true-recent baseline plus L5/L10/L20/season "
@@ -14404,8 +14437,8 @@ def _legacy_make_projection_board_v9(lines, logs, base, mode: Optional[str] = No
 # are calculated once. Opportunity, game-script, line-history, and market-rank
 # data may confirm/block a play, but they cannot stack a second projection bump.
 
-APP_VERSION = "WNBA v3.7.0 — Production Reliability V1"
-PROJECTION_ENGINE_VERSION = "V370_WNBA_PRODUCTION_RELIABILITY_V1"
+APP_VERSION = "WNBA v3.7.2 — Production Reliability V1 + Final Runtime Order Fix"
+PROJECTION_ENGINE_VERSION = "V372_WNBA_PRODUCTION_RELIABILITY_FINAL_RUNTIME_ORDER_FIX"
 PROJECTION_ENGINE_NOTE = (
     "Market-isolated L5/L10/L20/season baseline → bounded minutes once → "
     "verified opponent matchup once → PRA exact component identity. Opportunity, "
@@ -14760,8 +14793,8 @@ def _stable_repair_projection_board(board: pd.DataFrame, base: Optional[pd.DataF
     return repaired
 
 
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
-    """The only public production projection authority.
+def _production_make_projection_board_impl(lines, logs, base, mode: Optional[str] = None):
+    """Final production projection implementation used by the public dispatcher.
 
     Raw inputs flow through the frozen clean single-pass engine, then through a
     schema/date/identity contract. Historical builders remain available only
@@ -14799,6 +14832,13 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
 
 # Refresh the release manifest after the final engine constants are defined.
 _prod_write_release_manifest()
+
+# Process the top refresh request only after the final production builder exists.
+# This ordering is mandatory: the refresh pipeline calls make_projection_board.
+_top_refresh_mode = st.session_state.pop("wnba_run_top_refresh_mode", None)
+if _top_refresh_mode:
+    st.session_state["player_cards_slate_selector"] = str(_top_refresh_mode)
+    run_full_refresh_with_progress(str(_top_refresh_mode), use_ud, logs_global, master_global)
 
 # Repair any older cache through the production contract before Best Bets renders.
 try:
