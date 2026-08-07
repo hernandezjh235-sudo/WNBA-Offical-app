@@ -33,7 +33,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.6.2 - Fast Rows + Moneyline Runtime Fix"
+APP_VERSION = "WNBA v3.6.5 - Full Live Board Projection Authority"
 LINE_PARSER_VERSION = "UD_BASE_CARD_MAINLINE_V5"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
 EMBEDDED_DATA_VERSION = "CORE_DATA_SELF_HEAL_V1"
@@ -237,7 +237,23 @@ def get_team_logo_src(team: Any) -> str:
         return gh
     slug = TEAM_ESPN_LOGO_SLUGS.get(abbr, abbr.lower())
     if slug:
+        remote = remote_logo_data_uri(slug)
+        if remote:
+            return remote
         return f"https://a.espncdn.com/i/teamlogos/wnba/500/{slug}.png"
+    return ""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def remote_logo_data_uri(slug: str) -> str:
+    """Inline ESPN logo bytes so deployed component iframes do not block them."""
+    try:
+        url = f"https://a.espncdn.com/i/teamlogos/wnba/500/{str(slug).strip().lower()}.png"
+        response = requests.get(url, timeout=12)
+        if response.status_code == 200 and response.content:
+            return "data:image/png;base64," + base64.b64encode(response.content).decode("ascii")
+    except Exception:
+        pass
     return ""
 
 # ============================================================
@@ -6078,7 +6094,7 @@ def kpi_card(label: str, value: Any, sub: str = ""):
 def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, strong: int = 0):
     st.markdown("""
     <div class='owp-hero'>
-      <div class='owp-title'>💜 WNBA PROP ENGINE v3.6.1<br/>MAIN-LINE GUARD + FULL MONEYLINE SLATE</div>
+      <div class='owp-title'>WNBA PROP ENGINE v3.6.5<br/>FULL LIVE BOARD + RANKED BEST BETS</div>
       <div class='owp-subtitle'>Railway-safe load → Refresh only when clicked → Save every real-line projection → Grade</div>
     </div>
     """, unsafe_allow_html=True)
@@ -6096,7 +6112,13 @@ def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, stron
                 try:
                     board_cache = pd.read_csv(board_path)
                     n = save_officials(board_cache)
-                    st.success(f"Saved {n} before-game real-line projections. Rows that passed the official gate are marked OFFICIAL_GATE; the rest are tracked for grading/calibration.")
+                    snapshot_n = save_board_snapshot(
+                        board_cache,
+                        st.session_state.get("wnba_lines_all", pd.DataFrame()),
+                        refresh_mode,
+                    )
+                    st.session_state["wnba_prefer_projection_cache_after_refresh"] = False
+                    st.success(f"Saved {n} tracked plays and {snapshot_n} board rows. This slate will reload without another refresh.")
                 except Exception as e:
                     st.error(f"Save failed: {e}")
             else:
@@ -8183,7 +8205,9 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     with action_cols[0]:
         if st.button(f"✅ Save {mode} Official Before", key=f"save_before_{mode}_{market_key}"):
             n = save_officials(proj_df)
-            st.success(f"Saved {n} official plays for {mode}.")
+            snapshot_n = save_board_snapshot(proj_df, st.session_state.get("wnba_lines_all", pd.DataFrame()), mode)
+            st.session_state["wnba_prefer_projection_cache_after_refresh"] = False
+            st.success(f"Saved {n} tracked plays and {snapshot_n} board rows. {mode} will reload without refreshing.")
     with action_cols[1]:
         if st.button(f"📊 Pull Final Results + Grade", key=f"grade_after_{mode}_{market_key}"):
             n, grade_dbg = pull_final_results_and_grade(mode)
@@ -8974,7 +8998,14 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
     ac1, ac2, ac3 = st.columns([1.2,1.2,1.4])
     with ac1:
         if st.button(f"✅ Save {mode} Official Before", key=f"{key_prefix}_save_before", use_container_width=True):
-            n = save_officials(view_df); st.success(f"Saved {n} real-line projections for {mode} tracking and grading.")
+            n = save_officials(view_df)
+            snapshot_n = save_board_snapshot(
+                view_df,
+                st.session_state.get("wnba_lines_all", pd.DataFrame()),
+                mode,
+            )
+            st.session_state["wnba_prefer_projection_cache_after_refresh"] = False
+            st.success(f"Saved {n} tracked plays and {snapshot_n} board rows. {mode} will reload without refreshing.")
     with ac2:
         if st.button(f"📊 Pull Final Results + Grade", key=f"{key_prefix}_grade_after", use_container_width=True):
             n, grade_dbg = pull_final_results_and_grade(mode)
@@ -9386,7 +9417,7 @@ def _wnba_game_script_context(row: pd.Series) -> Dict[str, Any]:
     }
 
 
-def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system", mode: str = "Today") -> None:
+def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system", mode: str = "Today") -> pd.DataFrame:
     st.markdown("#### WNBA Moneyline / Game Script")
     st.caption("Game-level model using pace, ORtg, DRtg, projected score, 15k simulation, spread, total and blowout risk.")
     ctx = _ml_team_context()
@@ -9406,7 +9437,7 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         pairs.append(p)
     if not pairs:
         st.info("No unique matchups found. Hit Refresh Everything Today so the app pulls today's schedule and lines.")
-        return
+        return pd.DataFrame()
     if schedule_pairs:
         st.caption(f"Moneyline games: {len(pairs)} total ({len(schedule_pairs)} live/scheduled, {len(line_pairs)} from pulled lines, {len(board_pairs)} from prop board).")
     else:
@@ -9425,6 +9456,7 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
             st.dataframe(dbg, use_container_width=True, hide_index=True)
 
     cards = []
+    game_rows = []
     for p in pairs[:12]:
         a, b = p["team"], p["opp"]
         ar, br = _ml_fallback_team_row(a, ctx), _ml_fallback_team_row(b, ctx)
@@ -9457,6 +9489,28 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         game_date_note = html.escape(str(p.get("game_date", "")))
         fav_label = html.escape(str(ml_team))
         ml_note = f"{fav_label} FAV" if ml_prob >= 50 else "NO CLEAR FAV"
+        game_rows.append({
+            "Slate": mode,
+            "Game Time": str(p.get("game_date", "")),
+            "Matchup": f"{a} @ {b}",
+            "Away": a,
+            "Home": b,
+            "Projected Away Score": round(a_score, 1),
+            "Projected Home Score": round(b_score, 1),
+            "Projected Total": round(safe_float(sim.get("Sim Total"), total), 1),
+            "Projected Favorite": ml_team,
+            "Projected Spread": round(abs(sim_spread), 1),
+            "Favorite Win Probability": round(ml_prob, 1),
+            "Underdog Win Probability": round(dog_prob, 1),
+            "Projected Total Side": total_side,
+            "Total Model Confidence": round(total_conf, 1),
+            "Game Pace": round(safe_float(sim.get("Sim Pace"), pace), 1),
+            "Blowout Risk": round(blowout, 1),
+            "Simulation Count": int(safe_float(sim.get("Sim Count"), WNBA_MONTE_CARLO_SIMS)),
+            "Matchup Source": str(p.get("source", "schedule")),
+            "Away Context": str(ar.get("Moneyline Context", "team data")),
+            "Home Context": str(br.get("Moneyline Context", "team data")),
+        })
         cards.append(
             "<div class='wnba-ml-card'>"
             f"<div class='wnba-ml-source'>{source_note}{' · ' + game_date_note if game_date_note else ''}</div>"
@@ -9482,7 +9536,7 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         )
     if not cards:
         st.info("No ML cards could be built from current team context.")
-        return
+        return pd.DataFrame()
     ml_html = "<style>"
     ml_html += ".wnba-ml-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:16px;margin:10px 0 18px;background:#070912;padding:4px}"
     ml_html += ".wnba-ml-card{background:linear-gradient(180deg,#0b0f18 0%,#0f1722 100%);border:1px solid rgba(250,204,21,.56);border-radius:16px;padding:18px;color:#e5e7eb;box-shadow:0 18px 42px rgba(0,0,0,.35);overflow:hidden;position:relative}"
@@ -9495,6 +9549,7 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
     ml_html += "@media(max-width:700px){.wnba-ml-wrap{grid-template-columns:1fr}.wnba-ml-teams{grid-template-columns:1fr}.wnba-ml-mid{padding-top:0}.wnba-ml-bottom{grid-template-columns:1fr 1fr}.wnba-ml-total-side,.wnba-ml-total em{position:static;display:inline-block;margin-left:8px}.wnba-ml-total strong{font-size:2.2rem}}"
     ml_html += "</style><div class='wnba-ml-wrap'>" + "".join(cards) + "</div>"
     st.components.v1.html(ml_html, height=min(900, 390 * len(cards) + 80), scrolling=True)
+    return pd.DataFrame(game_rows)
 
 def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: str, max_key: str, official_key: str, saved_view: bool = False) -> pd.DataFrame:
     """Render an already-built projection board with fast table / card toggle."""
@@ -9678,6 +9733,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
         if st.button("💾 Save Board", key=f"save_board_snapshot_{mode}", use_container_width=True):
             n = save_board_snapshot(proj_df, lines_all, mode)
             st.session_state[f"wnba_force_live_{mode}"] = False
+            st.session_state["wnba_prefer_projection_cache_after_refresh"] = False
             st.success(f"Saved {n:,} board rows. Next app open will load this board without refreshing.")
     with save_cols[1]:
         st.caption("Save Board keeps the pulled lines + projections available after closing/reopening, similar to the MLB app.")
@@ -10111,7 +10167,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v3.6.2 - Fast Rows + Moneyline Runtime Fix"
+APP_VERSION = "WNBA v3.6.5 - Full Live Board Projection Authority"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -11652,8 +11708,8 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v3.6.2 - Fast Rows + Moneyline Runtime Fix"
-PROJECTION_ENGINE_VERSION = "V361_WNBA_MAINLINE_FULL_SLATE_V1"
+APP_VERSION = "WNBA v3.6.5 - Full Live Board Projection Authority"
+PROJECTION_ENGINE_VERSION = "V365_FULL_LIVE_BOARD_PROJECTION_V1"
 PROJECTION_ENGINE_NOTE = "Bayesian L5/L10/L20/season baseline + bounded minutes once + verified matchup once + small market shrink; later context is audit-only."
 
 
@@ -12188,6 +12244,56 @@ def _stable_load_or_repair_cached_board(mode: str, base: Optional[pd.DataFrame])
     return board, label
 
 
+def _refresh_core_projection_data(mode: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Refresh current-season inputs on an explicit user refresh.
+
+    Existing caches are preserved when the remote source is unavailable.
+    Heavy shot/lineup downloads remain in Data Manager.
+    """
+    target = slate_target_date(mode) or datetime.now().date()
+    logs = load_dataset("player_game_logs")
+    newest = pd.NaT
+    if logs is not None and not logs.empty and "GameDate" in logs.columns:
+        newest = pd.to_datetime(logs["GameDate"], errors="coerce").max()
+    age_days = (target - newest.date()).days if pd.notna(newest) else 999
+    report: Dict[str, Any] = {
+        "Player Logs Before": str(newest.date()) if pd.notna(newest) else "missing",
+        "Player Log Age Days": int(age_days),
+        "Core Data Refresh": "cache current" if age_days <= 2 else "refresh requested",
+    }
+    if age_days > 2:
+        try:
+            raw, debug = download_sportsdataverse_dataset("player_game_logs", [int(target.year)])
+            if raw is not None and not raw.empty:
+                refreshed = standardize_player_logs(raw)
+                if refreshed is not None and not refreshed.empty:
+                    combined = pd.concat([logs, refreshed], ignore_index=True, sort=False) if logs is not None and not logs.empty else refreshed
+                    combined = standardize_player_logs(combined)
+                    save_dataset("player_game_logs", combined)
+                    logs = combined
+                    newest_after = pd.to_datetime(combined.get("GameDate"), errors="coerce").max()
+                    report["Core Data Refresh"] = "player logs updated"
+                    report["Player Logs After"] = str(newest_after.date()) if pd.notna(newest_after) else "unknown"
+                    try:
+                        get_global_datasets.clear()
+                    except Exception:
+                        pass
+            else:
+                report["Core Data Refresh"] = "remote unavailable; existing cache preserved"
+                if debug is not None and not debug.empty:
+                    report["Core Data Detail"] = str(debug.iloc[-1].to_dict())[:300]
+        except Exception as exc:
+            report["Core Data Refresh"] = f"refresh failed; cache preserved: {str(exc)[:160]}"
+    master = load_dataset("master_features")
+    if logs is not None and not logs.empty:
+        try:
+            master, _ = build_master_features()
+            report["Master Features"] = f"rebuilt {len(master)} players"
+        except Exception as exc:
+            report["Master Features"] = f"existing cache used: {str(exc)[:120]}"
+    return logs, master, report
+
+
 def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """One visible refresh path: schedule/context, lines, projections, cache."""
     progress = st.progress(0, text="Starting full refresh...")
@@ -12219,14 +12325,9 @@ def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd
         except Exception as exc:
             status["Context Warning"] = str(exc)[:160]
 
-        step(38, "Loading/rebuilding player baselines...")
-        logs = logs_global if logs_global is not None and not logs_global.empty else load_dataset("player_game_logs")
-        master = master_global if master_global is not None and not master_global.empty else load_dataset("master_features")
-        if (master is None or master.empty) and logs is not None and not logs.empty:
-            try:
-                master, _team_ranks = build_master_features()
-            except Exception:
-                master = pd.DataFrame()
+        step(38, "Refreshing player logs and rebuilding projection baselines...")
+        logs, master, core_report = _refresh_core_projection_data(mode)
+        status.update(core_report)
         status["Database Players"] = 0 if master is None or master.empty else len(master)
 
         step(58, "Pulling current lines...")
@@ -12341,8 +12442,8 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v3.6.2 - Fast Rows + Moneyline Runtime Fix"
-PROJECTION_ENGINE_VERSION = "V361_WNBA_MAINLINE_FULL_SLATE_V1"
+APP_VERSION = "WNBA v3.6.5 - Full Live Board Projection Authority"
+PROJECTION_ENGINE_VERSION = "V365_FULL_LIVE_BOARD_PROJECTION_V1"
 PROJECTION_ENGINE_NOTE = (
     "Each market uses its own workload-adjusted true-recent baseline plus L5/L10/L20/season "
     "shrinkage. Opponent pace/DRtg is joined before one bounded matchup adjustment. "
@@ -13647,7 +13748,9 @@ def _strict_market_isolated_rebuild(board: pd.DataFrame, base: Optional[pd.DataF
             }
         else:
             current_source_row = _strict_market_source_row(row, market, market_rows)
-            final_projection, display_values, meta = _strict_component_projection(current_source_row, br, market, market_shrink=True)
+            # The sportsbook line is used only after the mean is built to
+            # calculate edge/probability. It must never pull the model mean.
+            final_projection, display_values, meta = _strict_component_projection(current_source_row, br, market, market_shrink=False)
 
         row["Projection Before Market Isolation"] = safe_float(row.get("Projection"), np.nan)
         row["Projection"] = round(final_projection, 2) if pd.notna(final_projection) else np.nan
@@ -13796,6 +13899,115 @@ def _attach_player_prop_slate_coverage(board: pd.DataFrame, mode: Optional[str] 
     return out
 
 
+def _attach_projection_data_readiness(
+    board: pd.DataFrame,
+    logs: Optional[pd.DataFrame],
+    mode: str,
+) -> pd.DataFrame:
+    """Audit sample size and freshness without manufacturing a projection."""
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    target = slate_target_date(mode) or datetime.now().date()
+    player_meta: Dict[str, Dict[str, Any]] = {}
+    global_latest = pd.NaT
+    if logs is not None and not logs.empty:
+        ld = standardize_player_logs(logs)
+        if ld is not None and not ld.empty:
+            dates = pd.to_datetime(ld.get("GameDate"), errors="coerce")
+            global_latest = dates.max()
+            ld = ld.assign(_AuditDate=dates)
+            if "Played" in ld.columns:
+                played = ld[ld["Played"].fillna(False).astype(bool)].copy()
+                if not played.empty:
+                    ld = played
+            for name_key, group in ld.groupby("NameKey"):
+                player_meta[str(name_key)] = {
+                    "games": int(len(group)),
+                    "latest": pd.to_datetime(group["_AuditDate"], errors="coerce").max(),
+                }
+    global_age = (target - global_latest.date()).days if pd.notna(global_latest) else 999
+    out["Projection Data Through"] = str(global_latest.date()) if pd.notna(global_latest) else ""
+    out["Projection Data Age Days"] = int(global_age)
+    readiness = []
+    missing_notes = []
+    for idx, row in out.iterrows():
+        key = normalize_name(row.get("Matched Player") or row.get("Player"))
+        meta = player_meta.get(key, {})
+        games = int(meta.get("games", 0) or 0)
+        latest = meta.get("latest", pd.NaT)
+        projection = safe_float(row.get("Projection"), np.nan)
+        minutes = safe_float(row.get("MIN Proj"), np.nan)
+        team = _team_key_for_matchup(row.get("Team"))
+        opponent = _team_key_for_matchup(row.get("Opponent"))
+        issues = []
+        if pd.isna(projection): issues.append("projection unavailable")
+        if games < 5: issues.append(f"only {games} played games")
+        if pd.isna(minutes) or minutes <= 0: issues.append("projected minutes unavailable")
+        if not team: issues.append("team unresolved")
+        if not opponent: issues.append("opponent unresolved")
+        if global_age > 2: issues.append(f"player database stale by {global_age} days")
+        out.at[idx, "Player Games Available"] = games
+        out.at[idx, "Player Last Game"] = str(latest.date()) if pd.notna(latest) else ""
+        status = "READY" if not issues else "BLOCKED"
+        readiness.append(status)
+        missing_notes.append(" | ".join(issues))
+        if issues:
+            out.at[idx, "Official"] = "PASS"
+            existing = str(row.get("PASS Reason", "") or "").strip(" |")
+            reason = "Projection readiness: " + " | ".join(issues)
+            out.at[idx, "PASS Reason"] = " | ".join(x for x in [existing, reason] if x)
+    out["Projection Readiness"] = readiness
+    out["Projection Missing Inputs"] = missing_notes
+    return out
+
+
+def _ensure_full_live_board_coverage(
+    board: Optional[pd.DataFrame],
+    lines: Optional[pd.DataFrame],
+    mode: str,
+) -> pd.DataFrame:
+    """Keep every validated main line visible, including unprojected rows."""
+    out = board.copy() if board is not None else pd.DataFrame()
+    if lines is None or lines.empty:
+        return out
+    live = lines.copy()
+    live["Market"] = live.get("Market", "").astype(str).str.upper()
+    live["Line"] = pd.to_numeric(live.get("Line"), errors="coerce")
+    live_players = live["Player"] if "Player" in live.columns else pd.Series("", index=live.index)
+    live["NameKey"] = live_players.map(normalize_name)
+    live = live[live["Market"].isin(MARKETS) & live["Line"].notna() & live["NameKey"].ne("")].copy()
+    live["_CoverageKey"] = live["NameKey"] + "|" + live["Market"] + "|" + live["Line"].round(3).astype(str)
+    if out.empty:
+        existing = set()
+    else:
+        if "NameKey" not in out.columns:
+            out_players = out["Player"] if "Player" in out.columns else pd.Series("", index=out.index)
+            out["NameKey"] = out_players.map(normalize_name)
+        out_line = pd.to_numeric(out.get("Line"), errors="coerce")
+        out["_CoverageKey"] = out["NameKey"].astype(str) + "|" + out.get("Market", "").astype(str).str.upper() + "|" + out_line.round(3).astype(str)
+        existing = set(out["_CoverageKey"].dropna().astype(str))
+    missing = live[~live["_CoverageKey"].isin(existing)].copy()
+    if not missing.empty:
+        missing["Projection"] = np.nan
+        missing["Edge"] = np.nan
+        missing["Lean"] = "PASS"
+        missing["Official"] = "PASS"
+        missing["Tier"] = "TRACK"
+        missing["Projection Readiness"] = "BLOCKED"
+        missing["Projection Missing Inputs"] = "player line did not match a projection baseline"
+        missing["PASS Reason"] = "Projection readiness: player line did not match a projection baseline"
+        missing["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
+        missing["LineParserVersion"] = LINE_PARSER_VERSION
+        missing["Slate"] = mode
+        missing["SlateDate"] = str(slate_target_date(mode) or "ALL")
+        out = pd.concat([out, missing], ignore_index=True, sort=False)
+    out["Full Live Board Rows"] = int(len(live))
+    out["Projected Live Rows"] = int(pd.to_numeric(out.get("Projection"), errors="coerce").notna().sum())
+    out["Unprojected Live Rows"] = int(pd.to_numeric(out.get("Projection"), errors="coerce").isna().sum())
+    return out.drop(columns=["_CoverageKey"], errors="ignore")
+
+
 def make_projection_board(lines, logs, base, mode: Optional[str] = None):
     """Final projection authority; working Underdog pull remains unchanged."""
     board = _make_projection_board_v344_input(lines, logs, base, mode)
@@ -13807,6 +14019,9 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
     if board is not None and not board.empty:
         board = _reattach_line_audit_columns(board, lines)
         board = _attach_player_prop_slate_coverage(board, mode or "Today")
+        board = _attach_projection_data_readiness(board, logs, mode or "Today")
+    board = _ensure_full_live_board_coverage(board, lines, mode or "Today")
+    if board is not None and not board.empty:
         board["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
         board["LineParserVersion"] = LINE_PARSER_VERSION
         save_dataset("projection_board", board)
@@ -13861,9 +14076,23 @@ with tabs[1]:
     if bb.empty:
         st.warning("No projection board cached yet. Refresh a PTS/REB/AST/PRA board first.")
     else:
+        include_tracked = st.toggle(
+            "Include tracked/PASS rows",
+            value=False,
+            key="best_bets_include_tracked",
+            help="Best Bets normally shows only projection-ready OVER/UNDER candidates. The full live board remains available in Player Cards.",
+        )
         tier_options = sorted(bb.get("Tier", pd.Series(dtype=str)).dropna().unique().tolist())
         tier_filter = st.multiselect("Tier filter", tier_options, default=tier_options[:4] if tier_options else [])
         show = bb.copy()
+        if not include_tracked:
+            if "Projection Readiness" in show.columns:
+                show = show[show["Projection Readiness"].astype(str).str.upper().eq("READY")]
+            if "Lean" in show.columns:
+                show = show[show["Lean"].astype(str).str.upper().isin(["OVER", "UNDER"])]
+            if "Official" in show.columns:
+                blocked = show["Official"].astype(str).str.upper().isin(["PASS", "NO", "TRACK", ""])
+                show = show[~blocked]
         if tier_filter and "Tier" in show.columns:
             show = show[show["Tier"].isin(tier_filter)]
         sort_cols = [c for c in ["Official Play Score", "Edge"] if c in show.columns]
@@ -13879,7 +14108,7 @@ with tabs[1]:
         if card_view:
             for _, rr in show.head(40).iterrows():
                 render_card(rr)
-        display_cols = [c for c in ["Tier", "Official", "Clean Risk", "Playable Gate", "Winning Play Score", "Projection Engine Version", "LineParserVersion", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided", "Slate Player Prop Coverage", "Slate Missing From Player Props", "Opening Line", "CLV", "Projection", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+        display_cols = [c for c in ["Projection Readiness", "Projection Missing Inputs", "Projection Data Through", "Projection Data Age Days", "Player Games Available", "Player Last Game", "Full Live Board Rows", "Projected Live Rows", "Unprojected Live Rows", "Tier", "Official", "Clean Risk", "Playable Gate", "Winning Play Score", "Projection Engine Version", "LineParserVersion", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided", "Slate Player Prop Coverage", "Slate Missing From Player Props", "Opening Line", "CLV", "Projection", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
         st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
@@ -13901,18 +14130,13 @@ with tabs[3]:
         ml_board = filter_projection_board_for_slate(ml_board, ml_mode)
     if ml_board is None or ml_board.empty:
         st.warning(f"No {ml_mode.lower()} prop board is cached. Showing schedule-based Moneyline cards when that slate is available.")
-        render_wnba_ml_system(pd.DataFrame(), "moneyline_tab", mode=ml_mode)
+        ml_games = render_wnba_ml_system(pd.DataFrame(), "moneyline_tab", mode=ml_mode)
     else:
-        render_wnba_ml_system(ml_board, "moneyline_tab", mode=ml_mode)
-        ml_cols = [c for c in [
-            "Team", "Opponent", "Matchup", "WNBA ML Game Script", "Projected Team Score ML",
-            "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML",
-            "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML"
-        ] if c in ml_board.columns]
-        if ml_cols:
-            ml_view = ml_board[ml_cols].drop_duplicates().copy()
-            st.dataframe(ml_view, use_container_width=True, hide_index=True)
-            st.download_button("Download Moneyline/Game Script CSV", ml_view.to_csv(index=False), "wnba_moneyline_game_script.csv", "text/csv")
+        ml_games = render_wnba_ml_system(ml_board, "moneyline_tab", mode=ml_mode)
+    if ml_games is not None and not ml_games.empty:
+        st.markdown("#### Moneyline model output")
+        st.dataframe(ml_games, use_container_width=True, hide_index=True)
+        st.download_button("Download Moneyline/Game Script CSV", ml_games.to_csv(index=False), "wnba_moneyline_game_script.csv", "text/csv")
 
 with tabs[4]:
     st.subheader("Official + Grade")
@@ -13943,7 +14167,14 @@ with tabs[4]:
                     st.warning("No projection board cached yet. Refresh a market board first.")
                 else:
                     n = save_officials(board)
-                    st.success(f"Saved {n} real-line projections for tracking and grading.")
+                    saved_mode = str(st.session_state.get("wnba_current_mode", "Today"))
+                    snapshot_n = save_board_snapshot(
+                        board,
+                        st.session_state.get("wnba_lines_all", pd.DataFrame()),
+                        saved_mode,
+                    )
+                    st.session_state["wnba_prefer_projection_cache_after_refresh"] = False
+                    st.success(f"Saved {n} tracked plays and {snapshot_n} board rows. The saved slate will reload without refreshing.")
         with c2:
             grade_scope = st.selectbox("Grade scope", ["Today", "Tomorrow", "All pending"], index=0, key="grade_scope_after_results")
             if st.button("🏁 Pull final results + grade pending plays", use_container_width=True):
