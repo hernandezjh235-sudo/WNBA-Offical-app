@@ -33,8 +33,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.6.5 - Full Live Board Projection Authority"
+APP_VERSION = "WNBA v3.6.6 - Live Moneyline Feed Fixed"
 LINE_PARSER_VERSION = "UD_BASE_CARD_MAINLINE_V5"
+MONEYLINE_FEED_VERSION = "V366_UNDERDOG_FULL_GAME_SLATE_V1"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
 EMBEDDED_DATA_VERSION = "CORE_DATA_SELF_HEAL_V1"
 
@@ -75,6 +76,7 @@ CACHE_FILES = {
 SAVED_BOARD_FILE = DATA_DIR / "wnba_saved_board_snapshot.csv"
 SAVED_LINES_FILE = DATA_DIR / "wnba_saved_lines_snapshot.csv"
 SAVED_BOARD_META_FILE = LOCAL_DIR / "wnba_saved_board_meta.json"
+UNDERDOG_GAMES_CACHE_FILE = DATA_DIR / "wnba_underdog_games.csv"
 
 
 # Optional GitHub/raw cache support.
@@ -2448,20 +2450,27 @@ def fetch_underdog_board():
             "Raw Sample": str(raw)[:700],
         })
 
-    def append_row(player, team, market, line, raw, parser, order=999999, profile=None):
+    def append_row(player, team, market, line, raw, parser, order=999999, profile=None, game_ctx=None):
         if market not in MARKETS:
             return False
         if pd.isna(line):
             return False
         profile = profile or {}
+        game_ctx = game_ctx or {}
         rows.append({
             "Player": player,
             "Team": team,
-            "Opponent": "",
+            "Opponent": game_ctx.get("Opponent", ""),
+            "HomeAway": game_ctx.get("HomeAway", ""),
+            "Matchup": game_ctx.get("Matchup", ""),
             "Market": market,
             "Line": float(line),
             "Source": "Underdog",
-            "Start": "",
+            "Start": game_ctx.get("Start", ""),
+            "SlateDate": game_ctx.get("SlateDate", ""),
+            "GameID": game_ctx.get("GameID", ""),
+            "Event": game_ctx.get("Event", ""),
+            "MatchupSource": game_ctx.get("MatchupSource", ""),
             "Raw": str(raw)[:400],
             "Parser Mode": parser,
             "NameKey": normalize_name(player),
@@ -2504,6 +2513,67 @@ def fetch_underdog_board():
             continue
         objects = collect_objects(data)
         by_id = {get_id(o): o for o in objects if get_id(o)}
+
+        # The v6 feed exposes the exact player appearance -> game relationship.
+        # Keep that context on every prop row so Today/Tomorrow and Moneyline do
+        # not have to guess matchups from player names or a stale schedule CSV.
+        appearances_by_id = {
+            str(o.get("id")): o for o in (data.get("appearances", []) if isinstance(data, dict) else [])
+            if isinstance(o, dict) and o.get("id") not in [None, ""]
+        }
+        games_by_id = {
+            str(o.get("id")): o for o in (data.get("games", []) if isinstance(data, dict) else [])
+            if isinstance(o, dict) and o.get("id") not in [None, ""]
+        }
+
+        def game_context_for_line(line_obj, team_value=""):
+            if not isinstance(line_obj, dict):
+                return {}
+            over_under = line_obj.get("over_under")
+            if not isinstance(over_under, dict):
+                over_under = attr(line_obj).get("over_under")
+            appearance_stat = over_under.get("appearance_stat", {}) if isinstance(over_under, dict) else {}
+            appearance_id = str(appearance_stat.get("appearance_id") or "") if isinstance(appearance_stat, dict) else ""
+            appearance = appearances_by_id.get(appearance_id, {})
+            game_id = str(appearance.get("match_id") or "") if isinstance(appearance, dict) else ""
+            game = games_by_id.get(game_id, {})
+            if not isinstance(game, dict) or not game:
+                return {}
+            sport = str(game.get("sport_id") or game.get("sport_name") or "").upper()
+            if "WNBA" not in sport:
+                return {}
+            event = str(
+                game.get("abbreviated_title")
+                or game.get("title")
+                or game.get("full_team_names_title")
+                or game.get("short_title")
+                or ""
+            ).strip()
+            away, home = _parse_event_teams_from_text(event) if "_parse_event_teams_from_text" in globals() else ("", "")
+            if not away or not home:
+                return {}
+            team_key = _team_key_for_matchup(team_value) if "_team_key_for_matchup" in globals() else team_abbrev(team_value)
+            opponent = home if team_key == away else away if team_key == home else ""
+            home_away = "AWAY" if team_key == away else "HOME" if team_key == home else ""
+            start = str(game.get("scheduled_at") or ((game.get("scoreboard") or {}).get("scheduled_at")) or "")
+            slate_date = ""
+            if start:
+                try:
+                    start_ts = pd.to_datetime(start, errors="coerce", utc=True)
+                    if pd.notna(start_ts):
+                        slate_date = str(start_ts.tz_convert("America/Los_Angeles").date())
+                except Exception:
+                    slate_date = ""
+            return {
+                "Opponent": opponent,
+                "HomeAway": home_away,
+                "Matchup": f"{away} @ {home}",
+                "Start": start,
+                "SlateDate": slate_date,
+                "GameID": game_id,
+                "Event": event,
+                "MatchupSource": "Underdog game feed",
+            }
 
         line_objs = []
         for o in objects:
@@ -2551,7 +2621,11 @@ def fetch_underdog_board():
             if ACTIVE_TEAMS and resolved.get("Team") and resolved.get("Team") not in ACTIVE_TEAMS:
                 add_decode(raw_name, market, line, resolved, False, "matched player not on active schedule team", "relationship", raw)
                 continue
-            append_row(resolved["Player"], resolved.get("Team", ""), market, line, raw, "relationship", order=order, profile=profile)
+            game_ctx = game_context_for_line(lo, resolved.get("Team", ""))
+            append_row(
+                resolved["Player"], resolved.get("Team", ""), market, line, raw,
+                "relationship", order=order, profile=profile, game_ctx=game_ctx,
+            )
             add_decode(raw_name, market, line, resolved, True, f"{resolved.get('Reason', 'accepted')} | {profile.get('UD Line Kind')} | order {order} | base {profile.get('UD Base Score')}", "relationship", raw)
 
         # No recursive option fallback. It was useful for debugging but created bad lines
@@ -6094,7 +6168,7 @@ def kpi_card(label: str, value: Any, sub: str = ""):
 def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, strong: int = 0):
     st.markdown("""
     <div class='owp-hero'>
-      <div class='owp-title'>WNBA PROP ENGINE v3.6.5<br/>FULL LIVE BOARD + RANKED BEST BETS</div>
+      <div class='owp-title'>WNBA PROP ENGINE v3.6.6<br/>LIVE MONEYLINE FEED + FULL PLAYER BOARD</div>
       <div class='owp-subtitle'>Railway-safe load → Refresh only when clicked → Save every real-line projection → Grade</div>
     </div>
     """, unsafe_allow_html=True)
@@ -6676,7 +6750,9 @@ def slate_target_date(mode: str) -> Optional[date]:
 def line_start_date_series(df: pd.DataFrame) -> pd.Series:
     if df is None or df.empty or "Start" not in df.columns:
         return pd.Series([pd.NaT] * (0 if df is None else len(df)))
-    return pd.to_datetime(df["Start"], errors="coerce", utc=True).dt.tz_convert(None).dt.date
+    # Underdog stores UTC timestamps. Convert to the app/user slate timezone
+    # before taking the date so evening West Coast games do not become tomorrow.
+    return pd.to_datetime(df["Start"], errors="coerce", utc=True).dt.tz_convert("America/Los_Angeles").dt.date
 
 
 def _slate_team_set(mode: str) -> set:
@@ -9227,50 +9303,130 @@ def _simulate_wnba_game(team_row: pd.Series, opp_row: pd.Series, sims: int = 150
     }
 
 
-def _moneyline_pairs_from_schedule(mode: str = "Today") -> List[Dict[str, Any]]:
-    sched = pd.DataFrame()
-    target = slate_target_date(mode)
-    if target is not None and "fetch_espn_wnba_schedule_for_date" in globals():
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_underdog_wnba_schedule_feed() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Read the complete live WNBA game slate directly from Underdog.
+
+    Player props are not guaranteed for every game, so Moneyline must consume
+    the feed's `games` collection instead of trying to infer the slate only
+    from accepted player-line rows.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Underdog/1.0",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://underdogfantasy.com",
+        "Referer": "https://underdogfantasy.com/",
+    }
+    debug = []
+    for url in UNDERDOG_URLS:
         try:
-            live_sched, live_dbg = fetch_espn_wnba_schedule_for_date(target)
-            st.session_state["wnba_moneyline_schedule_debug"] = live_dbg
-            if live_sched is not None and not live_sched.empty:
-                sched = live_sched.copy()
+            response = requests.get(url, headers=headers, timeout=25)
+            if response.status_code != 200:
+                debug.append({"Source": "Underdog games", "URL": url, "Status": f"HTTP {response.status_code}", "Rows": 0})
+                continue
+            payload = response.json()
         except Exception as exc:
-            st.session_state["wnba_moneyline_schedule_error"] = str(exc)[:220]
-    if sched is None or sched.empty:
-        sched = schedule_for_slate(mode)
+            debug.append({"Source": "Underdog games", "URL": url, "Status": f"error: {str(exc)[:160]}", "Rows": 0})
+            continue
+
+        rows = []
+        games = payload.get("games", []) if isinstance(payload, dict) else []
+        for game in games:
+            if not isinstance(game, dict):
+                continue
+            sport = str(game.get("sport_id") or game.get("sport_name") or "").upper()
+            if "WNBA" not in sport:
+                continue
+            status = str(game.get("status") or "").lower()
+            if status in {"cancelled", "canceled", "postponed"}:
+                continue
+            event = str(
+                game.get("abbreviated_title")
+                or game.get("title")
+                or game.get("full_team_names_title")
+                or game.get("short_title")
+                or ""
+            ).strip()
+            away, home = _parse_event_teams_from_text(event)
+            if not away or not home or away == home:
+                continue
+            start_raw = str(game.get("scheduled_at") or ((game.get("scoreboard") or {}).get("scheduled_at")) or "")
+            start_local = pd.NaT
+            slate_date = ""
+            if start_raw:
+                try:
+                    start_utc = pd.to_datetime(start_raw, errors="coerce", utc=True)
+                    if pd.notna(start_utc):
+                        start_local = start_utc.tz_convert("America/Los_Angeles")
+                        slate_date = str(start_local.date())
+                except Exception:
+                    start_local = pd.NaT
+            rows.append({
+                "GameID": str(game.get("id") or ""),
+                "GameDate": start_local,
+                "SlateDate": slate_date,
+                "Away": away,
+                "Home": home,
+                "Matchup": f"{away} @ {home}",
+                "Source": "Underdog live games",
+                "Status": status or "scheduled",
+                "Event": event,
+            })
+        feed = pd.DataFrame(rows)
+        if not feed.empty:
+            feed = feed.drop_duplicates(subset=["GameID", "Away", "Home"], keep="last")
+            debug.append({"Source": "Underdog games", "URL": url, "Status": "ok", "Rows": len(feed)})
+            return feed.reset_index(drop=True), pd.DataFrame(debug)
+        debug.append({"Source": "Underdog games", "URL": url, "Status": "no WNBA games", "Rows": 0})
+    return pd.DataFrame(columns=["GameID", "GameDate", "SlateDate", "Away", "Home", "Matchup", "Source", "Status", "Event"]), pd.DataFrame(debug)
+
+
+def _moneyline_pairs_from_schedule(mode: str = "Today") -> List[Dict[str, Any]]:
+    schedule_frames = []
     target = slate_target_date(mode)
+
+    # Primary source: the Underdog game slate saved by the explicit Refresh
+    # button. Merely opening/changing tabs never performs another network pull.
     try:
-        sched_n = 0 if sched is None or sched.empty else len(sched)
-        if target == date(2026, 7, 28) and sched_n < 5:
-            fallback = pd.DataFrame([
-                {"GameDate": pd.Timestamp("2026-07-28 16:30:00"), "Away": "CON", "Home": "WAS", "Source": "verified fallback"},
-                {"GameDate": pd.Timestamp("2026-07-28 17:00:00"), "Away": "TOR", "Home": "MIN", "Source": "verified fallback"},
-                {"GameDate": pd.Timestamp("2026-07-28 18:30:00"), "Away": "IND", "Home": "SEA", "Source": "verified fallback"},
-                {"GameDate": pd.Timestamp("2026-07-28 19:00:00"), "Away": "NYL", "Home": "LAS", "Source": "verified fallback"},
-                {"GameDate": pd.Timestamp("2026-07-28 19:00:00"), "Away": "POR", "Home": "LVA", "Source": "verified fallback"},
-            ])
-            sched = fallback if sched is None or sched.empty else pd.concat([sched, fallback], ignore_index=True, sort=False)
-            sched = sched.drop_duplicates(subset=["Away", "Home"], keep="last")
-            st.session_state["wnba_moneyline_schedule_fallback"] = "Applied verified July 28 five-game slate fallback."
+        ud_sched = st.session_state.get("wnba_moneyline_games", pd.DataFrame())
+        if (ud_sched is None or ud_sched.empty) and UNDERDOG_GAMES_CACHE_FILE.exists():
+            ud_sched = pd.read_csv(UNDERDOG_GAMES_CACHE_FILE, low_memory=False)
+        if ud_sched is not None and not ud_sched.empty:
+            if target is not None and "SlateDate" in ud_sched.columns:
+                ud_sched = ud_sched[ud_sched["SlateDate"].astype(str).eq(str(target))].copy()
+            if not ud_sched.empty:
+                schedule_frames.append(ud_sched)
     except Exception as exc:
-        st.session_state["wnba_moneyline_schedule_fallback_error"] = str(exc)[:180]
+        st.session_state["wnba_moneyline_underdog_error"] = str(exc)[:220]
+
+    # Secondary source: the schedule cache already updated by the same Refresh.
+    if not schedule_frames:
+        cached = schedule_for_slate(mode)
+        if cached is not None and not cached.empty:
+            schedule_frames.append(cached.copy())
+
+    sched = pd.concat(schedule_frames, ignore_index=True, sort=False) if schedule_frames else pd.DataFrame()
     if sched is None or sched.empty:
         return []
     pairs = []
+    seen = set()
     for _, r in sched.iterrows():
         away = _team_key_for_matchup(r.get("Away"))
         home = _team_key_for_matchup(r.get("Home"))
         if not away or not home or away == home:
             continue
+        pair_key = tuple(sorted([away, home]))
+        if pair_key in seen:
+            continue
+        seen.add(pair_key)
         pairs.append({
-            "key": tuple(sorted([away, home])),
+            "key": pair_key,
             "team": away,
             "opp": home,
             "matchup": f"{away} @ {home}",
             "source": str(r.get("Source", "schedule") or "schedule"),
             "game_date": str(r.get("GameDate", ""))[:19],
+            "game_id": str(r.get("GameID", "") or ""),
         })
     return pairs
 
@@ -9425,8 +9581,17 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         st.warning("Team context is unavailable. Scheduled games are shown with league-average fallback ratings until team data refreshes.")
 
     schedule_pairs = _moneyline_pairs_from_schedule(mode)
-    line_pairs = _moneyline_pairs_from_lines(st.session_state.get("wnba_lines_all", pd.DataFrame()))
-    board_pairs = _moneyline_pairs_from_board(board_df)
+    ml_lines = st.session_state.get("wnba_lines_all", pd.DataFrame())
+    if ml_lines is not None and not ml_lines.empty and mode != "All Lines":
+        try:
+            ml_lines, _ = filter_lines_for_slate(ml_lines, mode)
+        except Exception:
+            pass
+    line_pairs = _moneyline_pairs_from_lines(ml_lines)
+    ml_board = board_df.copy() if board_df is not None else pd.DataFrame()
+    if ml_board is not None and not ml_board.empty and mode != "All Lines":
+        ml_board = filter_projection_board_for_slate(ml_board, mode)
+    board_pairs = _moneyline_pairs_from_board(ml_board)
     pairs = []
     seen = set()
     for p in schedule_pairs + line_pairs + board_pairs:
@@ -9436,7 +9601,21 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         seen.add(key)
         pairs.append(p)
     if not pairs:
-        st.info("No unique matchups found. Hit Refresh Everything Today so the app pulls today's schedule and lines.")
+        st.error(
+            f"No {mode.lower()} WNBA matchups were returned by Underdog, ESPN, the saved schedule, "
+            "or the current prop board. Open Moneyline coverage debug below for the source response."
+        )
+        with st.expander("Moneyline coverage debug", expanded=True):
+            st.write({
+                "slate": mode,
+                "line_rows": 0 if ml_lines is None else len(ml_lines),
+                "board_rows": 0 if ml_board is None else len(ml_board),
+                "underdog_error": st.session_state.get("wnba_moneyline_underdog_error", ""),
+                "espn_error": st.session_state.get("wnba_moneyline_schedule_error", ""),
+            })
+            ud_dbg = st.session_state.get("wnba_moneyline_underdog_debug", pd.DataFrame())
+            if ud_dbg is not None and not getattr(ud_dbg, "empty", True):
+                st.dataframe(ud_dbg, use_container_width=True, hide_index=True)
         return pd.DataFrame()
     if schedule_pairs:
         st.caption(f"Moneyline games: {len(pairs)} total ({len(schedule_pairs)} live/scheduled, {len(line_pairs)} from pulled lines, {len(board_pairs)} from prop board).")
@@ -9448,9 +9627,13 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
             "line_pairs": [p.get("matchup") for p in line_pairs],
             "board_pairs": [p.get("matchup") for p in board_pairs],
             "rendered_pairs": [p.get("matchup") for p in pairs],
+            "moneyline_feed_version": MONEYLINE_FEED_VERSION,
             "schedule_error": st.session_state.get("wnba_moneyline_schedule_error", ""),
-            "schedule_fallback": st.session_state.get("wnba_moneyline_schedule_fallback", ""),
+            "underdog_error": st.session_state.get("wnba_moneyline_underdog_error", ""),
         })
+        ud_dbg = st.session_state.get("wnba_moneyline_underdog_debug", pd.DataFrame())
+        if ud_dbg is not None and not getattr(ud_dbg, "empty", True):
+            st.dataframe(ud_dbg, use_container_width=True, hide_index=True)
         dbg = st.session_state.get("wnba_moneyline_schedule_debug", pd.DataFrame())
         if dbg is not None and not getattr(dbg, "empty", True):
             st.dataframe(dbg, use_container_width=True, hide_index=True)
@@ -9507,6 +9690,7 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
             "Game Pace": round(safe_float(sim.get("Sim Pace"), pace), 1),
             "Blowout Risk": round(blowout, 1),
             "Simulation Count": int(safe_float(sim.get("Sim Count"), WNBA_MONTE_CARLO_SIMS)),
+            "Moneyline Feed Version": MONEYLINE_FEED_VERSION,
             "Matchup Source": str(p.get("source", "schedule")),
             "Away Context": str(ar.get("Moneyline Context", "team data")),
             "Home Context": str(br.get("Moneyline Context", "team data")),
@@ -10167,7 +10351,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v3.6.5 - Full Live Board Projection Authority"
+APP_VERSION = "WNBA v3.6.6 - Live Moneyline Feed Fixed"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -11708,7 +11892,7 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v3.6.5 - Full Live Board Projection Authority"
+APP_VERSION = "WNBA v3.6.6 - Live Moneyline Feed Fixed"
 PROJECTION_ENGINE_VERSION = "V365_FULL_LIVE_BOARD_PROJECTION_V1"
 PROJECTION_ENGINE_NOTE = "Bayesian L5/L10/L20/season baseline + bounded minutes once + verified matchup once + small market shrink; later context is audit-only."
 
@@ -12316,6 +12500,23 @@ def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd
         status["Schedule Loaded"] = "YES" if status["Games"] else "NO/CACHED"
         st.session_state["wnba_schedule_debug"] = sched_dbg
         try:
+            fetch_underdog_wnba_schedule_feed.clear()
+        except Exception:
+            pass
+        try:
+            ml_games, ml_games_dbg = fetch_underdog_wnba_schedule_feed()
+            st.session_state["wnba_moneyline_games"] = ml_games
+            st.session_state["wnba_moneyline_underdog_debug"] = ml_games_dbg
+            status["Moneyline Games"] = 0 if ml_games is None or ml_games.empty else len(ml_games)
+            if ml_games is not None and not ml_games.empty:
+                UNDERDOG_GAMES_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                ml_games.to_csv(UNDERDOG_GAMES_CACHE_FILE, index=False)
+                status["Moneyline Source"] = "Underdog full game feed"
+            else:
+                status["Moneyline Source"] = "no live Underdog games; saved schedule fallback"
+        except Exception as exc:
+            status["Moneyline Warning"] = str(exc)[:180]
+        try:
             game_ctx, game_dbg = build_game_context_cache(mode, force_official=True)
             daily_ctx, daily_dbg = build_daily_team_context_cache_v2(mode, force=True)
             status["Game Context Rows"] = 0 if game_ctx is None or game_ctx.empty else len(game_ctx)
@@ -12442,7 +12643,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v3.6.5 - Full Live Board Projection Authority"
+APP_VERSION = "WNBA v3.6.6 - Live Moneyline Feed Fixed"
 PROJECTION_ENGINE_VERSION = "V365_FULL_LIVE_BOARD_PROJECTION_V1"
 PROJECTION_ENGINE_NOTE = (
     "Each market uses its own workload-adjusted true-recent baseline plus L5/L10/L20/season "
@@ -14245,7 +14446,16 @@ with tabs[6]:
             st.caption("Automatically creates player season stats and rosters from cached game logs/master features when the repository files are missing. The Underdog line pull is untouched.")
             st.dataframe(embedded_report, use_container_width=True)
     st.markdown("### Aggregated real lines")
-    lines, ud_debug, sl_debug = get_lines_from_state_or_pull(use_ud, False, False, "")
+    lines = st.session_state.get("wnba_lines_all", pd.DataFrame())
+    if (lines is None or lines.empty) and SAVED_LINES_FILE.exists():
+        try:
+            lines = pd.read_csv(SAVED_LINES_FILE, low_memory=False)
+        except Exception:
+            lines = pd.DataFrame()
+    ud_debug = st.session_state.get("wnba_ud_debug", pd.DataFrame())
+    sl_debug = st.session_state.get("wnba_sl_debug", pd.DataFrame())
+    if lines is None or lines.empty:
+        st.info("No line pull is cached. Use the top Refresh button; Debug/Status does not pull automatically.")
     render_source_status_card(lines, ud_debug, sl_debug, False, "")
     st.dataframe(lines, use_container_width=True)
     st.markdown("### Underdog debug")
