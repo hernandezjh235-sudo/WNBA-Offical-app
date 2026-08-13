@@ -13,6 +13,7 @@ Line-source build:
 """
 
 import os
+import sys
 import re
 import io
 import json
@@ -24,6 +25,7 @@ import hashlib
 import difflib
 import unicodedata
 import html
+import logging
 from pathlib import Path
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Tuple, Optional, Any
@@ -33,7 +35,22 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA v3.6.6 - Live Moneyline Feed Fixed"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from wnba_hhs import HHSRepository, attach_model_comparison
+from wnba_hhs.evaluation import (
+    calibration_table as hhs_calibration_table,
+    diagnose_misses as hhs_diagnose_misses,
+    model_evaluation_rows,
+    summarize_models as summarize_hhs_models,
+    validated_hybrid_recommendations,
+)
+from wnba_hhs.schema import DATASET_KEYS
+from wnba_hhs.snapshots import ProjectionSnapshotStore
+
+APP_VERSION = "WNBA v4.0.0 - Legacy + HHS Challenger"
 LINE_PARSER_VERSION = "UD_BASE_CARD_MAINLINE_V5"
 MONEYLINE_FEED_VERSION = "V366_UNDERDOG_FULL_GAME_SLATE_V1"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
@@ -42,7 +59,7 @@ EMBEDDED_DATA_VERSION = "CORE_DATA_SELF_HEAL_V1"
 # ============================================================
 # Storage
 # ============================================================
-LOCAL_DIR = Path("wnba_engine")
+LOCAL_DIR = Path(os.environ.get("WNBA_PERSISTENT_DIR", "wnba_engine"))
 LOCAL_DIR.mkdir(exist_ok=True)
 DATA_DIR = LOCAL_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -415,6 +432,17 @@ def save_board_snapshot(board_df: pd.DataFrame, lines_df: Optional[pd.DataFrame]
             "Markets": sorted(out["Market"].astype(str).str.upper().dropna().unique().tolist()) if "Market" in out.columns else [],
             "LineParserVersion": LINE_PARSER_VERSION,
         }
+        try:
+            batch_id, snapshot_rows = ProjectionSnapshotStore(
+                LOCAL_DIR / "wnba_projection_history.sqlite3"
+            ).save(out, mode=mode)
+            meta["ImmutableSnapshotBatch"] = batch_id
+            meta["ImmutableSnapshotRows"] = snapshot_rows
+        except Exception as exc:
+            logging.getLogger("wnba.snapshots").warning(
+                "Immutable projection snapshot failed: %s", exc
+            )
+            meta["ImmutableSnapshotError"] = str(exc)[:240]
         save_json(SAVED_BOARD_META_FILE, meta)
         return int(len(out))
     except Exception:
@@ -1598,6 +1626,7 @@ def _enrich_master_with_embedded_core(season_df: pd.DataFrame, roster_df: pd.Dat
     return len(m)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def ensure_embedded_core_cache_files() -> pd.DataFrame:
     """Self-heal the two optional core datasets from already bundled caches.
 
@@ -4657,6 +4686,7 @@ def grade_pending(logs, mode: Optional[str] = None, allowed_dates: Optional[List
         played = _grade_bool(stat_row.get("Played"), minutes > 0)
         if dnp or (source.lower().startswith(("espn", "wnba")) and not played and minutes <= 0):
             row["Actual"] = None
+            row["ActualMinutes"] = round(float(minutes), 2)
             row["ActualGameDate"] = str(target_date or stat_row.get("GameDate"))
             row["Result"] = "VOID"
             row["GradedAt"] = now_iso()
@@ -4682,6 +4712,13 @@ def grade_pending(logs, mode: Optional[str] = None, allowed_dates: Optional[List
         push = abs(actual - line) < 1e-9
         win = (actual > line and lean == "OVER") or (actual < line and lean == "UNDER")
         row["Actual"] = round(float(actual), 2)
+        row["ActualMinutes"] = round(float(minutes), 2)
+        projected_value = safe_float(row.get("Projection"), np.nan)
+        projected_minutes = safe_float(row.get("HHS Projected Minutes"), safe_float(row.get("MIN Proj"), np.nan))
+        row["ProjectionError"] = round(projected_value - actual, 2) if pd.notna(projected_value) else None
+        row["LineError"] = round(actual - line, 2)
+        row["MinutesError"] = round(projected_minutes - minutes, 2) if pd.notna(projected_minutes) else None
+        row["ModelAtSave"] = row.get("Active Model", "LEGACY")
         row["ActualGameDate"] = str(target_date or stat_row.get("GameDate"))
         row["Result"] = "PUSH" if push else "WIN" if win else "LOSS"
         row["GradedAt"] = now_iso()
@@ -4697,6 +4734,10 @@ def grade_pending(logs, mode: Optional[str] = None, allowed_dates: Optional[List
 
     save_json(OFFICIAL_LOG, official)
     save_json(LEARNING_LOG, learn)
+    try:
+        ProjectionSnapshotStore(LOCAL_DIR / "wnba_projection_history.sqlite3").grade_from_records(official)
+    except Exception as exc:
+        logging.getLogger("wnba.snapshots").warning("Snapshot result mirror failed: %s", exc)
     return updated
 
 
@@ -5676,13 +5717,10 @@ def derive_real_team_context_from_logs_schedule(logs: pd.DataFrame, schedules: p
         g["PointsAllowed"] = np.nan
     # Convert points allowed per game to DRtg using estimated team possessions/game.
     g["DRtg"] = np.where(g["Pace"] > 0, 100 * g["PointsAllowed"] / g["Pace"], np.nan)
-    # If schedule data absent, center DRtg around ORtg median but keep team variation using ORtg.
-    if g["DRtg"].isna().all():
-        med_o = g["ORtg"].dropna().median()
-        g["DRtg"] = med_o if pd.notna(med_o) else 100.0
-    else:
-        med_d = g["DRtg"].dropna().median()
-        g["DRtg"] = g["DRtg"].fillna(med_d if pd.notna(med_d) else 100.0)
+    # Missing defense stays missing. The final matchup gate treats it as a
+    # documented neutral fallback instead of disguising one league-average
+    # value as verified opponent-specific context.
+    g["TeamContextFallbackUsed"] = g["DRtg"].isna()
     g["NetRtg"] = g["ORtg"] - g["DRtg"]
     return g[["Season", "Team", "Pace", "ORtg", "DRtg", "NetRtg", "PointsAllowed"]].copy()
 
@@ -5908,6 +5946,9 @@ def inject_css():
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;800;900&display=swap');
     html, body, [class*="css"] {font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif;}
+    html, body, .stApp {max-width:100%; overflow-x:hidden;}
+    [data-testid="stDataFrame"] {max-width:100%; overflow:auto;}
+    p, span, label, div {overflow-wrap:anywhere;}
     .stApp { background: radial-gradient(circle at top,#2b0f55 0,#14051f 42%,#050509 100%); color:#f7f7ff; }
     section[data-testid="stSidebar"] { background:#090712; border-right:1px solid rgba(179,113,255,.28); }
     .block-container { padding-top: 1.2rem; max-width: 1240px; }
@@ -5944,6 +5985,9 @@ def inject_css():
       .owp-kpi-card {min-height:110px; padding:16px;}
       .owp-kpi-value {font-size:2.2rem;}
       .block-container {padding-left:1rem; padding-right:1rem;}
+      .stButton>button, .stDownloadButton>button {min-height:44px; width:100%;}
+      .stTabs [data-baseweb="tab-list"] {overflow-x:auto; gap:12px;}
+      div[data-testid="stMetricValue"] {font-size:1.75rem!important;}
     }
 
     /* ===== Clean WNBA player cards inspired by the MLB card, purple theme ===== */
@@ -6168,7 +6212,7 @@ def kpi_card(label: str, value: Any, sub: str = ""):
 def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, strong: int = 0):
     st.markdown("""
     <div class='owp-hero'>
-      <div class='owp-title'>WNBA PROP ENGINE v3.6.6<br/>LIVE MONEYLINE FEED + FULL PLAYER BOARD</div>
+      <div class='owp-title'>WNBA PROP ENGINE v4.0.0<br/>LEGACY + HHS CHALLENGER</div>
       <div class='owp-subtitle'>Railway-safe load → Refresh only when clicked → Save every real-line projection → Grade</div>
     </div>
     """, unsafe_allow_html=True)
@@ -9026,13 +9070,13 @@ def render_fast_projection_rows(proj_df: pd.DataFrame) -> None:
     .owp-fast-edge{font-size:1.08rem;font-weight:900}.owp-fast-edge.positive{color:#35d167}.owp-fast-edge.negative{color:#ff4b4b}.owp-fast-edge.flat{color:#8591a3}
     .owp-fast-pick{text-align:center}.owp-fast-pick b{display:block;font-size:1.02rem;font-weight:900}.owp-fast-pick span{display:block;font-size:.78rem;margin-top:4px}.owp-fast-pick.over{color:#35d167}.owp-fast-pick.under{color:#258de8}.owp-fast-pick.pass{color:#94a3b8}
     .owp-fast-over{display:grid;grid-template-columns:minmax(54px,1fr) auto;gap:8px;align-items:center}.owp-fast-over>div{height:7px;background:#1b2632;border-radius:999px;overflow:hidden}.owp-fast-over i{display:block;height:100%;background:#20ad52;border-radius:999px}.owp-fast-over b{color:#7c899a;font-size:.8rem}.owp-fast-over span{grid-column:1/-1;color:#39475a;font-size:.66rem;white-space:nowrap}
-    @media(max-width:700px){.owp-fast-board{overflow-x:auto}.owp-fast-head,.owp-fast-row{min-width:760px;grid-template-columns:220px 70px 80px 80px 90px 125px;padding-left:16px;padding-right:16px;gap:12px}}
+    @media(max-width:700px){.owp-fast-board{overflow-x:hidden}.owp-fast-head{display:none}.owp-fast-row{min-width:0;grid-template-columns:repeat(3,minmax(0,1fr));padding:14px;gap:10px}.owp-fast-player{grid-column:1/-1}.owp-fast-proj,.owp-fast-pick{text-align:left}.owp-fast-over{grid-column:1/-1}.owp-fast-over span{white-space:normal}}
     </style>
     <div class='owp-fast-board'><div class='owp-fast-head'><span>Player</span><span>Prop</span><span>Proj</span><span>Edge</span><span>Pick</span><span>Over %</span></div>
     """ + "".join(rows) + "</div>"
     st.markdown(markup, unsafe_allow_html=True)
 
-def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: str, default_cards: bool = False) -> pd.DataFrame:
+def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: str, default_cards: bool = True) -> pd.DataFrame:
     """Fast display switcher. Table mode avoids rendering dozens of heavy HTML cards."""
     if proj_df is None or proj_df.empty:
         st.info("No rows to show.")
@@ -9742,7 +9786,7 @@ def _render_grouped_projection_df(proj_df: pd.DataFrame, mode: str, search_key: 
         st.info(f"No {mode.lower()} projection rows in the current cache. Use the refresh button for that slate, or open All Lines.")
         return pd.DataFrame()
     key_prefix = f"saved_group_{mode}" if saved_view else f"live_group_{mode}"
-    return render_grouped_table_or_cards(proj_df, mode, key_prefix, default_cards=False)
+    return render_grouped_table_or_cards(proj_df, mode, key_prefix, default_cards=True)
 
 
 
@@ -10351,7 +10395,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v3.6.6 - Live Moneyline Feed Fixed"
+APP_VERSION = "WNBA v4.0.0 - Legacy + HHS Challenger"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -11892,7 +11936,7 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v3.6.6 - Live Moneyline Feed Fixed"
+APP_VERSION = "WNBA v4.0.0 - Legacy + HHS Challenger"
 PROJECTION_ENGINE_VERSION = "V365_FULL_LIVE_BOARD_PROJECTION_V1"
 PROJECTION_ENGINE_NOTE = "Bayesian L5/L10/L20/season baseline + bounded minutes once + verified matchup once + small market shrink; later context is audit-only."
 
@@ -12413,6 +12457,142 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
     return board
 
 
+def render_hhs_model_tab() -> None:
+    """Authorized HHS import, diagnostics, and legacy/challenger comparison."""
+    repository = HHSRepository()
+    coverage = repository.coverage()
+    st.subheader("Her Hoop Stats / Model Comparison")
+    st.caption(
+        "Legacy remains the active production model. HHS and Hybrid are challenger outputs only; "
+        "the app never crawls subscriber pages or promotes an unvalidated blend."
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("HHS datasets", f"{coverage['datasets_available']}/{coverage['datasets_expected']}")
+    c2.metric("HHS rows", f"{coverage['rows_loaded']:,}")
+    c3.metric("Last HHS refresh", coverage["last_refresh"] or "not loaded")
+    c4.metric("Active model", "LEGACY")
+
+    data_tab, compare_tab, evaluation_tab, diagnostics_tab = st.tabs(
+        ["HHS Data", "Model Compare", "Evaluation", "Diagnostics"]
+    )
+    with data_tab:
+        st.info(
+            "Import an HHS CSV/Parquet/XLSX/JSON export that you are authorized to use. "
+            "Missing or rejected data leaves the last good cache and legacy app untouched."
+        )
+        dataset = st.selectbox(
+            "HHS dataset type",
+            list(DATASET_KEYS),
+            format_func=lambda value: value.replace("hhs_", "").replace("_", " ").title(),
+            key="hhs_dataset_type",
+        )
+        upload = st.file_uploader(
+            "Authorized HHS export",
+            type=["csv", "parquet", "xlsx", "xls", "json"],
+            key="hhs_authorized_upload",
+        )
+        if st.button("Import validated HHS export", disabled=upload is None, use_container_width=True):
+            report = repository.import_bytes(dataset, upload.getvalue(), upload.name)
+            st.dataframe(pd.DataFrame([report.as_dict()]), use_container_width=True, hide_index=True)
+            if report.ok:
+                st.success(f"Imported {report.rows_valid:,} validated rows into {dataset}.")
+                st.cache_data.clear()
+            else:
+                st.error("Import rejected. The last successful HHS cache was preserved.")
+        configured = bool(repository.config.structured_base_url)
+        st.caption(
+            "Optional structured endpoint: set HHS_STRUCTURED_DATA_BASE_URL to an authorized "
+            "manifest folder and HHS_API_TOKEN when required. Direct HHS HTML crawling is blocked."
+        )
+        if st.button("Refresh authorized structured endpoint", disabled=not configured, use_container_width=True):
+            with st.spinner("Refreshing authorized structured HHS exports..."):
+                refresh_report = repository.refresh_structured_endpoint()
+            st.dataframe(refresh_report, use_container_width=True, hide_index=True)
+            st.cache_data.clear()
+        cache_zip = repository.export_cache_zip()
+        if cache_zip:
+            st.download_button(
+                "Download HHS cache backup",
+                cache_zip,
+                "wnba_hhs_cache_backup.zip",
+                "application/zip",
+                use_container_width=True,
+            )
+
+    with compare_tab:
+        board = load_dataset("projection_board")
+        if board is None or board.empty:
+            st.info("No projection board is cached yet.")
+        else:
+            if "Model Comparison Version" not in board.columns:
+                try:
+                    board = attach_model_comparison(board, repository=repository, simulations=10_000)
+                except Exception as exc:
+                    st.error(f"HHS comparison unavailable; legacy board remains active: {exc}")
+            columns = [
+                "Player", "Team", "Opponent", "Market", "Line", "Active Model",
+                "Legacy Projection", "HHS Projection", "HHS P50", "Hybrid Projection",
+                "HHS Over %", "HHS Under %", "HHS Direction", "HHS Confidence Tier",
+                "HHS Data Quality", "HHS Projected Minutes", "HHS Minutes Confidence",
+                "HHS Matchup Score", "HHS Distribution Conflict", "Model Agreement Count",
+                "HHS Model Status", "Hybrid Status",
+            ]
+            display = board[[column for column in columns if column in board.columns]].copy()
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download Legacy vs HHS vs Hybrid CSV",
+                board.to_csv(index=False),
+                "wnba_legacy_hhs_hybrid_comparison.csv",
+                "text/csv",
+                use_container_width=True,
+            )
+
+    with evaluation_tab:
+        graded = pd.DataFrame(load_json(LEARNING_LOG, []))
+        evaluation_rows = model_evaluation_rows(graded)
+        if evaluation_rows.empty:
+            st.info(
+                "No same-slate graded HHS snapshots are available yet. Save boards before games, "
+                "grade the exact snapshots, and return here to compare models."
+            )
+        else:
+            summary = summarize_hhs_models(evaluation_rows)
+            st.markdown("#### Same-slate model metrics")
+            st.dataframe(summary, use_container_width=True, hide_index=True)
+            calibration = hhs_calibration_table(evaluation_rows)
+            st.markdown("#### Probability calibration")
+            st.dataframe(calibration, use_container_width=True, hide_index=True)
+            recommendations = validated_hybrid_recommendations(evaluation_rows)
+            st.markdown("#### Hybrid holdout validation")
+            st.dataframe(recommendations, use_container_width=True, hide_index=True)
+            st.caption(
+                "Recommendations use a chronological train/holdout split and are not promoted automatically."
+            )
+            misses = hhs_diagnose_misses(evaluation_rows)
+            with st.expander("Miss diagnosis queue", expanded=False):
+                st.dataframe(misses, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download model evaluation rows",
+                evaluation_rows.to_csv(index=False),
+                "wnba_model_evaluation_rows.csv",
+                "text/csv",
+                use_container_width=True,
+            )
+
+    with diagnostics_tab:
+        st.markdown("#### HHS cache diagnostics")
+        st.dataframe(repository.diagnostics(), use_container_width=True, hide_index=True)
+        match_path = repository.config.root / "hhs_player_match_diagnostics.csv"
+        if match_path.exists():
+            st.markdown("#### Player identity diagnostics")
+            st.dataframe(pd.read_csv(match_path, low_memory=False), use_container_width=True, hide_index=True)
+        store = ProjectionSnapshotStore(LOCAL_DIR / "wnba_projection_history.sqlite3")
+        st.markdown("#### Immutable projection batches")
+        st.dataframe(store.list_batches(), use_container_width=True, hide_index=True)
+        if coverage["last_error"]:
+            st.warning(f"Last HHS error: {coverage['last_error']}")
+
+
 def _stable_load_or_repair_cached_board(mode: str, base: Optional[pd.DataFrame]) -> tuple:
     board, label = _load_last_good_projection_board(mode)
     if board is None or board.empty:
@@ -12425,6 +12605,13 @@ def _stable_load_or_repair_cached_board(mode: str, base: Optional[pd.DataFrame])
             label = f"repaired {label}"
         except Exception as exc:
             st.session_state["wnba_projection_cache_repair_error"] = str(exc)[:220]
+    elif "Model Comparison Version" not in board.columns:
+        try:
+            board = attach_model_comparison(board, repository=HHSRepository(), simulations=10_000)
+            board.to_csv(CACHE_FILES["projection_board"], index=False)
+            label = f"HHS-enriched {label}"
+        except Exception as exc:
+            st.session_state["wnba_hhs_cache_enrich_error"] = str(exc)[:220]
     return board, label
 
 
@@ -12643,7 +12830,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v3.6.6 - Live Moneyline Feed Fixed"
+APP_VERSION = "WNBA v4.0.0 - Legacy + HHS Challenger"
 PROJECTION_ENGINE_VERSION = "V365_FULL_LIVE_BOARD_PROJECTION_V1"
 PROJECTION_ENGINE_NOTE = (
     "Each market uses its own workload-adjusted true-recent baseline plus L5/L10/L20/season "
@@ -13773,6 +13960,8 @@ def _strict_attach_opponent_context(board: pd.DataFrame, mode: Optional[str] = N
         baseline_ok = all(pd.notna(safe_float(rr.get(c), np.nan)) for c in ["L5 Avg", "L10 Avg", "Season Avg"])
         minutes_ok = pd.notna(safe_float(rr.get("MIN Proj"), np.nan))
         context_ok = bool(opp) and pd.notna(pace) and pd.notna(drtg)
+        out.at[idx, "Opponent Context Fallback Used"] = not context_ok
+        out.at[idx, "Opponent Context Source"] = "team cache / derived logs" if context_ok else "neutral missing-data fallback"
         if baseline_ok and minutes_ok and context_ok:
             out.at[idx, "Data Integrity"] = "VERIFIED"
             out.at[idx, "Data Integrity Score"] = 100.0
@@ -13998,6 +14187,7 @@ def _stable_repair_projection_board(board: pd.DataFrame, base: Optional[pd.DataF
     fixed = _stable_attach_context_audit_only(fixed, base)
     fixed = _strong_trust_enrich_board(fixed, mode)
     fixed = _apply_full_winning_play_stack(fixed, base, mode)
+    fixed = attach_model_comparison(fixed, repository=HHSRepository(), simulations=10_000)
     fixed["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
     fixed["LineParserVersion"] = LINE_PARSER_VERSION
     return fixed
@@ -14223,6 +14413,14 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
         board = _attach_projection_data_readiness(board, logs, mode or "Today")
     board = _ensure_full_live_board_coverage(board, lines, mode or "Today")
     if board is not None and not board.empty:
+        legacy_projection = pd.to_numeric(board["Projection"], errors="coerce").copy()
+        board = attach_model_comparison(board, repository=HHSRepository(), simulations=10_000)
+        if not np.allclose(
+            pd.to_numeric(board["Projection"], errors="coerce"),
+            legacy_projection,
+            equal_nan=True,
+        ):
+            raise RuntimeError("HHS challenger changed the legacy Projection column")
         board["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
         board["LineParserVersion"] = LINE_PARSER_VERSION
         save_dataset("projection_board", board)
@@ -14250,7 +14448,7 @@ except Exception as _stable_startup_exc:
     st.session_state["wnba_stable_startup_repair_error"] = str(_stable_startup_exc)[:240]
 
 
-tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Moneyline", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports"])
+tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Moneyline", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports", "HHS / Models"])
 
 with tabs[0]:
     st.markdown("<div class='section-title'>PLAYER CARDS / Grouped Markets</div>", unsafe_allow_html=True)
@@ -14581,3 +14779,6 @@ with tabs[7]:
         with st.expander("Backtest rows", expanded=False):
             st.dataframe(bt.tail(1000), use_container_width=True)
             st.download_button("Download full backtest rows CSV", bt.to_csv(index=False), "wnba_backtest_rows.csv", "text/csv")
+
+with tabs[8]:
+    render_hhs_model_tab()
