@@ -12,6 +12,30 @@ Line-source build:
 - Projection engine still runs from the SportsDataverse database even when lines are manual.
 """
 
+
+# APP 120 ELITE ROLE-BUDGET V3 CHANGES
+# - Legacy projection is locked for clean A/B testing.
+# - Current-season player/shot/starter/opponent features are isolated from prior seasons.
+# - Prior-year production is explicit *_prior data only.
+# - Calibration uses the probability of the selected side.
+# - Data Installer derived team opponent/recent tables are accepted.
+# - PTS V2 challenger allocates a team FGA/FTA budget across an inferred 200-minute rotation,
+#   then projects 2PA/3PA/FTA scoring and reconciles to the expected team total.
+# - REB remains legacy/protected in production; App118 adds REB/AST opportunity challengers for agreement and ranking.
+# - Elite Role Budget models the game first, then team opportunity pools, then player roles.
+# - Best Plays receives a full-board 1-200 rank with correlation/risk penalties instead of trusting raw edge alone.
+# - Injury vacancy redistribution is role-aware: missing bigs preferentially move minutes/rebounds to bigs, missing creators move assists/touches to creators, and missing scorers move shot share to the strongest active scoring roles.
+# - Market Role Fit is explicit and feeds Best Plays ranking (PTS=scoring role, REB=rebound role, AST=creation role, PRA=combined role fit).
+# - Team player-point sums reconcile to the game-level team score when the required normalization is sane; extreme reconciliation is flagged instead of hidden.
+# - Moneyline score math rejects implausible ORtg/DRtg inputs and no longer treats a hard-coded total line as real market data.
+# - Moneyline now uses the Elite injury/rotation-adjusted score environment when available and shrinks stale-data confidence toward 50%.
+# - App120 hard-gates critically stale active-season data from Best Plays instead of allowing stale inputs to look ELITE.
+# - Role labels are hierarchy-aware: each team has one primary scorer/creator/rebounder, with explicit secondary/support roles.
+# - Best Plays ranks only projection-ready OVER/UNDER candidates; PASS/TRACK rows no longer consume #1-#200 slots.
+# - Agreement scoring downweights correlated Monte Carlo/PTS-V2 votes so pseudo-confirmation cannot inflate confidence.
+# - Raw edge is capped as supporting evidence; larger edges cannot outrank better-calibrated, better-role, fresher plays by themselves.
+# - Same-player PTS/PRA and same-team scoring-over concentration receive stronger correlation penalties.
+
 import os
 import sys
 import re
@@ -75,9 +99,9 @@ from wnba_hhs.evaluation import (
 from wnba_hhs.schema import DATASET_KEYS
 from wnba_hhs.snapshots import ProjectionSnapshotStore
 
-APP_VERSION = "WNBA v4.1.0 - Single File Pacific Slate + Auto HHS Challenger"
+APP_VERSION = "WNBA v4.4.0 - App120 Elite Role Budget V3 + Ranked Plays"
 LINE_PARSER_VERSION = "UD_BASE_CARD_MAINLINE_V5"
-MONEYLINE_FEED_VERSION = "V366_UNDERDOG_FULL_GAME_SLATE_V1"
+MONEYLINE_FEED_VERSION = "V367_UNDERDOG_GAME_SLATE_ELITE_INJURY_FRESHNESS"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
 EMBEDDED_DATA_VERSION = "CORE_DATA_SELF_HEAL_V1"
 APP_TIMEZONE_NAME = str(os.environ.get("WNBA_APP_TIMEZONE", "America/Los_Angeles") or "America/Los_Angeles").strip()
@@ -117,6 +141,9 @@ CACHE_FILES = {
     "player_season_stats": DATA_DIR / "wnba_player_season_stats.csv",
     "team_season_stats": DATA_DIR / "wnba_team_season_stats.csv",
     "team_ranks": DATA_DIR / "wnba_team_ranks.csv",
+    "team_opponent_stats": DATA_DIR / "wnba_team_opponent_stats.csv",
+    "team_recent_stats": DATA_DIR / "wnba_team_recent_stats.csv",
+    "data_manifest": DATA_DIR / "wnba_data_manifest.csv",
     "schedules": DATA_DIR / "wnba_schedules.csv",
     "rosters": DATA_DIR / "wnba_rosters.csv",
     "game_rosters": DATA_DIR / "wnba_game_rosters.csv",
@@ -693,6 +720,14 @@ def classify_filename(name: str) -> Optional[str]:
         "wnba_player_season_stats.csv": "player_season_stats",
         "wnba_team_season_stats.csv": "team_season_stats",
         "wnba_team_ranks.csv": "team_ranks",
+        "wnba_team_opponent_stats.csv": "team_opponent_stats",
+        "wnba_team_opponent_stats_2026.csv": "team_opponent_stats",
+        "wnba_team_recent_stats.csv": "team_recent_stats",
+        "wnba_data_manifest.csv": "data_manifest",
+        "wnba_player_season_stats_2026.csv": "player_season_stats",
+        "wnba_team_season_stats_2026.csv": "team_season_stats",
+        "wnba_team_ranks_2026.csv": "team_ranks",
+        "wnba_rosters_current_2026.csv": "rosters",
         "wnba_schedules.csv": "schedules",
         "wnba_rosters.csv": "rosters",
         "wnba_game_rosters.csv": "game_rosters",
@@ -709,6 +744,12 @@ def classify_filename(name: str) -> Optional[str]:
         return "player_season_stats"
     if "team_season" in n:
         return "team_season_stats"
+    if "team_opponent" in n:
+        return "team_opponent_stats"
+    if "team_recent" in n:
+        return "team_recent_stats"
+    if "data_manifest" in n:
+        return "data_manifest"
     if "team_rank" in n:
         return "team_ranks"
     if "master_feature" in n:
@@ -1180,15 +1221,26 @@ def standardize_rosters(df: pd.DataFrame) -> pd.DataFrame:
     team_col = find_col(d, ["TEAM", "team", "team_abbreviation", "team_name", "team_short_display_name"])
     pos_col = find_col(d, ["position", "pos", "athlete_position", "display_position"])
     season_col = find_col(d, ["season", "year"])
+    current_col = find_col(d, ["CurrentInCache", "current_in_cache", "current", "is_current"])
+    latest_col = find_col(d, ["LatestGameDate", "latest_game_date", "last_game", "last_game_date"])
+    games_col = find_col(d, ["GamesOnRoster", "games_on_roster", "roster_games", "games"])
     out = pd.DataFrame()
     out["Player"] = d[player_col] if player_col else np.nan
     out["Team"] = d[team_col] if team_col else ""
     out["Position"] = d[pos_col] if pos_col else ""
     out["Season"] = d[season_col] if season_col else np.nan
+    out["CurrentInCache"] = d[current_col] if current_col else False
+    if out["CurrentInCache"].dtype == object:
+        out["CurrentInCache"] = out["CurrentInCache"].astype(str).str.lower().isin(["1", "true", "yes", "y", "current"])
+    else:
+        out["CurrentInCache"] = out["CurrentInCache"].fillna(False).astype(bool)
+    out["LatestGameDate"] = parse_date_series(d[latest_col]) if latest_col else pd.NaT
+    out["GamesOnRoster"] = pd.to_numeric(d[games_col], errors="coerce") if games_col else np.nan
+    out["Season"] = pd.to_numeric(out["Season"], errors="coerce")
     out["NameKey"] = out["Player"].map(normalize_name)
+    out["Team"] = out["Team"].map(lambda x: _canonical_wnba_team(x) or str(x or "").strip())
     out["PositionGroup"] = out["Position"].map(position_group)
     return out.dropna(subset=["Player"])
-
 
 def standardize_game_rosters(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -1323,24 +1375,52 @@ def standardize_shots(df: pd.DataFrame) -> pd.DataFrame:
         out["Made"] = np.nan
 
     out = coerce_numeric(out, ["Season", "ShotValue", "ShotDistance", "X", "Y"])
-    # Zone tags: conservative and schema-independent.
+    # App118 shot-coordinate repair. SportsDataverse WNBA coordinates are
+    # center-court based (the baskets are near x=+/-41.75), while some cached
+    # `ShotDistance`/`ShotValue` fields were event-score values rather than true
+    # attempt geometry. That previously classified many missed threes as midrange
+    # and made the three-point make rate look ~99%. When court-scale coordinates
+    # are available, derive distance to the nearest basket and use geometry for
+    # the shot zone.
+    _x = pd.to_numeric(out["X"], errors="coerce")
+    _y = pd.to_numeric(out["Y"], errors="coerce")
+    _court_scale = (_x.abs().quantile(.99) <= 55 if _x.notna().any() else False) and (_y.abs().quantile(.99) <= 35 if _y.notna().any() else False)
+    if _court_scale:
+        _d1 = np.sqrt((_x - 41.75)**2 + _y**2)
+        _d2 = np.sqrt((_x + 41.75)**2 + _y**2)
+        _hoop_dist = pd.concat([_d1, _d2], axis=1).min(axis=1)
+        out["ShotDistance"] = _hoop_dist.where(_hoop_dist.notna(), out["ShotDistance"])
     type_text = out["ShotType"].astype(str).str.lower()
-    out["Is3"] = (out["ShotValue"].fillna(0) >= 3) | type_text.str.contains("3|three", na=False)
-    out["AtRim"] = (out["ShotDistance"].fillna(999) <= 5) | type_text.str.contains("layup|rim|dunk", na=False)
-    out["MidRange"] = (~out["Is3"].fillna(False)) & (~out["AtRim"].fillna(False))
+    _explicit_three = type_text.str.contains(r"3[- ]?pt|three[- ]?point|three pointer", regex=True, na=False)
+    _geometry_three = out["ShotDistance"].fillna(-1) >= 22.0
+    out["Is3"] = (_explicit_three | _geometry_three).astype(bool)
+    out["AtRim"] = ((out["ShotDistance"].fillna(999) <= 5.0) | type_text.str.contains("layup|rim|dunk", na=False)).astype(bool)
+    out["MidRange"] = (~out["Is3"]) & (~out["AtRim"])
+    # Attempt value is a zone property, not whether the shot was made.
+    out["ShotValue"] = np.where(out["Is3"], 3, 2)
     out["NameKey"] = out["Player"].map(normalize_name)
     out = out[out["NameKey"].str.len() > 0].copy()
     return out
 
 
 def build_shot_features(shots: pd.DataFrame) -> pd.DataFrame:
+    """Build season-isolated shot features.
+
+    App 116 grouped every season by NameKey, which allowed older shot profiles
+    to leak into a row labelled as the current season. App 117 keeps Season in
+    the aggregation key so current projections only receive current-season shots.
+    """
     sh = standardize_shots(shots) if shots is not None and not shots.empty else pd.DataFrame()
     if sh.empty:
         return pd.DataFrame()
+    sh = sh.copy().drop_duplicates()
+    sh["Season"] = pd.to_numeric(sh.get("Season"), errors="coerce")
+    if sh["Season"].isna().any() and "GameDate" in sh.columns:
+        sh.loc[sh["Season"].isna(), "Season"] = pd.to_datetime(sh.loc[sh["Season"].isna(), "GameDate"], errors="coerce").dt.year
     sh["Attempt"] = 1
     sh["MadeNum"] = sh["Made"].fillna(False).astype(bool).astype(int)
     sh["PtsOnShot"] = sh["MadeNum"] * pd.to_numeric(sh["ShotValue"], errors="coerce").fillna(2)
-    agg = sh.groupby("NameKey").agg(
+    agg = sh.groupby(["NameKey", "Season"], dropna=False).agg(
         ShotAttempts=("Attempt", "sum"),
         ShotMakes=("MadeNum", "sum"),
         ShotPoints=("PtsOnShot", "sum"),
@@ -1359,7 +1439,6 @@ def build_shot_features(shots: pd.DataFrame) -> pd.DataFrame:
         0, 100
     ).round(1)
     return agg
-
 
 def position_group(pos) -> str:
     p = str(pos or "").upper()
@@ -1763,10 +1842,14 @@ def build_team_ranks(player_logs: pd.DataFrame, team_season: pd.DataFrame, sched
     if team_season is not None and not team_season.empty:
         d = standardize_team_season(team_season)
         if not d.empty:
+            d["Team"] = d["Team"].map(_canonical_wnba_team)
+            d = d[d["Team"].astype(str).str.len() > 0].copy()
             frames.append(d)
     if player_logs is not None and not player_logs.empty:
         d = standardize_player_logs(player_logs)
         if not d.empty:
+            d["Team"] = d["Team"].map(_canonical_wnba_team)
+            d = d[d["Team"].astype(str).str.len() > 0].copy()
             agg = d.groupby(["Season", "Team"], dropna=False).agg(
                 Games=("GameDate", "nunique"), PTS=("PTS", "sum"), REB=("REB", "sum"), AST=("AST", "sum"),
                 FGA=("FGA", "sum"), FGM=("FGM", "sum"), FG3M=("FG3M", "sum"), FTA=("FTA", "sum"), TOV=("TOV", "sum"), OREB=("OREB", "sum")
@@ -1786,8 +1869,20 @@ def build_team_ranks(player_logs: pd.DataFrame, team_season: pd.DataFrame, sched
     if schedules is not None and not schedules.empty:
         sched = standardize_schedules(schedules)
         if not sched.empty and {"Home", "Away", "HomeScore", "AwayScore"}.issubset(sched.columns):
+            sched["Home"] = sched["Home"].map(_canonical_wnba_team)
+            sched["Away"] = sched["Away"].map(_canonical_wnba_team)
+            sched = sched[(sched["Home"].astype(str).str.len() > 0) & (sched["Away"].astype(str).str.len() > 0)].copy()
             rows = []
-            for _, r in sched.dropna(subset=["HomeScore", "AwayScore"]).iterrows():
+            _played = sched.dropna(subset=["HomeScore", "AwayScore"]).copy()
+            _played["HomeScore"] = pd.to_numeric(_played["HomeScore"], errors="coerce")
+            _played["AwayScore"] = pd.to_numeric(_played["AwayScore"], errors="coerce")
+            # SportsDataverse/ESPN schedule caches encode future WNBA games as
+            # 0-0 rather than NaN.  Counting those as finals diluted 2026 team
+            # PPG/points-allowed into the 50s and was the root cause of the
+            # absurd 68-64 Moneyline projections.  A real WNBA final cannot be
+            # 0-0, so only positive-score rows belong in played-game aggregates.
+            _played = _played[(_played["HomeScore"] > 0) | (_played["AwayScore"] > 0)].copy()
+            for _, r in _played.iterrows():
                 rows.append({"Season": r.get("Season"), "Team": r.get("Home"), "PtsFor": r.get("HomeScore"), "PtsAllowed": r.get("AwayScore"), "HomeAway": "HOME"})
                 rows.append({"Season": r.get("Season"), "Team": r.get("Away"), "PtsFor": r.get("AwayScore"), "PtsAllowed": r.get("HomeScore"), "HomeAway": "AWAY"})
             if rows:
@@ -1825,12 +1920,26 @@ def build_team_ranks(player_logs: pd.DataFrame, team_season: pd.DataFrame, sched
 
 
 def compute_player_baselines(logs: pd.DataFrame, season_stats: pd.DataFrame = pd.DataFrame(), shots: pd.DataFrame = pd.DataFrame(), rosters: pd.DataFrame = pd.DataFrame()) -> pd.DataFrame:
+    """Build one current-season baseline per player without cross-season leakage.
+
+    Older seasons are retained only in explicit *_prior fields. This prevents a
+    player row labelled 2026 from silently containing 2025 games, home/away
+    splits, volatility, shot profile, or usage totals.
+    """
     logs = standardize_player_logs(logs) if logs is not None and not logs.empty else pd.DataFrame()
     if logs.empty:
         return pd.DataFrame()
-    d = logs.sort_values(["NameKey", "GameDate"])
-    for c in ["MIN", "PTS", "REB", "AST", "PRA", "FGA", "FGM", "FG3A", "FG3M", "FTA", "TOV", "OREB", "DREB"]:
-        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+    all_logs = logs.copy().sort_values(["NameKey", "GameDate"])
+    all_logs["Season"] = pd.to_numeric(all_logs.get("Season"), errors="coerce")
+    if all_logs["Season"].isna().any():
+        inferred = pd.to_datetime(all_logs.get("GameDate"), errors="coerce").dt.year
+        all_logs["Season"] = all_logs["Season"].fillna(inferred)
+    for c in ["MIN", "PTS", "REB", "AST", "PRA", "FGA", "FGM", "FG3A", "FG3M", "FTA", "FTM", "TOV", "OREB", "DREB"]:
+        all_logs[c] = pd.to_numeric(all_logs.get(c), errors="coerce").fillna(0)
+
+    latest_by_name = all_logs.groupby("NameKey")["Season"].transform("max")
+    d = all_logs[(all_logs["Season"].eq(latest_by_name)) | latest_by_name.isna()].copy()
+    d = d.sort_values(["NameKey", "GameDate"])
     g = d.groupby(["NameKey", "Player"], dropna=False)
     base = g.agg(
         Team=("Team", lambda x: x.dropna().iloc[-1] if len(x.dropna()) else ""),
@@ -1846,45 +1955,89 @@ def compute_player_baselines(logs: pd.DataFrame, season_stats: pd.DataFrame = pd
         FGA_avg=("FGA", "mean"), FGA_l3=("FGA", lambda x: x.tail(3).mean()), FGA_l5=("FGA", lambda x: x.tail(5).mean()), FGA_l10=("FGA", lambda x: x.tail(10).mean()), FGA_l20=("FGA", lambda x: x.tail(20).mean()),
         FG3A_avg=("FG3A", "mean"), FG3A_l5=("FG3A", lambda x: x.tail(5).mean()), FG3A_l10=("FG3A", lambda x: x.tail(10).mean()), FG3A_l20=("FG3A", lambda x: x.tail(20).mean()),
         FTA_avg=("FTA", "mean"), FTA_l5=("FTA", lambda x: x.tail(5).mean()), FTA_l10=("FTA", lambda x: x.tail(10).mean()), FTA_l20=("FTA", lambda x: x.tail(20).mean()),
-        FGA=("FGA", "sum"), FGM=("FGM", "sum"), FG3A=("FG3A", "sum"), FG3M=("FG3M", "sum"), FTA=("FTA", "sum"), TOV=("TOV", "sum"), OREB=("OREB", "sum"), DREB=("DREB", "sum"),
+        FGA=("FGA", "sum"), FGM=("FGM", "sum"), FG3A=("FG3A", "sum"), FG3M=("FG3M", "sum"), FTA=("FTA", "sum"), FTM=("FTM", "sum"), TOV=("TOV", "sum"), OREB=("OREB", "sum"), DREB=("DREB", "sum"),
     ).reset_index()
+    base["Team"] = base["Team"].map(lambda x: _canonical_wnba_team(x) or str(x or "").strip())
     base["eFG%"] = np.where(base["FGA"] > 0, (base["FGM"] + 0.5*base["FG3M"]) / base["FGA"], np.nan)
     base["TS%"] = np.where((2*(base["FGA"] + 0.44*base["FTA"])) > 0, (base["PTS_avg"]*base["Games"]) / (2*(base["FGA"] + 0.44*base["FTA"])), np.nan)
+    two_a = (base["FGA"] - base["FG3A"]).clip(lower=0)
+    two_m = (base["FGM"] - base["FG3M"]).clip(lower=0)
+    base["2P%"] = np.where(two_a > 0, two_m / two_a, np.nan)
+    base["3P%"] = np.where(base["FG3A"] > 0, base["FG3M"] / base["FG3A"], np.nan)
+    base["FT%"] = np.where(base["FTA"] > 0, base["FTM"] / base["FTA"], np.nan)
     base["UsageProxy"] = (base["FGA"] + 0.44*base["FTA"] + base["TOV"]) / base["Games"].clip(lower=1)
     base["AST%Proxy"] = base["AST_avg"] / base["MIN_avg"].replace(0, np.nan)
     base["TRB%Proxy"] = base["REB_avg"] / base["MIN_avg"].replace(0, np.nan)
     base["PERProxy"] = (base["PTS_avg"] + base["REB_avg"] + base["AST_avg"] + base["FGM"] / base["Games"].clip(lower=1) - (base["FGA"] - base["FGM"]) / base["Games"].clip(lower=1) - base["TOV"] / base["Games"].clip(lower=1))
 
-    # Add season advanced fields where available.
+    # Explicit prior-season anchors. They are never mixed into current averages.
+    latest_map = all_logs.groupby("NameKey")["Season"].max().rename("LatestSeason")
+    prior = all_logs.merge(latest_map, on="NameKey", how="left")
+    prior = prior[prior["Season"] < prior["LatestSeason"]].copy()
+    if not prior.empty:
+        prior_latest = prior.groupby("NameKey")["Season"].transform("max")
+        prior = prior[prior["Season"].eq(prior_latest)]
+        prior_agg = prior.groupby("NameKey", as_index=False).agg(
+            PTS_prior=("PTS", "mean"), REB_prior=("REB", "mean"), AST_prior=("AST", "mean"), PRA_prior=("PRA", "mean"),
+            MIN_prior=("MIN", "mean"), FGA_prior=("FGA", "mean"), FG3A_prior=("FG3A", "mean"), FTA_prior=("FTA", "mean"),
+            PriorSeason=("Season", "max"), PriorGames=("PTS", "count"),
+        )
+        base = base.merge(prior_agg, on="NameKey", how="left")
+    else:
+        for c in ["PTS_prior", "REB_prior", "AST_prior", "PRA_prior", "MIN_prior", "FGA_prior", "FG3A_prior", "FTA_prior", "PriorSeason", "PriorGames"]:
+            base[c] = np.nan
+
+    # Add season advanced fields only from the SAME season as the baseline.
     ss = standardize_player_season(season_stats) if season_stats is not None and not season_stats.empty else pd.DataFrame()
     if not ss.empty:
-        ss_latest = ss.sort_values("Season").groupby("NameKey", as_index=False).tail(1)
-        keep = [c for c in ["NameKey", "USG%", "TS%", "eFG%", "AST%", "TRB%", "PER"] if c in ss_latest.columns]
-        base = base.merge(ss_latest[keep], on="NameKey", how="left", suffixes=("", "_Season"))
+        ss["Season"] = pd.to_numeric(ss["Season"], errors="coerce")
+        ss["GP"] = pd.to_numeric(ss.get("GP"), errors="coerce")
+        ss = ss.sort_values(["NameKey", "Season", "GP"], na_position="first")
+        ss_latest = ss.groupby(["NameKey", "Season"], as_index=False).tail(1)
+        keep = [c for c in ["NameKey", "Season", "USG%", "TS%", "eFG%", "AST%", "TRB%", "PER"] if c in ss_latest.columns]
+        base = base.merge(ss_latest[keep], on=["NameKey", "Season"], how="left", suffixes=("", "_Season"))
         for c in ["USG%", "TS%", "eFG%", "AST%", "TRB%", "PER"]:
             if c in base.columns and f"{c}_Season" in base.columns:
                 base[c] = base[c].fillna(base[f"{c}_Season"])
             elif f"{c}_Season" in base.columns:
                 base[c] = base[f"{c}_Season"]
 
-    # Roster position.
+    # Prefer a same-season current roster row, including current-in-cache evidence.
     rost = standardize_rosters(rosters) if rosters is not None and not rosters.empty else pd.DataFrame()
     if not rost.empty:
-        rr = rost.sort_values("Season").groupby("NameKey", as_index=False).tail(1)
-        base = base.merge(rr[["NameKey", "Position", "PositionGroup"]].drop_duplicates("NameKey"), on="NameKey", how="left")
+        rost["Season"] = pd.to_numeric(rost["Season"], errors="coerce")
+        rost["_CurrentSort"] = rost.get("CurrentInCache", False).fillna(False).astype(bool).astype(int)
+        rost["_LatestSort"] = pd.to_datetime(rost.get("LatestGameDate"), errors="coerce")
+        rost["_GamesSort"] = pd.to_numeric(rost.get("GamesOnRoster"), errors="coerce").fillna(0)
+        rr = rost.sort_values(["NameKey", "Season", "_CurrentSort", "_LatestSort", "_GamesSort"], na_position="first").groupby(["NameKey", "Season"], as_index=False).tail(1)
+        base = base.merge(rr[["NameKey", "Season", "Position", "PositionGroup"]].drop_duplicates(["NameKey", "Season"]), on=["NameKey", "Season"], how="left")
     else:
         base["Position"] = ""
         base["PositionGroup"] = "Unknown"
 
-    # Shot profile for points. Flexible parser supports SportsDataverse parquet schemas.
+    # Current-season shot profile only.
     sh_agg = build_shot_features(shots)
     if not sh_agg.empty:
-        base = base.merge(sh_agg, on="NameKey", how="left")
+        base = base.merge(sh_agg, on=["NameKey", "Season"], how="left")
     else:
         for c in ["ShotAttempts", "ShotMakes", "ShotPoints", "ThreePA", "RimAttempts", "MidRangeAttempts", "ThreePARate", "RimRate", "MidRangeRate", "ShotMakeRate", "PointsPerShot", "ShotProfileScore", "AvgShotDistance"]:
             base[c] = np.nan
 
-    # Home/away and consistency features from logs.
+    # Shot-event make flags can be duplicated/misencoded by upstream play-by-play.
+    # Use box-score FGM/FGA for efficiency and keep shot events for *where* the
+    # attempts came from. This prevents bad event labels from boosting scoring.
+    _box_fg = np.where(base["FGA"] > 0, base["FGM"] / base["FGA"], np.nan)
+    _two_m = (base["FGM"] - base["FG3M"]).clip(lower=0)
+    _box_pps = np.where(base["FGA"] > 0, (2*_two_m + 3*base["FG3M"]) / base["FGA"], np.nan)
+    base["ShotMakeRate"] = _box_fg
+    base["PointsPerShot"] = _box_pps
+    base["ShotProfileScore"] = np.clip(
+        50 + pd.to_numeric(base.get("ThreePARate"),errors="coerce").fillna(0)*14
+        + pd.to_numeric(base.get("RimRate"),errors="coerce").fillna(0)*18
+        + (pd.Series(_box_fg,index=base.index).fillna(.42)-.42)*60, 0, 100
+    ).round(1)
+
+    # Current-season home/away and volatility only.
     if "HomeAway" in d.columns:
         ha = d.copy()
         ha["HA"] = ha["HomeAway"].astype(str).str.upper().str[:1]
@@ -1895,15 +2048,16 @@ def compute_player_baselines(logs: pd.DataFrame, season_stats: pd.DataFrame = pd
             if "A" in piv.columns:
                 base = base.merge(piv[["A"]].rename(columns={"A": f"{m}_AwayAvg"}).reset_index(), on="NameKey", how="left")
     for m in MARKETS:
-        base[f"{m}_Std20"] = g[m].agg(lambda x: x.tail(20).std(ddof=0)).values
+        std_map = d.groupby("NameKey")[m].agg(lambda x: x.tail(20).std(ddof=0))
+        base[f"{m}_Std20"] = base["NameKey"].map(std_map)
         base[f"{m}_per_min"] = base[f"{m}_avg"] / base["MIN_avg"].replace(0, np.nan)
 
     base["VolatilityScore"] = np.clip(
         30 + base[[f"{m}_Std20" for m in MARKETS if f"{m}_Std20" in base.columns]].fillna(0).mean(axis=1) * 8,
         0, 100
     ).round(1)
+    base["Baseline Season Isolation"] = "CURRENT_SEASON_ONLY"
     return base
-
 
 def build_master_features() -> Tuple[pd.DataFrame, pd.DataFrame]:
     logs = load_dataset("player_game_logs")
@@ -1930,6 +2084,12 @@ def build_master_features() -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Game roster role confidence.
     grs = standardize_game_rosters(gr) if not gr.empty else pd.DataFrame()
     if not grs.empty:
+        grs["Season"] = pd.to_numeric(grs.get("Season"), errors="coerce")
+        latest_season = pd.to_numeric(base.get("Season"), errors="coerce").max()
+        if pd.notna(latest_season) and "Season" in grs.columns:
+            season_rows = grs[grs["Season"].eq(latest_season)]
+            if not season_rows.empty:
+                grs = season_rows
         grs["StarterBool"] = grs["Starter"].astype(str).str.lower().isin(["true", "1", "yes", "starter", "started"])
         rconf = grs.groupby("NameKey").agg(RosterGames=("Player", "count"), StarterGames=("StarterBool", "sum")).reset_index()
         rconf["StarterRate"] = rconf["StarterGames"] / rconf["RosterGames"].replace(0, np.nan)
@@ -1943,6 +2103,12 @@ def build_master_features() -> Tuple[pd.DataFrame, pd.DataFrame]:
     # even when SportsDataverse gives lineup-player columns instead of one clean player field.
     lns = standardize_lineups(lineups) if not lineups.empty else pd.DataFrame()
     if not lns.empty:
+        latest_season = pd.to_numeric(base.get("Season"), errors="coerce").max()
+        if "Season" in lns.columns and pd.notna(latest_season):
+            lns["Season"] = pd.to_numeric(lns["Season"], errors="coerce")
+            season_lns = lns[lns["Season"].eq(latest_season)]
+            if not season_lns.empty:
+                lns = season_lns
         lns_text = lns["LineupText"].astype(str).map(normalize_name)
         total_lineups = max(len(lns_text), 1)
         mentions = []
@@ -3610,7 +3776,7 @@ def project_row(row, base, logs):
     }
     return proj, {**info, **hit}
 
-def make_projection_board(lines, logs, base):
+def _historical_make_projection_board_1(lines, logs, base):
     if lines is None or lines.empty:
         return pd.DataFrame()
     if base is None or base.empty:
@@ -4531,9 +4697,9 @@ def attach_game_context_columns(lines_df: pd.DataFrame, mode: str = "Today") -> 
 
 
 # Preserve prior projection builder and enhance it with full advanced engines.
-_make_projection_board_core = make_projection_board
+_make_projection_board_core = _historical_make_projection_board_1
 
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+def _historical_make_projection_board_2(lines, logs, base, mode: Optional[str] = None):
     mode = mode or st.session_state.get("wnba_current_mode", "Today")
     if lines is not None and not lines.empty:
         try:
@@ -6903,7 +7069,7 @@ def append_game_context_history(board: pd.DataFrame) -> None:
 # Override the projection enhancer to include v3 game context and market-specific defense.
 _make_projection_board_context_v2_core = _make_projection_board_core
 
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+def _historical_make_projection_board_3(lines, logs, base, mode: Optional[str] = None):
     mode = mode or st.session_state.get("wnba_current_mode", "Today")
     if lines is not None and not lines.empty:
         try:
@@ -9536,7 +9702,10 @@ def build_copy_paste_slate(df: pd.DataFrame, best_only: bool = False, max_rows: 
             mins = _fmt_num_compact(r.get("MIN Proj"), 2)
             icon_txt = f"{icon} " if icon else ""
             minute_txt = f" — MIN {mins}" if mins != "—" else ""
-            lines.append(f"• {player} — {icon_txt}{side} {line} {market} — {proj} PROJ{minute_txt}")
+            v2_val = safe_float(r.get("PTS V2 Projection"), np.nan) if market == "PTS" else safe_float(r.get("PRA V2 Projection"), np.nan) if market == "PRA" else np.nan
+            v2_side = str(r.get("PTS V2 Side", "") or "") if market == "PTS" else ""
+            v2_text = f" — V2 {v2_val:.2f}{(' ' + v2_side) if v2_side else ''}" if pd.notna(v2_val) else ""
+            lines.append(f"• {player} — {icon_txt}{side} {line} {market} — {proj} LEGACY{v2_text}{minute_txt}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
@@ -9630,50 +9799,112 @@ def _ml_fallback_team_row(team: str, ctx: pd.DataFrame) -> pd.Series:
     })
 
 
+def _ml_sane_rating(value: Any, fallback: float, low: float = 88.0, high: float = 120.0) -> float:
+    """Reject corrupt team-rating values before they can crater a game projection."""
+    v = safe_float(value, np.nan)
+    if pd.isna(v) or v < low or v > high:
+        return float(fallback)
+    return float(v)
+
+
 def _project_game_score(team_row: pd.Series, opp_row: pd.Series) -> Tuple[float, float]:
-    pace = np.nanmean([safe_float(team_row.get("Pace"), np.nan), safe_float(opp_row.get("Pace"), np.nan)])
-    if pd.isna(pace):
-        pace = 79.0
-    ortg = safe_float(team_row.get("ORtg"), 101.0)
-    opp_drtg = safe_float(opp_row.get("DRtg"), 101.0)
-    raw = pace * ((ortg + opp_drtg) / 2.0) / 100.0
-    return float(np.clip(raw, 62.0, 102.0)), float(pace)
+    """App119 absolute-score model with rating sanity and PPG anchoring.
+
+    The previous formula could produce a 60s team score when a malformed DRtg
+    leaked into context.  This version uses a league-centered offense/defense
+    interaction and shrinks extreme outputs toward actual scoring/points-allowed
+    baselines when those fields exist.
+    """
+    tp = safe_float(team_row.get("Pace"), np.nan)
+    op = safe_float(opp_row.get("Pace"), np.nan)
+    if pd.notna(tp) and not (70.0 <= tp <= 92.0):
+        tp = np.nan
+    if pd.notna(op) and not (70.0 <= op <= 92.0):
+        op = np.nan
+    if pd.notna(tp) and pd.notna(op):
+        pace = float(math.sqrt(max(tp, 1.0) * max(op, 1.0)))
+    else:
+        pace = float(np.nanmean([tp, op])) if pd.notna(tp) or pd.notna(op) else 80.0
+    pace = float(np.clip(pace, 72.0, 89.0))
+
+    # Dynamic reference when possible; 104 is a conservative WNBA fallback.
+    league_ref = 104.0
+    ortg = _ml_sane_rating(team_row.get("ORtg"), league_ref)
+    opp_drtg = _ml_sane_rating(opp_row.get("DRtg"), league_ref)
+    expected_eff = league_ref + 0.58 * (ortg - league_ref) + 0.42 * (opp_drtg - league_ref)
+    core_score = pace * expected_eff / 100.0
+
+    ppg = safe_float(team_row.get("PTS_per_game", team_row.get("PPG")), np.nan)
+    opp_allowed = safe_float(opp_row.get("PointsAllowed_per_game", opp_row.get("PointsAllowed")), np.nan)
+    anchors = [v for v in [ppg, opp_allowed] if pd.notna(v) and 60.0 <= v <= 105.0]
+    if anchors:
+        anchor = float(np.mean(anchors))
+        score = 0.72 * core_score + 0.28 * anchor
+        # Prevent a malformed rating from moving more than 10 points away from
+        # the observable scoring environment.
+        score = float(np.clip(score, anchor - 10.0, anchor + 10.0))
+    else:
+        score = core_score
+    return float(np.clip(score, 64.0, 103.0)), pace
 
 
-def _simulate_wnba_game(team_row: pd.Series, opp_row: pd.Series, sims: int = 15000, seed_key: str = "") -> Dict[str, Any]:
-    team_mean, pace = _project_game_score(team_row, opp_row)
-    opp_mean, _ = _project_game_score(opp_row, team_row)
-    seed = stable_seed("wnba_game_sim", seed_key, team_row.get("Team"), opp_row.get("Team"), PROJECTION_ENGINE_VERSION)
+def _simulate_wnba_game(
+    team_row: pd.Series,
+    opp_row: pd.Series,
+    sims: int = 15000,
+    seed_key: str = "",
+    total_line: Optional[float] = None,
+    team_mean_override: Optional[float] = None,
+    opp_mean_override: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Correlated game simulation centered on the sanity-checked score model.
+
+    App120 can optionally supply injury/rotation-adjusted team means from the
+    Elite game environment.  Existing callers remain backward compatible.
+    """
+    base_team_mean, pace = _project_game_score(team_row, opp_row)
+    base_opp_mean, _ = _project_game_score(opp_row, team_row)
+    team_mean = safe_float(team_mean_override, base_team_mean)
+    opp_mean = safe_float(opp_mean_override, base_opp_mean)
+    if pd.isna(team_mean): team_mean = base_team_mean
+    if pd.isna(opp_mean): opp_mean = base_opp_mean
+    team_mean = float(np.clip(team_mean, 60.0, 105.0))
+    opp_mean = float(np.clip(opp_mean, 60.0, 105.0))
+    seed = stable_seed("wnba_game_sim_app119", seed_key, team_row.get("Team"), opp_row.get("Team"), PROJECTION_ENGINE_VERSION)
     rng = np.random.default_rng(seed)
-    team_net = safe_float(team_row.get("NetRtg"), 0.0)
-    opp_net = safe_float(opp_row.get("NetRtg"), 0.0)
-    quality_gap = float(np.clip((team_net - opp_net) / 7.5, -2.0, 2.0))
-    pace_sd = 2.2
-    eff_sd = 6.5
-    base_total_sd = 9.8
-    sim_pace = rng.normal(pace, pace_sd, int(sims))
-    team_eff = rng.normal((safe_float(team_row.get("ORtg"), 101.0) + safe_float(opp_row.get("DRtg"), 101.0)) / 2.0, eff_sd, int(sims))
-    opp_eff = rng.normal((safe_float(opp_row.get("ORtg"), 101.0) + safe_float(team_row.get("DRtg"), 101.0)) / 2.0, eff_sd, int(sims))
-    team_scores = np.clip(sim_pace * team_eff / 100.0 + rng.normal(quality_gap, base_total_sd / 2.0, int(sims)), 45, 115)
-    opp_scores = np.clip(sim_pace * opp_eff / 100.0 + rng.normal(-quality_gap, base_total_sd / 2.0, int(sims)), 45, 115)
+    n = int(max(1000, sims))
+    # Shared pace shock creates realistic score correlation; independent
+    # efficiency shocks decide the margin.
+    sim_pace = np.clip(rng.normal(pace, 2.15, n), 70.0, 92.0)
+    pace_factor = sim_pace / max(pace, 1e-6)
+    shared_env = rng.normal(0.0, 2.2, n)
+    team_scores = np.clip(team_mean * pace_factor + shared_env + rng.normal(0.0, 6.4, n), 45.0, 118.0)
+    opp_scores = np.clip(opp_mean * pace_factor + shared_env + rng.normal(0.0, 6.4, n), 45.0, 118.0)
     margins = team_scores - opp_scores
     totals = team_scores + opp_scores
     win_pct = float((margins > 0).mean() * 100.0)
-    total_line = 161.5
-    total_over_pct = float((totals > total_line).mean() * 100.0)
     spread_mean = float(np.mean(margins))
     favorite = str(team_row.get("Team")) if spread_mean >= 0 else str(opp_row.get("Team"))
+    tl = safe_float(total_line, np.nan)
+    if pd.notna(tl) and tl > 0:
+        total_over_pct = float((totals > tl).mean() * 100.0)
+        total_under_pct = float((totals < tl).mean() * 100.0)
+    else:
+        total_over_pct = np.nan
+        total_under_pct = np.nan
     return {
         "Team Sim Score": round(float(np.mean(team_scores)), 1),
         "Opponent Sim Score": round(float(np.mean(opp_scores)), 1),
         "Sim Win %": round(win_pct, 1),
         "Sim Total": round(float(np.mean(totals)), 1),
-        "Sim Total Over %": round(total_over_pct, 1),
-        "Sim Total Under %": round(100.0 - total_over_pct, 1),
+        "Sim Total Over %": round(total_over_pct, 1) if pd.notna(total_over_pct) else np.nan,
+        "Sim Total Under %": round(total_under_pct, 1) if pd.notna(total_under_pct) else np.nan,
         "Sim Spread": round(spread_mean, 1),
         "Sim Favorite": favorite,
         "Sim Pace": round(float(np.mean(sim_pace)), 1),
-        "Sim Count": int(sims),
+        "Sim Count": n,
+        "Market Total Line": tl if pd.notna(tl) else np.nan,
+        "Total Line Status": "SUPPLIED" if pd.notna(tl) and tl > 0 else "NO_REAL_TOTAL_LINE",
     }
 
 
@@ -10012,6 +10243,20 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         if dbg is not None and not getattr(dbg, "empty", True):
             st.dataframe(dbg, use_container_width=True, hide_index=True)
 
+    # App120: use the same injury/rotation-aware game environment that feeds
+    # the Elite player budgets whenever those caches are available.  If any
+    # piece is missing, Moneyline safely falls back to the standalone team model.
+    try:
+        _ml_elite_base = _elite_latest_base(load_dataset("master_features"))
+        _ml_team_season = _pts_v2_latest_team_table("team_season_stats")
+        _ml_team_opp = _pts_v2_latest_team_table("team_opponent_stats")
+        _ml_team_recent = _pts_v2_latest_team_table("team_recent_stats")
+        _ml_inactive, _ml_questionable, _ml_injury_note = _elite_inactive_by_team(mode)
+    except Exception as _ml_elite_exc:
+        _ml_elite_base = pd.DataFrame(); _ml_team_season = pd.DataFrame(); _ml_team_opp = pd.DataFrame(); _ml_team_recent = pd.DataFrame()
+        _ml_inactive, _ml_questionable = {}, {}
+        _ml_injury_note = f"elite ML context unavailable: {str(_ml_elite_exc)[:120]}"
+
     cards = []
     game_rows = []
     for p in pairs[:12]:
@@ -10019,31 +10264,70 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         ar, br = _ml_fallback_team_row(a, ctx), _ml_fallback_team_row(b, ctx)
         a_score, pace = _project_game_score(ar, br)
         b_score, _ = _project_game_score(br, ar)
-        sim = _simulate_wnba_game(ar, br, sims=WNBA_MONTE_CARLO_SIMS, seed_key=f"{a}-{b}")
+        _elite_ml_env = None
+        try:
+            if not _ml_elite_base.empty and not _ml_team_season.empty and not _ml_team_opp.empty:
+                _ml_game_row = pd.Series({"Team":a,"Opponent":b,"HomeAway":"AWAY"})
+                _elite_ml_env = _elite_game_environment(
+                    a,b,_ml_game_row,_ml_elite_base,_ml_team_season,_ml_team_opp,_ml_team_recent,
+                    _ml_inactive,_ml_questionable,
+                )
+                if _elite_ml_env.get("data_ok"):
+                    a_score = safe_float(_elite_ml_env.get("team_score"), a_score)
+                    b_score = safe_float(_elite_ml_env.get("opp_score"), b_score)
+                    pace = safe_float(_elite_ml_env.get("pace"), pace)
+        except Exception:
+            _elite_ml_env = None
+        sim = _simulate_wnba_game(
+            ar, br, sims=WNBA_MONTE_CARLO_SIMS, seed_key=f"{a}-{b}", total_line=None,
+            team_mean_override=a_score, opp_mean_override=b_score,
+        )
         a_score = safe_float(sim.get("Team Sim Score"), a_score)
         b_score = safe_float(sim.get("Opponent Sim Score"), b_score)
         spread = a_score - b_score
         total = a_score + b_score
         ml_team = sim.get("Sim Favorite") or (a if spread >= 0 else b)
-        a_win = safe_float(sim.get("Sim Win %"), 50.0)
+        raw_a_win = safe_float(sim.get("Sim Win %"), 50.0)
+        # Freshness is confidence, not score direction. Stale active-season
+        # team data shrinks the displayed win probability toward 50 instead of
+        # pretending the stale model is still highly certain.
+        _ml_latest = pd.to_datetime((_elite_ml_env or {}).get("latest_data"), errors="coerce")
+        _ml_target = pd.to_datetime(str(p.get("game_date", "")), errors="coerce")
+        if pd.isna(_ml_target):
+            try: _ml_target = pd.to_datetime(slate_target_date(mode), errors="coerce")
+            except Exception: _ml_target = pd.to_datetime(datetime.now(tz=app_timezone()).date(), errors="coerce")
+        _ml_age = (_ml_target.normalize()-_ml_latest.normalize()).days if pd.notna(_ml_latest) and pd.notna(_ml_target) else np.nan
+        if _elite_ml_env is None or not (_elite_ml_env or {}).get("data_ok"):
+            _ml_fresh_factor, _ml_fresh_status = 0.35, "FALLBACK"
+        elif pd.notna(_ml_age) and _ml_age > 7:
+            _ml_fresh_factor, _ml_fresh_status = 0.35, "CRITICAL STALE"
+        elif pd.notna(_ml_age) and _ml_age > 2:
+            _ml_fresh_factor, _ml_fresh_status = 0.72, "STALE"
+        else:
+            _ml_fresh_factor, _ml_fresh_status = 1.0, "FRESH"
+        a_win = float(np.clip(50.0 + (raw_a_win-50.0)*_ml_fresh_factor, 15.0, 85.0))
         b_win = 100.0 - a_win
         ml_prob = a_win if ml_team == a else b_win
         dog_team = b if ml_team == a else a
         dog_prob = b_win if ml_team == a else a_win
-        total_side = "OVER" if safe_float(sim.get("Sim Total Over %"), 50.0) >= 50 else "UNDER"
-        total_conf = max(safe_float(sim.get("Sim Total Over %"), 50.0), safe_float(sim.get("Sim Total Under %"), 50.0))
+        _total_over = safe_float(sim.get("Sim Total Over %"), np.nan)
+        _total_under = safe_float(sim.get("Sim Total Under %"), np.nan)
+        total_side = "MODEL TOTAL" if pd.isna(_total_over) or pd.isna(_total_under) else ("OVER" if _total_over >= _total_under else "UNDER")
+        total_conf = np.nan if pd.isna(_total_over) or pd.isna(_total_under) else max(_total_over, _total_under)
         sim_spread = safe_float(sim.get("Sim Spread"), spread)
         spread_conf = min(82, 50 + abs(sim_spread) * 4.5)
         blowout = float(np.clip((abs(sim_spread) - 8.0) * 4.5, 0.0, 36.0))
-        total_line = 161.5
-        total_edge = safe_float(sim.get("Sim Total"), total) - total_line
-        total_bar = float(np.clip(total_conf, 0, 100))
+        total_line = safe_float(sim.get("Market Total Line"), np.nan)
+        total_edge = safe_float(sim.get("Sim Total"), total) - total_line if pd.notna(total_line) else np.nan
+        total_bar = float(np.clip(total_conf, 0, 100)) if pd.notna(total_conf) else 0.0
         a_logo = _team_logo_html(a, "wnba-ml-logo")
         b_logo = _team_logo_html(b, "wnba-ml-logo")
         a_nick = html.escape(TEAM_NICKNAMES.get(a, a))
         b_nick = html.escape(TEAM_NICKNAMES.get(b, b))
         source_note = html.escape(str(p.get("source", "schedule")))
         game_date_note = html.escape(str(p.get("game_date", "")))
+        ml_fresh_note = html.escape(f"{_ml_fresh_status}{(' · '+str(int(_ml_age))+'d') if pd.notna(_ml_age) else ''}")
+        ml_injury_names = html.escape(str((_elite_ml_env or {}).get("injury_names", "") or ""))
         fav_label = html.escape(str(ml_team))
         ml_note = f"{fav_label} FAV" if ml_prob >= 50 else "NO CLEAR FAV"
         game_rows.append({
@@ -10068,19 +10352,25 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
             "Matchup Source": str(p.get("source", "schedule")),
             "Away Context": str(ar.get("Moneyline Context", "team data")),
             "Home Context": str(br.get("Moneyline Context", "team data")),
+            "Raw Sim Favorite Win Probability": round(max(raw_a_win, 100.0-raw_a_win), 1),
+            "ML Data Freshness": _ml_fresh_status,
+            "ML Data Age Days": _ml_age,
+            "ML Injury Adjusted": bool(_elite_ml_env is not None and (_elite_ml_env or {}).get("data_ok")),
+            "ML Injury Names Away": str((_elite_ml_env or {}).get("injury_names", "")),
+            "ML Injury Feed Note": str(_ml_injury_note),
         })
         cards.append(
             "<div class='wnba-ml-card'>"
-            f"<div class='wnba-ml-source'>{source_note}{' · ' + game_date_note if game_date_note else ''}</div>"
+            f"<div class='wnba-ml-source'>{source_note}{' · ' + game_date_note if game_date_note else ''} · {ml_fresh_note}{(' · INJ '+ml_injury_names) if ml_injury_names else ''}</div>"
             "<div class='wnba-ml-teams'>"
             f"<div class='wnba-ml-team'>{a_logo}<b>{html.escape(a)}</b><span>{a_nick}</span><strong>{a_score:.1f}</strong><em>{a_win:.0f}% win</em></div>"
             f"<div class='wnba-ml-mid'><span>{safe_float(sim.get('Sim Pace'), pace):.1f} POSS</span><div class='wnba-ml-poss'><i style='width:{ml_prob:.0f}%'></i></div><small>{ml_prob:.0f}%/{dog_prob:.0f}%</small><b>{ml_note}</b></div>"
             f"<div class='wnba-ml-team'>{b_logo}<b>{html.escape(b)}</b><span>{b_nick}</span><strong>{b_score:.1f}</strong><em>{b_win:.0f}% win</em></div>"
             "</div>"
             "<div class='wnba-ml-total'>"
-            f"<div><small>Game Total</small><strong>{safe_float(sim.get('Sim Total'), total):.1f}</strong><span class='{'over' if total_side == 'OVER' else 'under'}'>{total_edge:+.1f} vs {total_line:.1f}</span></div>"
-            f"<b class='wnba-ml-total-side'>{total_side}</b><em>HIGH {total_conf:.0f}%</em>"
-            f"<div class='wnba-ml-total-bar'><i style='width:{total_bar:.0f}%'></i></div><p>OVER {safe_float(sim.get('Sim Total Over %'), 50):.0f}% <span>UNDER {safe_float(sim.get('Sim Total Under %'), 50):.0f}%</span></p>"
+            f"<div><small>Game Total</small><strong>{safe_float(sim.get('Sim Total'), total):.1f}</strong><span>{('market line '+format(total_line,'.1f')) if pd.notna(total_line) else 'projection only · no real total line'}</span></div>"
+            f"<b class='wnba-ml-total-side'>{total_side}</b><em>{(format(total_conf,'.0f')+'%') if pd.notna(total_conf) else 'NO BET CONF'}</em>"
+            f"<div class='wnba-ml-total-bar'><i style='width:{total_bar:.0f}%'></i></div><p>{('OVER '+format(_total_over,'.0f')+'%') if pd.notna(_total_over) else 'Total probabilities disabled'} <span>{('UNDER '+format(_total_under,'.0f')+'%') if pd.notna(_total_under) else ''}</span></p>"
             "</div>"
             "<div class='wnba-ml-bottom'>"
             f"<div><small>Spread</small><b>{fav_label}</b><span>{fav_label} -{abs(sim_spread):.1f}</span><em>{spread_conf:.0f}% conf</em></div>"
@@ -10089,7 +10379,7 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
             f"<div><small>ORtg</small><b>{safe_float(ar.get('ORtg'), np.nan):.1f}</b><span>{a} offense</span></div>"
             f"<div><small>Blowout</small><b>{blowout:.0f}%</b><span>risk</span></div>"
             "</div>"
-            f"<div class='wnba-ml-sim'>15k sim: {html.escape(a)} {sim.get('Team Sim Score')} · {html.escape(b)} {sim.get('Opponent Sim Score')} · total {sim.get('Sim Total')} · winner {fav_label}</div>"
+            f"<div class='wnba-ml-sim'>15k sim: {html.escape(a)} {sim.get('Team Sim Score')} · {html.escape(b)} {sim.get('Opponent Sim Score')} · total {sim.get('Sim Total')} · winner {fav_label} · confidence data {ml_fresh_note}</div>"
             "</div>"
         )
     if not cards:
@@ -10602,7 +10892,7 @@ def ensure_online_wnba_master_features(force_official: bool = False) -> Tuple[pd
     return master, _build_team_context_from_cached_sources(), pd.DataFrame(debug)
 
 
-_make_projection_board_pre_true_recent = make_projection_board
+_make_projection_board_pre_true_recent = _historical_make_projection_board_3
 
 
 def _normal_over_probability(line: float, mean: float, sd: float) -> float:
@@ -10662,7 +10952,7 @@ def apply_true_recent_projection_layer(board: pd.DataFrame, base: pd.DataFrame) 
         min_edge = {"PTS":1.5,"REB":1.0,"AST":0.9,"PRA":2.5}.get(market,1.2)
         if pd.notna(edge) and abs(edge)>=min_edge and sidep>=61 and data_score>=72 and role_conf>=68:
             official = "🔥 OVER" if lean=="OVER" else "⚠️ UNDER"
-        row.update({
+        _row_values = {
             "Projection Before True Recent": old_proj,
             "Projection": round(final_proj,2) if pd.notna(final_proj) else np.nan,
             "Edge": round(edge,2) if pd.notna(edge) else np.nan,
@@ -10678,7 +10968,9 @@ def apply_true_recent_projection_layer(board: pd.DataFrame, base: pd.DataFrame) 
             "Data Source": "Official WNBA online: season + L5 + L10 + prior",
             "Projection Audit": "Minutes → per-minute production → recent/season shrinkage → capped context → calibrated probability",
             "Projection Explanation": f"{market}: {minutes:.1f} expected minutes; true L5/L10/season blend; matchup/context capped; probability recalibrated.",
-        })
+        }
+        for _rk, _rv in _row_values.items():
+            row[_rk] = _rv
         out.append(row)
     df = pd.DataFrame(out)
     if not df.empty:
@@ -10686,7 +10978,7 @@ def apply_true_recent_projection_layer(board: pd.DataFrame, base: pd.DataFrame) 
     return df
 
 
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+def _historical_make_projection_board_4(lines, logs, base, mode: Optional[str] = None):
     # Never require the user to visit Data Manager first.
     if base is None or base.empty or "PTS_true_recent_proj" not in base.columns:
         base, _, dbg = ensure_online_wnba_master_features(force_official=False)
@@ -10730,7 +11022,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v4.1.0 - Single File Pacific Slate + Auto HHS Challenger"
+APP_VERSION = "WNBA v4.4.0 - App120 Elite Role Budget V3 + Ranked Plays"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -10831,7 +11123,7 @@ def _data_integrity_audit(row: Dict[str, Any]) -> Tuple[str, float, str]:
     return status, round(score, 1), note
 
 
-_make_projection_board_v30 = make_projection_board
+_make_projection_board_v30 = _historical_make_projection_board_4
 
 
 def _apply_accuracy_integrity_layer(board: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
@@ -10895,7 +11187,7 @@ def _apply_accuracy_integrity_layer(board: pd.DataFrame, base: pd.DataFrame) -> 
     return pd.DataFrame(rows)
 
 
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+def _historical_make_projection_board_5(lines, logs, base, mode: Optional[str] = None):
     core = _make_projection_board_v30(lines, logs, base, mode)
     core = _apply_accuracy_integrity_layer(core, base)
     if core is not None and not core.empty:
@@ -11216,9 +11508,9 @@ def _v341_market_context(opp: str, market: str, pos: str, defense: pd.DataFrame,
     return result
 
 
-_make_projection_board_v341_base = make_projection_board
+_make_projection_board_v341_base = _historical_make_projection_board_5
 
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+def _historical_make_projection_board_6(lines, logs, base, mode: Optional[str] = None):
     board=_make_projection_board_v341_base(lines, logs, base, mode)
     if board is None or board.empty:
         return board
@@ -11451,7 +11743,7 @@ st.markdown("""
 #   • NEUTRAL/NO-PLAY zone for edges too small to be meaningful
 #   • slate bias is diagnosed, never artificially forced to 50/50
 # ============================================================================
-_make_projection_board_v344_input = make_projection_board
+_make_projection_board_v344_input = _historical_make_projection_board_6
 
 
 def _v344_numeric(values):
@@ -11758,7 +12050,7 @@ def _v344_rebuild_board(board: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame
     return out
 
 
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+def _historical_make_projection_board_7(lines, logs, base, mode: Optional[str] = None):
     board = _make_projection_board_v344_input(lines, logs, base, mode)
     return _v344_rebuild_board(board, base)
 
@@ -12271,9 +12563,11 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v4.1.0 - Single File Pacific Slate + Auto HHS Challenger"
-PROJECTION_ENGINE_VERSION = "V365_FULL_LIVE_BOARD_PROJECTION_V1"
-PROJECTION_ENGINE_NOTE = "Bayesian L5/L10/L20/season baseline + bounded minutes once + verified matchup once + small market shrink; later context is audit-only."
+APP_VERSION = "WNBA v4.4.0 - App120 Elite Role Budget V3 + Ranked Plays"
+PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
+PROJECTION_ENGINE_NOTE = "LEGACY LOCKED: season-isolated Bayesian baseline + bounded minutes/matchup. PTS V2 is a separate challenger and never overwrites legacy Projection."
+PTS_V2_ENGINE_VERSION = "PTS_V2_TEAM_CONSTRAINED_CHALLENGER_V1"
+PTS_V2_PROMOTE_TO_PRODUCTION = False
 
 
 def _stable_context_value(br: Optional[pd.Series], row: pd.Series, names, default=np.nan):
@@ -12817,7 +13111,7 @@ def _stable_repair_projection_board(board: pd.DataFrame, base: Optional[pd.DataF
     return rebuilt
 
 
-def make_projection_board(lines, logs, base, mode: Optional[str] = None):
+def _historical_make_projection_board_8(lines, logs, base, mode: Optional[str] = None):
     """Single-pass projection builder. The Underdog line pull remains unchanged."""
     board = _make_projection_board_v344_input(lines, logs, base, mode)
     board = _v344_rebuild_board(board, base)
@@ -13501,13 +13795,11 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v4.1.0 - Single File Pacific Slate + Auto HHS Challenger"
-PROJECTION_ENGINE_VERSION = "V365_FULL_LIVE_BOARD_PROJECTION_V1"
+APP_VERSION = "WNBA v4.4.0 - App120 Elite Role Budget V3 + Ranked Plays"
+PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = (
-    "Each market uses its own workload-adjusted true-recent baseline plus L5/L10/L20/season "
-    "shrinkage. Opponent pace/DRtg is joined before one bounded matchup adjustment. "
-    "PRA equals the corrected component sum, lines do not overwrite the model mean, and "
-    "official plays require 15k Monte Carlo, matchup, minutes, freshness, line value, and calibration agreement."
+    "LEGACY LOCKED for A/B testing. Current-season inputs are isolated; prior seasons live only in explicit *_prior fields. "
+    "PTS V2 is a separate team-constrained FGA/FTA/usage challenger; REB production remains protected."
 )
 OFFICIAL_WNBA_INJURY_URL = "https://www.wnba.com/webview/wnba-injury-report"
 STRONG_PLAY_FRESHNESS_VERSION = "V349_STRONG_TRUST_FRESHNESS_V1"
@@ -13719,6 +14011,13 @@ def _wnba_opponent_market_rank_table() -> pd.DataFrame:
     if d is None or d.empty or "Opponent" not in d.columns:
         return pd.DataFrame()
     d = d.copy()
+    if "Season" in d.columns:
+        d["Season"] = pd.to_numeric(d["Season"], errors="coerce")
+        latest_season = d["Season"].max()
+        if pd.notna(latest_season):
+            season_rows = d[d["Season"].eq(latest_season)]
+            if not season_rows.empty:
+                d = season_rows.copy()
     d["DefTeam"] = d["Opponent"].map(_team_key_for_matchup)
     d["OffTeam"] = d.get("Team", "").map(_team_key_for_matchup)
     if "GameDate" in d.columns:
@@ -13940,7 +14239,11 @@ def _graded_result_rows() -> pd.DataFrame:
     d["Market"] = d["Market"].astype(str).str.upper()
     d["Lean"] = d["Lean"].astype(str).str.upper().map(lambda x: "OVER" if "OVER" in x else "UNDER" if "UNDER" in x else x)
     d["EdgeNum"] = pd.to_numeric(d.get("Edge", d.get("edge", d.get("abs_edge", np.nan))), errors="coerce").abs()
-    d["ProbNum"] = pd.to_numeric(d.get("Over %", d.get("Under %", d.get("Probability", d.get("Win Probability %", np.nan)))), errors="coerce")
+    over_prob = pd.to_numeric(d.get("Over %", pd.Series(np.nan, index=d.index)), errors="coerce")
+    under_prob = pd.to_numeric(d.get("Under %", pd.Series(np.nan, index=d.index)), errors="coerce")
+    generic_prob = pd.to_numeric(d.get("Probability", d.get("Win Probability %", pd.Series(np.nan, index=d.index))), errors="coerce")
+    d["ProbNum"] = np.where(d["Lean"].eq("OVER"), over_prob, np.where(d["Lean"].eq("UNDER"), under_prob, generic_prob))
+    d["ProbNum"] = pd.to_numeric(d["ProbNum"], errors="coerce").fillna(generic_prob)
     d["Win"] = d["ResultKey"].str.contains("WIN", na=False)
     return d
 
@@ -14515,7 +14818,9 @@ def _strict_team_context_table() -> pd.DataFrame:
                 "Team_PointsAllowed": "PointsAllowed",
             })
             team_ctx = team_ctx.groupby(["Season", "Team"], as_index=False).agg(lambda x: x.dropna().iloc[-1] if len(x.dropna()) else np.nan)
-            frames.append(team_ctx)
+            # Master features are a fallback only. Real team season/rank caches appended
+            # above must win when both are populated.
+            frames.insert(0, team_ctx)
     if not frames:
         return pd.DataFrame()
     all_rows = pd.concat(frames, ignore_index=True, sort=False)
@@ -14537,6 +14842,46 @@ def _strict_team_context_table() -> pd.DataFrame:
         return np.nan
 
     combined = all_rows.groupby("Team", as_index=False).agg(last_non_null)
+
+    # App119 integrity guard: team_ranks from older installer builds could divide
+    # current points by the full scheduled season and write impossible DRtg/PPG
+    # values (for example DRtg in the 50s).  Team-season rows are the canonical
+    # source for core rates; rank files may contribute ranks, but they may never
+    # overwrite a sane season Pace/ORtg/DRtg/PPG value.
+    try:
+        _season_core = load_dataset("team_season_stats")
+    except Exception:
+        _season_core = pd.DataFrame()
+    if _season_core is not None and not _season_core.empty:
+        sc = _season_core.copy()
+        _tc = next((c for c in ["Team","team","team_abbreviation","TeamAbbreviation","Abbreviation"] if c in sc.columns), None)
+        if _tc is not None:
+            sc["Team"] = sc[_tc].map(lambda x: _team_key_for_matchup(x) or str(x or "").strip().upper())
+            if "Season" in sc.columns:
+                sc["Season"] = pd.to_numeric(sc["Season"], errors="coerce")
+                _ls = sc["Season"].max()
+                if pd.notna(_ls):
+                    sc = sc[sc["Season"].eq(_ls)].copy()
+            sc = sc.drop_duplicates("Team", keep="last").set_index("Team")
+            _core_cols = ["Pace","ORtg","DRtg","NetRtg","PTS_per_game","PointsAllowed_per_game"]
+            for _idx in combined.index:
+                _team = str(combined.at[_idx,"Team"])
+                if _team not in sc.index:
+                    continue
+                _sr = sc.loc[_team]
+                for _col in _core_cols:
+                    if _col not in sc.columns:
+                        continue
+                    _v = safe_float(_sr.get(_col), np.nan)
+                    _ok = pd.notna(_v)
+                    if _col == "Pace": _ok = _ok and 70.0 <= _v <= 92.0
+                    elif _col in {"ORtg","DRtg"}: _ok = _ok and 88.0 <= _v <= 120.0
+                    elif _col in {"PTS_per_game","PointsAllowed_per_game"}: _ok = _ok and 60.0 <= _v <= 110.0
+                    if _ok:
+                        combined.at[_idx,_col] = float(_v)
+                if "PointsAllowed_per_game" in combined.columns:
+                    _pa = safe_float(combined.at[_idx,"PointsAllowed_per_game"], np.nan)
+                    if pd.notna(_pa): combined.at[_idx,"PointsAllowed"] = _pa
     # Normalize common aliases used by different data providers.
     alias_pairs = {
         "Defensive Rating": "DRtg", "DefRtg": "DRtg", "defensive_rating": "DRtg",
@@ -14864,6 +15209,7 @@ def _stable_repair_projection_board(board: pd.DataFrame, base: Optional[pd.DataF
     fixed = _stable_attach_context_audit_only(fixed, base)
     fixed = _strong_trust_enrich_board(fixed, mode)
     fixed = _apply_full_winning_play_stack(fixed, base, mode)
+    fixed = _attach_pts_v2_challenger(fixed, base)
     fixed = attach_model_comparison(fixed, repository=HHSRepository(), simulations=10_000)
     fixed["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
     fixed["LineParserVersion"] = LINE_PARSER_VERSION
@@ -14982,6 +15328,12 @@ def _attach_projection_data_readiness(
     if logs is not None and not logs.empty:
         ld = standardize_player_logs(logs)
         if ld is not None and not ld.empty:
+            if "Season" in ld.columns:
+                ld["Season"] = pd.to_numeric(ld["Season"], errors="coerce")
+                target_season = int(target.year)
+                target_rows = ld[ld["Season"].eq(target_season)]
+                if not target_rows.empty:
+                    ld = target_rows.copy()
             dates = pd.to_datetime(ld.get("GameDate"), errors="coerce")
             global_latest = dates.max()
             ld = ld.assign(_AuditDate=dates)
@@ -15169,7 +15521,7 @@ def _build_live_projection_inputs(
         opponent = _team_key_for_matchup(row.get("Opponent"))
         market = str(row.get("Market", "")).upper()
 
-        row.update({
+        _row_values = {
             "NameKey": normalize_name(selected.get("Player")),
             "Matched Player": str(selected.get("Player", "") or "").strip(),
             "Match Score": round(float(effective_score), 3),
@@ -15195,7 +15547,9 @@ def _build_live_projection_inputs(
             "Projection Input Path": "DIRECT_VALIDATED_LINE_TO_LEGACY_FINAL",
             "Slate": str(row.get("Slate", "") or mode),
             "SlateDate": str(row.get("SlateDate", "") or slate_target_date(mode) or "ALL"),
-        })
+        }
+        for _rk, _rv in _row_values.items():
+            row[_rk] = _rv
         output_rows.append(row)
 
     if not output_rows:
@@ -15204,6 +15558,1577 @@ def _build_live_projection_inputs(
     dedupe = [column for column in ["NameKey", "Team", "Market", "Line"] if column in out.columns]
     return out.drop_duplicates(dedupe, keep="first") if dedupe else out
 
+
+
+# ============================================================
+# App 117 — PTS V2 TEAM-CONSTRAINED CHALLENGER
+# ============================================================
+# This challenger deliberately does NOT overwrite legacy Projection. App 116's
+# REB engine was the strongest graded market, so production remains locked while
+# PTS V2 is evaluated on untouched slates.
+
+
+def _pts_v2_latest_team_table(dataset_key: str) -> pd.DataFrame:
+    try:
+        d = load_dataset(dataset_key)
+    except Exception:
+        d = pd.DataFrame()
+    if d is None or d.empty or "Team" not in d.columns:
+        return pd.DataFrame()
+    d = d.copy()
+    d["Team"] = d["Team"].map(_team_key_for_matchup)
+    if "Season" in d.columns:
+        d["Season"] = pd.to_numeric(d["Season"], errors="coerce")
+        latest = d["Season"].max()
+        if pd.notna(latest):
+            hit = d[d["Season"].eq(latest)]
+            if not hit.empty:
+                d = hit
+    return d.dropna(subset=["Team"]).drop_duplicates("Team", keep="last")
+
+
+def _pts_v2_weighted_br_stat(br: Optional[pd.Series], prefix: str) -> float:
+    if br is None:
+        return np.nan
+    vals = []
+    for name, weight in [
+        (f"{prefix}_l5", 0.18),
+        (f"{prefix}_l10", 0.34),
+        (f"{prefix}_l20", 0.28),
+        (f"{prefix}_avg", 0.20),
+    ]:
+        v = safe_float(br.get(name), np.nan)
+        if pd.notna(v) and v >= 0:
+            vals.append((float(v), weight))
+    if not vals:
+        return np.nan
+    sw = sum(w for _, w in vals)
+    return float(sum(v*w for v, w in vals) / max(sw, 1e-9))
+
+
+def _pts_v2_minutes_base(br: Optional[pd.Series]) -> float:
+    if br is None:
+        return np.nan
+    direct = safe_float(br.get("MinutesProjectionBase"), np.nan)
+    if pd.notna(direct) and direct > 0:
+        return float(direct)
+    vals = []
+    for name, weight in [("MIN_l5", 0.20), ("MIN_l10", 0.35), ("MIN_l20", 0.25), ("MIN_avg", 0.20)]:
+        v = safe_float(br.get(name), np.nan)
+        if pd.notna(v) and v > 0:
+            vals.append((float(v), weight))
+    if not vals:
+        return np.nan
+    sw = sum(w for _, w in vals)
+    return float(sum(v*w for v, w in vals) / max(sw, 1e-9))
+
+
+def _pts_v2_rate_for_minutes(br: Optional[pd.Series], stat: str, minutes: float) -> float:
+    value = _pts_v2_weighted_br_stat(br, stat)
+    base_minutes = _pts_v2_minutes_base(br)
+    if pd.isna(value):
+        return np.nan
+    if pd.isna(base_minutes) or base_minutes <= 0 or pd.isna(minutes) or minutes <= 0:
+        return float(value)
+    return float(max(0.0, value * minutes / base_minutes))
+
+
+def _pts_v2_shrunk_pct(made: float, attempts: float, prior_mean: float, prior_n: float) -> float:
+    made = max(0.0, safe_float(made, 0.0))
+    attempts = max(0.0, safe_float(attempts, 0.0))
+    return float(np.clip((made + prior_mean * prior_n) / max(attempts + prior_n, 1e-9), 0.05, 0.98))
+
+
+def _pts_v2_player_efficiency(br: Optional[pd.Series], opp_row: Optional[pd.Series], opp_efg_median: float) -> Dict[str, float]:
+    if br is None:
+        return {"two_pct": 0.50, "three_pct": 0.34, "ft_pct": 0.80, "three_rate": 0.30}
+    fga = max(0.0, safe_float(br.get("FGA"), 0.0))
+    fgm = max(0.0, safe_float(br.get("FGM"), 0.0))
+    three_a = max(0.0, safe_float(br.get("FG3A"), 0.0))
+    three_m = max(0.0, safe_float(br.get("FG3M"), 0.0))
+    fta = max(0.0, safe_float(br.get("FTA"), 0.0))
+    ftm = max(0.0, safe_float(br.get("FTM"), 0.0))
+    two_a = max(0.0, fga - three_a)
+    two_m = max(0.0, fgm - three_m)
+    two_pct = _pts_v2_shrunk_pct(two_m, two_a, 0.50, 45.0)
+    three_pct = _pts_v2_shrunk_pct(three_m, three_a, 0.34, 55.0)
+    ft_pct = _pts_v2_shrunk_pct(ftm, fta, 0.80, 28.0)
+    three_rate = float(np.clip(three_a / fga, 0.02, 0.78)) if fga > 0 else float(np.clip(safe_float(br.get("ThreePARate"), 0.30), 0.02, 0.78))
+
+    opp_efg = safe_float(opp_row.get("Opp_eFG%"), np.nan) if opp_row is not None else np.nan
+    if pd.notna(opp_efg) and pd.notna(opp_efg_median):
+        # Small, bounded shot-making adjustment. Opportunity remains the primary driver.
+        delta = float(np.clip(opp_efg - opp_efg_median, -0.055, 0.055))
+        two_pct = float(np.clip(two_pct + 0.38*delta, 0.38, 0.68))
+        three_pct = float(np.clip(three_pct + 0.30*delta, 0.24, 0.47))
+    return {"two_pct": two_pct, "three_pct": three_pct, "ft_pct": ft_pct, "three_rate": three_rate}
+
+
+def _pts_v2_team_environment(team: str, opponent: str, row: pd.Series, team_season: pd.DataFrame, team_opp: pd.DataFrame, team_recent: pd.DataFrame) -> Dict[str, Any]:
+    t = team_season[team_season["Team"].eq(team)].iloc[0] if not team_season.empty and team in set(team_season["Team"]) else pd.Series(dtype=object)
+    o = team_season[team_season["Team"].eq(opponent)].iloc[0] if not team_season.empty and opponent in set(team_season["Team"]) else pd.Series(dtype=object)
+    od = team_opp[team_opp["Team"].eq(opponent)].iloc[0] if not team_opp.empty and opponent in set(team_opp["Team"]) else pd.Series(dtype=object)
+    tr = team_recent[team_recent["Team"].eq(team)].iloc[0] if not team_recent.empty and team in set(team_recent["Team"]) else pd.Series(dtype=object)
+    orc = team_recent[team_recent["Team"].eq(opponent)].iloc[0] if not team_recent.empty and opponent in set(team_recent["Team"]) else pd.Series(dtype=object)
+
+    team_pace = safe_float(t.get("Pace"), np.nan)
+    opp_pace = safe_float(o.get("Pace"), safe_float(row.get("Opponent Pace"), np.nan))
+    recent_team_pace = safe_float(tr.get("Pace_L10"), safe_float(tr.get("Pace_L5"), np.nan))
+    recent_opp_pace = safe_float(orc.get("Pace_L10"), safe_float(orc.get("Pace_L5"), np.nan))
+    pace_parts = [(team_pace, 0.30), (opp_pace, 0.30), (recent_team_pace, 0.20), (recent_opp_pace, 0.20)]
+    valid = [(v, w) for v, w in pace_parts if pd.notna(v) and v > 0]
+    projected_pace = sum(v*w for v, w in valid) / sum(w for _, w in valid) if valid else safe_float(row.get("Game Pace ML"), 79.0)
+    projected_pace = float(np.clip(projected_pace, 72.0, 88.0))
+
+    gp = max(1.0, safe_float(t.get("GP"), safe_float(t.get("Games"), 1.0)))
+    team_fga_pg = safe_float(t.get("FGA_per_game"), np.nan)
+    if pd.isna(team_fga_pg):
+        team_fga_pg = safe_float(t.get("FGA"), np.nan) / gp if pd.notna(safe_float(t.get("FGA"), np.nan)) else np.nan
+    team_fta_pg = safe_float(t.get("FTA_per_game"), np.nan)
+    if pd.isna(team_fta_pg):
+        team_fta_pg = safe_float(t.get("FTA"), np.nan) / gp if pd.notna(safe_float(t.get("FTA"), np.nan)) else np.nan
+    team_pace_ref = team_pace if pd.notna(team_pace) and team_pace > 0 else 79.0
+    pace_mult = float(np.clip(projected_pace / team_pace_ref, 0.92, 1.08))
+    fga_budget = (team_fga_pg if pd.notna(team_fga_pg) else 69.0) * pace_mult
+
+    opp_fta_allowed = safe_float(od.get("OppFTA_per_game"), np.nan)
+    if pd.notna(opp_fta_allowed) and pd.notna(team_fta_pg):
+        fta_base = 0.68*team_fta_pg + 0.32*opp_fta_allowed
+    else:
+        fta_base = team_fta_pg if pd.notna(team_fta_pg) else (opp_fta_allowed if pd.notna(opp_fta_allowed) else 20.0)
+    fta_budget = float(np.clip(fta_base * pace_mult, 10.0, 34.0))
+
+    game_ctx = _wnba_game_script_context(pd.Series({**row.to_dict(), "Market": "PTS"}))
+    if game_ctx.get("ok"):
+        team_score = safe_float(game_ctx.get("team_score"), np.nan)
+        blowout = safe_float(game_ctx.get("blowout_risk"), 0.0)
+    else:
+        ppg = safe_float(t.get("PTS_per_game"), safe_float(t.get("PTS"), np.nan) / gp if pd.notna(safe_float(t.get("PTS"), np.nan)) else np.nan)
+        allowed = safe_float(od.get("OppPTS_per_game"), safe_float(o.get("PointsAllowed_per_game"), np.nan))
+        vals = [v for v in [ppg, allowed] if pd.notna(v)]
+        team_score = float(np.mean(vals)) if vals else np.nan
+        blowout = safe_float(row.get("Blowout Risk ML"), 0.0)
+
+    data_through = []
+    for src in [t, od, tr]:
+        val = src.get("DataThrough") if isinstance(src, pd.Series) else None
+        dt = pd.to_datetime(val, errors="coerce")
+        if pd.notna(dt):
+            data_through.append(dt)
+    latest_data = max(data_through) if data_through else pd.NaT
+    return {
+        "pace": projected_pace,
+        "fga_budget": float(np.clip(fga_budget, 58.0, 82.0)),
+        "fta_budget": fta_budget,
+        "team_score": team_score,
+        "blowout": blowout,
+        "opp_row": od,
+        "latest_data": latest_data,
+        "data_ok": not t.empty and not od.empty,
+    }
+
+
+def _pts_v2_rotation(base: Optional[pd.DataFrame], team: str, target_key: str, target_minutes: float, target_role_factor: float, env: Dict[str, Any], excluded_keys: Optional[set] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if base is None or base.empty:
+        return pd.DataFrame(), {"note": "missing master baseline"}
+    b = base.copy()
+    if "Team" not in b.columns:
+        return pd.DataFrame(), {"note": "master baseline missing team"}
+    b["_TeamKey"] = b["Team"].map(_team_key_for_matchup)
+    b = b[b["_TeamKey"].eq(team)].copy()
+    excluded_keys = {normalize_name(x) for x in (excluded_keys or set()) if normalize_name(x)}
+    if target_key in excluded_keys:
+        return pd.DataFrame(), {"note": "target player is inactive on the current injury feed"}
+    if excluded_keys:
+        b = b[~b["NameKey"].astype(str).isin(excluded_keys)].copy()
+    if b.empty:
+        return pd.DataFrame(), {"note": "team rotation unavailable"}
+    if "Season" in b.columns:
+        b["Season"] = pd.to_numeric(b["Season"], errors="coerce")
+        latest = b["Season"].max()
+        if pd.notna(latest):
+            b = b[b["Season"].eq(latest)].copy()
+    b = b.drop_duplicates("NameKey", keep="last")
+    records = []
+    for _, br in b.iterrows():
+        key = normalize_name(br.get("Player"))
+        mins = _pts_v2_minutes_base(br)
+        if pd.isna(mins) or mins <= 0:
+            continue
+        fga_pg = _pts_v2_weighted_br_stat(br, "FGA")
+        fta_pg = _pts_v2_weighted_br_stat(br, "FTA")
+        if pd.isna(fga_pg):
+            continue
+        raw_fga = _pts_v2_rate_for_minutes(br, "FGA", mins)
+        raw_fta = _pts_v2_rate_for_minutes(br, "FTA", mins)
+        usg = safe_float(br.get("USG%"), np.nan)
+        records.append({"NameKey": key, "Player": br.get("Player"), "mins_base": mins, "raw_fga": raw_fga, "raw_fta": 0.0 if pd.isna(raw_fta) else raw_fta, "usg": usg, "_br": br})
+    rot = pd.DataFrame(records)
+    if rot.empty:
+        return rot, {"note": "rotation had no FGA baselines"}
+    # Top 10 rotation players by expected minutes; force the target into the set.
+    rot = rot.sort_values("mins_base", ascending=False)
+    top = rot.head(10).copy()
+    if target_key and target_key not in set(top["NameKey"]) and target_key in set(rot["NameKey"]):
+        target_row = rot[rot["NameKey"].eq(target_key)].head(1)
+        top = pd.concat([top.head(9), target_row], ignore_index=True)
+    rot = top.drop_duplicates("NameKey", keep="first").copy()
+    if target_key in set(rot["NameKey"]) and pd.notna(target_minutes) and target_minutes > 0:
+        target_minutes = float(np.clip(target_minutes, 4.0, 40.0))
+        other_mask = ~rot["NameKey"].eq(target_key)
+        other_sum = rot.loc[other_mask, "mins_base"].sum()
+        remaining = max(80.0, 200.0 - target_minutes)
+        if other_sum > 0:
+            rot.loc[other_mask, "proj_min"] = rot.loc[other_mask, "mins_base"] * remaining / other_sum
+        rot.loc[~other_mask, "proj_min"] = target_minutes
+    else:
+        total_min = rot["mins_base"].sum()
+        rot["proj_min"] = rot["mins_base"] * 200.0 / total_min if total_min > 0 else rot["mins_base"]
+
+    rot["fga_weight"] = rot.apply(lambda r: max(0.05, r["raw_fga"] * (r["proj_min"] / max(r["mins_base"], 1e-6))), axis=1)
+    rot["fta_weight"] = rot.apply(lambda r: max(0.02, r["raw_fta"] * (r["proj_min"] / max(r["mins_base"], 1e-6))), axis=1)
+    if target_key in set(rot["NameKey"]):
+        rot.loc[rot["NameKey"].eq(target_key), "fga_weight"] *= target_role_factor
+        rot.loc[rot["NameKey"].eq(target_key), "fta_weight"] *= target_role_factor
+
+    # Usage nudges shot allocation without overpowering actual FGA history.
+    valid_usg = pd.to_numeric(rot["usg"], errors="coerce").dropna()
+    usg_center = float(valid_usg.median()) if not valid_usg.empty else np.nan
+    if pd.notna(usg_center) and usg_center > 0:
+        usg_mult = (pd.to_numeric(rot["usg"], errors="coerce").fillna(usg_center) / usg_center).pow(0.18).clip(0.90, 1.12)
+        rot["fga_weight"] *= usg_mult
+        rot["fta_weight"] *= usg_mult.pow(0.65)
+
+    fga_sum = rot["fga_weight"].sum()
+    fta_sum = rot["fta_weight"].sum()
+    rot["proj_fga"] = env["fga_budget"] * rot["fga_weight"] / max(fga_sum, 1e-9)
+    rot["proj_fta"] = env["fta_budget"] * rot["fta_weight"] / max(fta_sum, 1e-9)
+
+    opp_table = _pts_v2_latest_team_table("team_opponent_stats")
+    opp_efg_med = pd.to_numeric(opp_table.get("Opp_eFG%", pd.Series(dtype=float)), errors="coerce").median() if not opp_table.empty else np.nan
+    expected = []
+    for _, r in rot.iterrows():
+        br = r["_br"]
+        eff = _pts_v2_player_efficiency(br, env.get("opp_row"), opp_efg_med)
+        three_a = float(np.clip(r["proj_fga"] * eff["three_rate"], 0.0, r["proj_fga"]))
+        two_a = max(0.0, r["proj_fga"] - three_a)
+        pts = 2.0*two_a*eff["two_pct"] + 3.0*three_a*eff["three_pct"] + r["proj_fta"]*eff["ft_pct"]
+        expected.append(pts)
+    rot["raw_pts"] = expected
+    rotation_pts = float(rot["raw_pts"].sum())
+    team_score = safe_float(env.get("team_score"), np.nan)
+    total_scale = float(np.clip(team_score / rotation_pts, 0.92, 1.08)) if pd.notna(team_score) and rotation_pts > 0 else 1.0
+    rot["proj_pts"] = rot["raw_pts"] * total_scale
+    inactive_n = len(excluded_keys)
+    note = "top-10 inferred rotation normalized to 200 team minutes"
+    if inactive_n:
+        note += f"; redistributed team FGA/FTA after excluding {inactive_n} inactive teammate(s)"
+    return rot, {"rotation_pts_raw": rotation_pts, "team_total_scale": total_scale, "team_score": team_score, "usage_budget": 100.0, "inactive_teammates": inactive_n, "note": note}
+
+
+def _pts_v2_monte_carlo(row: pd.Series, v2: Dict[str, Any], sims: int = 10000) -> Dict[str, float]:
+    proj_fga = max(0.0, safe_float(v2.get("projected_fga"), 0.0))
+    proj_fta = max(0.0, safe_float(v2.get("projected_fta"), 0.0))
+    three_rate = float(np.clip(safe_float(v2.get("three_rate"), 0.30), 0.01, 0.85))
+    two_pct = float(np.clip(safe_float(v2.get("two_pct"), 0.50), 0.20, 0.80))
+    three_pct = float(np.clip(safe_float(v2.get("three_pct"), 0.34), 0.15, 0.60))
+    ft_pct = float(np.clip(safe_float(v2.get("ft_pct"), 0.80), 0.45, 0.98))
+    target_scale = safe_float(v2.get("team_total_scale"), 1.0)
+    minutes = max(1.0, safe_float(row.get("MIN Proj"), 28.0))
+    p25 = safe_float(row.get("Minutes Low Outcome"), np.nan)
+    p75 = safe_float(row.get("Minutes High Outcome"), np.nan)
+    min_sd = max(1.4, (p75-p25)/1.349) if pd.notna(p25) and pd.notna(p75) and p75 > p25 else max(1.8, minutes*0.085)
+    seed = stable_seed("pts_v2", row.get("Player"), row.get("Team"), row.get("Opponent"), row.get("Line"), PTS_V2_ENGINE_VERSION)
+    rng = np.random.default_rng(seed)
+    sim_min = np.clip(rng.normal(minutes, min_sd, sims), 4.0, 40.0)
+    min_factor = sim_min / max(minutes, 1e-6)
+    fga_lambda = np.clip(proj_fga * min_factor, 0.05, 35.0)
+    fta_lambda = np.clip(proj_fta * min_factor, 0.02, 20.0)
+    fga = np.clip(rng.poisson(fga_lambda), 0, 40)
+    three_a = rng.binomial(fga.astype(int), three_rate)
+    two_a = fga - three_a
+    fta = np.clip(rng.poisson(fta_lambda), 0, 25)
+    three_m = rng.binomial(three_a.astype(int), three_pct)
+    two_m = rng.binomial(two_a.astype(int), two_pct)
+    ftm = rng.binomial(fta.astype(int), ft_pct)
+    pts = (2*two_m + 3*three_m + ftm).astype(float) * target_scale
+    line = safe_float(row.get("Line"), np.nan)
+    result = {
+        "mean": float(np.mean(pts)), "p10": float(np.quantile(pts, 0.10)), "p25": float(np.quantile(pts, 0.25)),
+        "p50": float(np.quantile(pts, 0.50)), "p75": float(np.quantile(pts, 0.75)), "p90": float(np.quantile(pts, 0.90)),
+        "sd": float(np.std(pts, ddof=0)), "over": np.nan, "under": np.nan, "push": np.nan,
+    }
+    if pd.notna(line):
+        result["over"] = float(np.mean(pts > line) * 100.0)
+        result["under"] = float(np.mean(pts < line) * 100.0)
+        result["push"] = float(np.mean(np.isclose(pts, line)) * 100.0)
+    return result
+
+
+def _pts_v2_compute(row: pd.Series, base: Optional[pd.DataFrame], base_lookup: pd.DataFrame, team_season: pd.DataFrame, team_opp: pd.DataFrame, team_recent: pd.DataFrame, excluded_keys: Optional[set] = None) -> Dict[str, Any]:
+    key = normalize_name(row.get("Matched Player") or row.get("Player"))
+    br = base_lookup.loc[key] if (base_lookup is not None and not base_lookup.empty and key in base_lookup.index) else None
+    if br is None:
+        return {"ok": False, "note": "missing player baseline"}
+    team = _team_key_for_matchup(row.get("Team"))
+    opp = _team_key_for_matchup(row.get("Opponent"))
+    minutes = safe_float(row.get("MIN Proj"), _pts_v2_minutes_base(br))
+    if not team or not opp or pd.isna(minutes) or minutes <= 0:
+        return {"ok": False, "note": "team/opponent/minutes incomplete"}
+    role_factor, role_note = _role_on_off_factor(pd.Series({**row.to_dict(), "Market": "PTS"}), br, "PTS")
+    role_factor = float(np.clip(role_factor, 0.90, 1.10))
+    env = _pts_v2_team_environment(team, opp, row, team_season, team_opp, team_recent)
+    rot, rot_meta = _pts_v2_rotation(base, team, key, minutes, role_factor, env, excluded_keys=excluded_keys)
+    if rot.empty or key not in set(rot["NameKey"]):
+        return {"ok": False, "note": "target player missing from inferred rotation"}
+    target = rot[rot["NameKey"].eq(key)].iloc[0]
+    opp_table = team_opp
+    opp_efg_med = pd.to_numeric(opp_table.get("Opp_eFG%", pd.Series(dtype=float)), errors="coerce").median() if not opp_table.empty else np.nan
+    eff = _pts_v2_player_efficiency(br, env.get("opp_row"), opp_efg_med)
+    proj = float(target["proj_pts"])
+    projected_fga = float(target["proj_fga"])
+    projected_fta = float(target["proj_fta"])
+    projected_3pa = float(projected_fga * eff["three_rate"])
+    fga_share = float(target["proj_fga"] / max(env["fga_budget"], 1e-9) * 100.0)
+    fta_share = float(target["proj_fta"] / max(env["fta_budget"], 1e-9) * 100.0)
+    usg = safe_float(br.get("USG%"), np.nan)
+    flags = []
+    own_fga = _pts_v2_rate_for_minutes(br, "FGA", minutes)
+    if pd.notna(own_fga) and own_fga > 0 and projected_fga/own_fga >= 1.14:
+        flags.append("HIGH_FGA_ASSUMPTION")
+    if pd.notna(usg) and usg >= 30:
+        flags.append("HIGH_USAGE_PLAYER")
+    ft_points = projected_fta * eff["ft_pct"] * safe_float(rot_meta.get("team_total_scale"), 1.0)
+    if proj > 0 and ft_points/proj >= 0.24:
+        flags.append("FTA_DEPENDENT")
+    if eff["three_rate"] >= 0.48:
+        flags.append("THREE_POINT_DEPENDENT")
+    if safe_float(row.get("Role Confidence"), 100.0) < 70:
+        flags.append("ROLE_UNCERTAINTY")
+    if safe_float(row.get("Minutes Confidence"), 100.0) < 70:
+        flags.append("MINUTES_UNCERTAINTY")
+    if bool(row.get("Opponent Context Fallback Used", False)) or not env.get("data_ok"):
+        flags.append("FALLBACK_MATCHUP_DATA")
+    if abs(safe_float(rot_meta.get("team_total_scale"), 1.0)-1.0) >= 0.055:
+        flags.append("TEAM_TOTAL_CONFLICT")
+    if safe_float(rot_meta.get("inactive_teammates"), 0) > 0:
+        flags.append("TEAMMATE_USAGE_REDISTRIBUTED")
+    if not bool(row.get("Lineup Confirmed", False)):
+        flags.append("ROTATION_INFERRED")
+
+    result = {
+        "ok": True, "projection": proj, "projected_fga": projected_fga, "projected_3pa": projected_3pa,
+        "projected_fta": projected_fta, "usage_pct": usg, "team_fga_share": fga_share, "team_fta_share": fta_share,
+        "two_pct": eff["two_pct"], "three_pct": eff["three_pct"], "ft_pct": eff["ft_pct"], "three_rate": eff["three_rate"],
+        "pace": env["pace"], "team_fga_budget": env["fga_budget"], "team_fta_budget": env["fta_budget"],
+        "team_score": safe_float(rot_meta.get("team_score"), np.nan), "rotation_pts_raw": safe_float(rot_meta.get("rotation_pts_raw"), np.nan),
+        "team_total_scale": safe_float(rot_meta.get("team_total_scale"), 1.0), "role_factor": role_factor,
+        "role_note": role_note, "flags": flags, "rotation_note": rot_meta.get("note", ""), "latest_data": env.get("latest_data", pd.NaT),
+        "inactive_teammates": int(safe_float(rot_meta.get("inactive_teammates"), 0)),
+    }
+    mc = _pts_v2_monte_carlo(row, result, sims=10000)
+    result["mc"] = mc
+    return result
+
+
+def _attach_pts_v2_challenger(board: pd.DataFrame, base: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Attach team-constrained scoring challenger while leaving legacy untouched."""
+    if board is None or board.empty:
+        return board
+    out = board.copy()
+    out["Legacy Projection"] = pd.to_numeric(out.get("Projection"), errors="coerce")
+    base_lookup = _v344_player_lookup(base) if base is not None and not base.empty else pd.DataFrame()
+    team_season = _pts_v2_latest_team_table("team_season_stats")
+    team_opp = _pts_v2_latest_team_table("team_opponent_stats")
+    team_recent = _pts_v2_latest_team_table("team_recent_stats")
+    inactive_by_team: Dict[str, set] = {}
+    injury_note = "no injury feed loaded"
+    try:
+        mode = str(out.get("Slate", pd.Series(["Today"])).iloc[0] if "Slate" in out.columns and len(out) else "Today")
+        injuries, injury_note = _combined_live_injury_table(mode)
+        if injuries is not None and not injuries.empty:
+            for _, ir in injuries.iterrows():
+                status = str(ir.get("StatusKey", ir.get("Status", "")) or "").upper()
+                if any(tag in status for tag in ["OUT", "DOUBTFUL", "INACTIVE", "SUSPENDED"]):
+                    tk = _team_key_for_matchup(ir.get("TeamKey") or ir.get("Team"))
+                    nk = normalize_name(ir.get("NameKey") or ir.get("Player"))
+                    if tk and nk:
+                        inactive_by_team.setdefault(tk, set()).add(nk)
+    except Exception as exc:
+        injury_note = f"injury redistribution unavailable: {str(exc)[:100]}"
+    cache: Dict[Tuple[str, str, str, float, Tuple[str, ...]], Dict[str, Any]] = {}
+    rows = []
+    for _, rr in out.iterrows():
+        row = rr.copy()
+        key = normalize_name(row.get("Matched Player") or row.get("Player"))
+        team = _team_key_for_matchup(row.get("Team"))
+        opp = _team_key_for_matchup(row.get("Opponent"))
+        minutes = round(safe_float(row.get("MIN Proj"), -1.0), 2)
+        excluded = inactive_by_team.get(team, set())
+        ck = (key, team, opp, minutes, tuple(sorted(excluded)))
+        if ck not in cache:
+            cache[ck] = _pts_v2_compute(row, base, base_lookup, team_season, team_opp, team_recent, excluded_keys=excluded)
+        v2 = cache[ck]
+        row["PTS V2 Injury Redistribution"] = injury_note
+        market = str(row.get("Market", "")).upper()
+        row["PTS V2 Version"] = PTS_V2_ENGINE_VERSION
+        row["PTS V2 Status"] = "READY" if v2.get("ok") else "UNAVAILABLE"
+        row["PTS V2 Note"] = v2.get("note", "team-constrained opportunity challenger") if not v2.get("ok") else f"{v2.get('rotation_note','')} | {v2.get('role_note','')}"
+        if v2.get("ok"):
+            mc = v2.get("mc", {})
+            p50 = safe_float(mc.get("p50"), v2.get("projection"))
+            line = safe_float(row.get("Line"), np.nan)
+            v2_proj = safe_float(v2.get("projection"), np.nan)
+            v2_edge = v2_proj-line if pd.notna(v2_proj) and pd.notna(line) else np.nan
+            overp = safe_float(mc.get("over"), np.nan)
+            underp = safe_float(mc.get("under"), np.nan)
+            mean_side = "OVER" if pd.notna(v2_edge) and v2_edge > 0 else "UNDER" if pd.notna(v2_edge) and v2_edge < 0 else "PUSH"
+            median_side = "OVER" if pd.notna(line) and p50 > line else "UNDER" if pd.notna(line) and p50 < line else "PUSH"
+            flags = list(v2.get("flags", []))
+            if mean_side != median_side and "PUSH" not in {mean_side, median_side}:
+                flags.append("MEAN_P50_CONFLICT")
+            selected_prob = overp if mean_side == "OVER" else underp if mean_side == "UNDER" else max(overp, underp) if pd.notna(overp) else np.nan
+            if pd.notna(v2_edge) and abs(v2_edge) < 0.50:
+                flags.append("LOW_EDGE")
+            if mean_side == median_side and pd.notna(selected_prob) and selected_prob >= 56.0 and pd.notna(v2_edge) and abs(v2_edge) >= 0.50:
+                v2_side = mean_side
+            else:
+                v2_side = "PASS"
+            # Staleness is informational and blocks V2 promotion quality, not Legacy.
+            latest_data = pd.to_datetime(v2.get("latest_data"), errors="coerce")
+            target_date = pd.to_datetime(str(row.get("SlateDate", "")), errors="coerce")
+            age_days = (target_date.normalize()-latest_data.normalize()).days if pd.notna(target_date) and pd.notna(latest_data) else np.nan
+            if pd.notna(age_days) and age_days > 2:
+                flags.append("STALE_TEAM_DATA")
+            quality = "HIGH"
+            if any(f in flags for f in ["FALLBACK_MATCHUP_DATA", "ROTATION_INFERRED", "STALE_TEAM_DATA"]):
+                quality = "MEDIUM"
+            if any(f in flags for f in ["FALLBACK_MATCHUP_DATA", "STALE_TEAM_DATA"]) and len(flags) >= 3:
+                quality = "LOW"
+            row["PTS V2 Projection"] = round(v2_proj, 2)
+            row["PTS V2 Edge"] = round(v2_edge, 2) if pd.notna(v2_edge) else np.nan
+            row["PTS V2 Side"] = v2_side
+            row["PTS V2 Mean Side"] = mean_side
+            row["PTS V2 Median Side"] = median_side
+            row["PTS V2 Over %"] = round(overp, 1) if pd.notna(overp) else np.nan
+            row["PTS V2 Under %"] = round(underp, 1) if pd.notna(underp) else np.nan
+            row["PTS V2 P10"] = round(safe_float(mc.get("p10"), np.nan), 2)
+            row["PTS V2 P25"] = round(safe_float(mc.get("p25"), np.nan), 2)
+            row["PTS V2 P50"] = round(p50, 2)
+            row["PTS V2 P75"] = round(safe_float(mc.get("p75"), np.nan), 2)
+            row["PTS V2 P90"] = round(safe_float(mc.get("p90"), np.nan), 2)
+            row["PTS V2 SD"] = round(safe_float(mc.get("sd"), np.nan), 2)
+            row["PTS V2 Projected FGA"] = round(v2["projected_fga"], 2)
+            row["PTS V2 Projected 3PA"] = round(v2["projected_3pa"], 2)
+            row["PTS V2 Projected FTA"] = round(v2["projected_fta"], 2)
+            row["PTS V2 Usage %"] = round(v2["usage_pct"], 2) if pd.notna(v2["usage_pct"]) else np.nan
+            row["PTS V2 Team FGA Share %"] = round(v2["team_fga_share"], 2)
+            row["PTS V2 Team FTA Share %"] = round(v2["team_fta_share"], 2)
+            row["PTS V2 Team FGA Budget"] = round(v2["team_fga_budget"], 2)
+            row["PTS V2 Team FTA Budget"] = round(v2["team_fta_budget"], 2)
+            row["PTS V2 Expected Team Points"] = round(v2["team_score"], 2) if pd.notna(v2["team_score"]) else np.nan
+            row["PTS V2 Rotation Raw Points"] = round(v2["rotation_pts_raw"], 2) if pd.notna(v2["rotation_pts_raw"]) else np.nan
+            row["PTS V2 Team Total Scale"] = round(v2["team_total_scale"], 4)
+            row["PTS V2 2P%"] = round(v2["two_pct"], 4)
+            row["PTS V2 3P%"] = round(v2["three_pct"], 4)
+            row["PTS V2 FT%"] = round(v2["ft_pct"], 4)
+            row["PTS V2 Flags"] = " | ".join(dict.fromkeys(flags))
+            row["PTS V2 Data Quality"] = quality
+            row["PTS V2 Team Data Age Days"] = age_days
+            row["PTS V2 Inactive Teammates"] = int(safe_float(v2.get("inactive_teammates"), 0))
+            if market == "PTS":
+                row["Challenger Projection"] = row["PTS V2 Projection"]
+                row["Challenger Side"] = row["PTS V2 Side"]
+            elif market == "PRA":
+                reb = safe_float(row.get("REB Component Opportunity"), np.nan)
+                ast = safe_float(row.get("AST Component Opportunity"), np.nan)
+                if pd.notna(reb) and pd.notna(ast):
+                    pra_v2 = v2_proj + reb + ast
+                    row["PRA V2 Projection"] = round(pra_v2, 2)
+                    row["PRA V2 Component PTS"] = round(v2_proj, 2)
+                    row["PRA V2 Component REB Legacy"] = round(reb, 2)
+                    row["PRA V2 Component AST Legacy"] = round(ast, 2)
+                    row["Challenger Projection"] = round(pra_v2, 2)
+            elif market == "REB":
+                row["V2 Market Policy"] = "REB_LEGACY_PROTECTED"
+            elif market == "AST":
+                row["V2 Market Policy"] = "AST_LEGACY_UNTIL_PTS_VALIDATED"
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    result["PTS V2 Promotion Status"] = "CHALLENGER_ONLY" if not PTS_V2_PROMOTE_TO_PRODUCTION else "PROMOTED"
+    # Safety assertion: App 117 must not silently change the locked production baseline.
+    if not np.allclose(pd.to_numeric(result["Projection"], errors="coerce"), pd.to_numeric(result["Legacy Projection"], errors="coerce"), equal_nan=True):
+        raise RuntimeError("PTS V2 challenger changed locked legacy Projection")
+    return result
+
+
+# ============================================================
+# App 118 — ELITE GAME -> TEAM -> ROLE -> OPPORTUNITY ENGINE
+# ============================================================
+ELITE_ENGINE_VERSION = "ELITE_ROLE_BUDGET_V3_APP120"
+ELITE_MAX_RANK = 200
+ELITE_PROMOTE_TO_PRODUCTION = False
+
+
+def _elite_pct_rank(series: pd.Series) -> pd.Series:
+    x = pd.to_numeric(series, errors="coerce")
+    if x.notna().sum() <= 1:
+        return pd.Series(50.0, index=series.index)
+    return (x.rank(pct=True, method="average") * 100.0).fillna(50.0)
+
+
+def _elite_latest_base(base: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if base is None or base.empty:
+        return pd.DataFrame()
+    b = base.copy()
+    if "NameKey" not in b.columns:
+        b["NameKey"] = b.get("Player", pd.Series("", index=b.index)).map(normalize_name)
+    b["_TeamKey"] = b.get("Team", pd.Series("", index=b.index)).map(_team_key_for_matchup)
+    if "Season" in b.columns:
+        b["Season"] = pd.to_numeric(b["Season"], errors="coerce")
+        latest = b["Season"].max()
+        if pd.notna(latest):
+            current = b[b["Season"].eq(latest)].copy()
+            if not current.empty:
+                b = current
+    b = b.drop_duplicates("NameKey", keep="last").copy()
+    # Overlay the corrected current-season shot *location* profile directly from
+    # the shot cache. This protects Elite from an older master_features file that
+    # may still contain the pre-App118 three-point classification bug.
+    try:
+        _pf, _, _ = _elite_current_shot_context()
+    except Exception:
+        _pf = pd.DataFrame()
+    if _pf is not None and not _pf.empty and "NameKey" in _pf.columns:
+        _pf = _pf.drop_duplicates("NameKey", keep="last").set_index("NameKey")
+        for _c in ["ThreePARate","RimRate","MidRangeRate","AvgShotDistance","ShotAttempts"]:
+            if _c not in _pf.columns:
+                continue
+            _map = _pf[_c].to_dict()
+            _fresh = b["NameKey"].map(_map)
+            if _c in b.columns:
+                b[_c] = _fresh.where(_fresh.notna(), b[_c])
+            else:
+                b[_c] = _fresh
+    return b
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _elite_starter_rate_table() -> pd.DataFrame:
+    try:
+        logs = load_dataset("player_game_logs")
+    except Exception:
+        logs = pd.DataFrame()
+    if logs is None or logs.empty or "Player" not in logs.columns:
+        return pd.DataFrame(columns=["NameKey", "Team", "StarterRate", "StarterGames"])
+    d = standardize_player_logs(logs)
+    if d.empty:
+        return pd.DataFrame(columns=["NameKey", "Team", "StarterRate", "StarterGames"])
+    d["Season"] = pd.to_numeric(d.get("Season"), errors="coerce")
+    latest = d["Season"].max()
+    if pd.notna(latest):
+        d = d[d["Season"].eq(latest)].copy()
+    d = d[d.get("Played", True).fillna(True).astype(bool)] if "Played" in d.columns else d
+    d["Team"] = d["Team"].map(_team_key_for_matchup)
+    d["StarterNum"] = d.get("Starter", False).fillna(False).astype(bool).astype(float)
+    return d.groupby(["NameKey", "Team"], as_index=False).agg(StarterRate=("StarterNum", "mean"), StarterGames=("StarterNum", "count"))
+
+
+def _elite_inactive_by_team(mode: str) -> Tuple[Dict[str, set], Dict[str, set], str]:
+    out: Dict[str, set] = {}
+    questionable: Dict[str, set] = {}
+    note = "injury feed unavailable"
+    try:
+        inj, note = _combined_live_injury_table(mode)
+        if inj is None or inj.empty:
+            return out, questionable, note
+        for _, r in inj.iterrows():
+            team = _team_key_for_matchup(r.get("TeamKey") or r.get("Team"))
+            key = normalize_name(r.get("NameKey") or r.get("Player"))
+            status = str(r.get("StatusKey", r.get("Status", "")) or "").upper()
+            if not team or not key:
+                continue
+            if any(tag in status for tag in ["OUT", "DOUBTFUL", "INACTIVE", "SUSPENDED", "NOT PLAY"]):
+                out.setdefault(team, set()).add(key)
+            elif any(tag in status for tag in ["QUESTIONABLE", "GTD", "GAME TIME", "DAY-TO-DAY"]):
+                questionable.setdefault(team, set()).add(key)
+    except Exception as exc:
+        note = f"injury feed error: {str(exc)[:100]}"
+    return out, questionable, note
+
+
+def _elite_row(df: pd.DataFrame, team: str) -> pd.Series:
+    if df is None or df.empty or "Team" not in df.columns:
+        return pd.Series(dtype=object)
+    hit = df[df["Team"].eq(team)]
+    return hit.iloc[-1] if not hit.empty else pd.Series(dtype=object)
+
+
+def _elite_valid_rating(value: Any, fallback: float, low: float = 88.0, high: float = 120.0) -> float:
+    v = safe_float(value, np.nan)
+    return float(v) if pd.notna(v) and low <= v <= high else float(fallback)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _elite_current_shot_context() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Current-season player shot profile + team offensive/allowed shot frequencies.
+
+    Only *attempt location/frequency* is trusted from play-by-play here. Shooting
+    efficiency comes from box-score FGM/FGA because some upstream event make flags
+    are duplicated/misencoded. This separation keeps the matchup layer useful
+    without contaminating the scoring mean.
+    """
+    try:
+        shots = load_dataset("shots")
+    except Exception:
+        shots = pd.DataFrame()
+    try:
+        schedules = load_dataset("schedules")
+    except Exception:
+        schedules = pd.DataFrame()
+    if shots is None or shots.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    sh = standardize_shots(shots)
+    if sh.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    sh = sh.drop_duplicates().copy()
+    sh["Season"] = pd.to_numeric(sh.get("Season"), errors="coerce")
+    latest = sh["Season"].max()
+    if pd.notna(latest):
+        sh = sh[sh["Season"].eq(latest)].copy()
+    sh["Team"] = sh["Team"].map(_canonical_wnba_team)
+    sh = sh[sh["Team"].astype(str).str.len() > 0].copy()
+
+    # Player profile from corrected attempt geometry.
+    pf = build_shot_features(sh)
+    if not pf.empty and pd.notna(latest):
+        pf = pf[pd.to_numeric(pf["Season"], errors="coerce").eq(latest)].copy()
+
+    # Team/opponent profile requires schedule identity.
+    if schedules is None or schedules.empty or "GameID" not in sh.columns:
+        return pf, pd.DataFrame(), pd.DataFrame()
+    sc = standardize_schedules(schedules)
+    if sc.empty or not {"GameID","Home","Away"}.issubset(sc.columns):
+        return pf, pd.DataFrame(), pd.DataFrame()
+    sc = sc.copy()
+    sc["GameIDKey"] = sc["GameID"].astype(str)
+    sc["Home"] = sc["Home"].map(_canonical_wnba_team)
+    sc["Away"] = sc["Away"].map(_canonical_wnba_team)
+    sc = sc[(sc["Home"].astype(str).str.len()>0) & (sc["Away"].astype(str).str.len()>0)].drop_duplicates("GameIDKey", keep="last")
+    sh["GameIDKey"] = sh["GameID"].astype(str)
+    sh = sh.merge(sc[["GameIDKey","Home","Away"]], on="GameIDKey", how="left")
+    sh["Opponent"] = np.where(sh["Team"].eq(sh["Home"]), sh["Away"], np.where(sh["Team"].eq(sh["Away"]), sh["Home"], ""))
+    sh = sh[sh["Opponent"].astype(str).str.len()>0].copy()
+    if sh.empty:
+        return pf, pd.DataFrame(), pd.DataFrame()
+    sh["Attempt"] = 1.0
+    sh["ThreeAttempt"] = sh["Is3"].fillna(False).astype(bool).astype(float)
+    sh["RimAttempt"] = sh["AtRim"].fillna(False).astype(bool).astype(float)
+    sh["MidAttempt"] = sh["MidRange"].fillna(False).astype(bool).astype(float)
+
+    def _freq_table(group_col: str) -> pd.DataFrame:
+        g = sh.groupby(group_col, as_index=False).agg(
+            ShotAttempts=("Attempt","sum"), ThreeAttempts=("ThreeAttempt","sum"),
+            RimAttempts=("RimAttempt","sum"), MidAttempts=("MidAttempt","sum"),
+            DataThrough=("GameDate","max"),
+        ).rename(columns={group_col:"Team"})
+        denom = g["ShotAttempts"].replace(0,np.nan)
+        g["ThreeFreq"] = g["ThreeAttempts"] / denom
+        g["RimFreq"] = g["RimAttempts"] / denom
+        g["MidFreq"] = g["MidAttempts"] / denom
+        return g
+
+    offense = _freq_table("Team")
+    defense = _freq_table("Opponent").rename(columns={
+        "ThreeFreq":"AllowedThreeFreq","RimFreq":"AllowedRimFreq","MidFreq":"AllowedMidFreq",
+        "ShotAttempts":"OppShotAttempts","ThreeAttempts":"AllowedThreeAttempts",
+        "RimAttempts":"AllowedRimAttempts","MidAttempts":"AllowedMidAttempts",
+    })
+    return pf, offense, defense
+
+
+def _elite_shot_matchup_fit(br: pd.Series, team: str, opponent: str, position_group: str) -> Dict[str, float]:
+    """Translate shot-location matchups into small, bounded role-share factors."""
+    try:
+        _, offense, defense = _elite_current_shot_context()
+    except Exception:
+        offense = defense = pd.DataFrame()
+    neutral = {"scoring_factor":1.0,"rebound_factor":1.0,"scoring_fit":50.0,"rebound_fit":50.0}
+    if offense.empty or defense.empty:
+        return neutral
+    dh = defense[defense["Team"].eq(opponent)] if "Team" in defense.columns else pd.DataFrame()
+    oh = offense[offense["Team"].eq(opponent)] if "Team" in offense.columns else pd.DataFrame()
+    if dh.empty or oh.empty:
+        return neutral
+    drow = dh.iloc[-1]; orow = oh.iloc[-1]
+    # Player profile; position priors are used only when shot events are missing.
+    p3 = safe_float(br.get("ThreePARate"), np.nan)
+    rim = safe_float(br.get("RimRate"), np.nan)
+    mid = safe_float(br.get("MidRangeRate"), np.nan)
+    pos = str(position_group or "").upper()
+    if not all(pd.notna(v) for v in [p3,rim,mid]) or (p3+rim+mid) <= .25:
+        if "BIG" in pos:
+            p3,rim,mid = .16,.48,.36
+        elif "GUARD" in pos:
+            p3,rim,mid = .42,.24,.34
+        else:
+            p3,rim,mid = .34,.31,.35
+    total=max(p3+rim+mid,1e-9); p3,rim,mid=p3/total,rim/total,mid/total
+    med3 = pd.to_numeric(defense.get("AllowedThreeFreq"),errors="coerce").median()
+    medr = pd.to_numeric(defense.get("AllowedRimFreq"),errors="coerce").median()
+    medm = pd.to_numeric(defense.get("AllowedMidFreq"),errors="coerce").median()
+    i3 = safe_float(drow.get("AllowedThreeFreq"),med3)/max(med3,1e-9) if pd.notna(med3) else 1.0
+    ir = safe_float(drow.get("AllowedRimFreq"),medr)/max(medr,1e-9) if pd.notna(medr) else 1.0
+    im = safe_float(drow.get("AllowedMidFreq"),medm)/max(medm,1e-9) if pd.notna(medm) else 1.0
+    raw_scoring = p3*np.clip(i3,.75,1.25)+rim*np.clip(ir,.75,1.25)+mid*np.clip(im,.75,1.25)
+    scoring_factor=float(np.clip(1.0+0.34*(raw_scoring-1.0),.94,1.06))
+    scoring_fit=float(np.clip(50+220*(raw_scoring-1.0),15,85))
+
+    # Opponent offensive shot mix decides where defensive-rebound chances tend
+    # to travel. Threes create more long-rebound share; rim/mid misses favor
+    # interior rebounders. The total rebound pool is unchanged—only player share
+    # moves—so this cannot manufacture team rebounds.
+    omed3 = pd.to_numeric(offense.get("ThreeFreq"),errors="coerce").median()
+    omedr = pd.to_numeric(offense.get("RimFreq"),errors="coerce").median()
+    omedm = pd.to_numeric(offense.get("MidFreq"),errors="coerce").median()
+    long_idx = safe_float(orow.get("ThreeFreq"),omed3)/max(omed3,1e-9) if pd.notna(omed3) else 1.0
+    interior_num = safe_float(orow.get("RimFreq"),0)+.55*safe_float(orow.get("MidFreq"),0)
+    interior_den = max(safe_float(omedr,0)+.55*safe_float(omedm,0),1e-9)
+    interior_idx = interior_num/interior_den
+    if "BIG" in pos:
+        raw_reb=.78*interior_idx+.22*long_idx
+    elif "GUARD" in pos:
+        raw_reb=.24*interior_idx+.76*long_idx
+    else:
+        raw_reb=.46*interior_idx+.54*long_idx
+    rebound_factor=float(np.clip(1.0+0.30*(raw_reb-1.0),.94,1.06))
+    rebound_fit=float(np.clip(50+210*(raw_reb-1.0),15,85))
+    return {"scoring_factor":scoring_factor,"rebound_factor":rebound_factor,"scoring_fit":scoring_fit,"rebound_fit":rebound_fit}
+
+
+def _elite_injury_score_penalty(base: pd.DataFrame, team: str, inactive: set, questionable: set) -> Tuple[float, str]:
+    if base is None or base.empty:
+        return 0.0, "no player baseline for injury scoring"
+    b = base[base["_TeamKey"].eq(team)].copy()
+    if b.empty:
+        return 0.0, "team baseline unavailable"
+    penalty = 0.0
+    names = []
+    for _, br in b.iterrows():
+        key = normalize_name(br.get("Player"))
+        weight = 1.0 if key in inactive else 0.45 if key in questionable else 0.0
+        if weight <= 0:
+            continue
+        pts = _pts_v2_weighted_br_stat(br, "PTS")
+        usg = safe_float(br.get("USG%"), 20.0)
+        if pd.isna(pts):
+            continue
+        # Replacements recover most volume, so only a fraction of the missing
+        # scorer's production is removed from the team expectation.
+        indiv = min(3.2, max(0.35, 0.075 * pts + 0.018 * max(0.0, usg - 20.0))) * weight
+        penalty += indiv
+        names.append(str(br.get("Player", "")))
+    return float(min(6.0, penalty)), (", ".join(names[:4]) if names else "none")
+
+
+def _elite_one_side_environment(
+    team: str,
+    opponent: str,
+    row: pd.Series,
+    base: pd.DataFrame,
+    team_season: pd.DataFrame,
+    team_opp: pd.DataFrame,
+    team_recent: pd.DataFrame,
+    inactive_by_team: Dict[str, set],
+    questionable_by_team: Dict[str, set],
+) -> Dict[str, Any]:
+    t = _elite_row(team_season, team)
+    o = _elite_row(team_season, opponent)
+    od = _elite_row(team_opp, opponent)
+    tr = _elite_row(team_recent, team)
+    orc = _elite_row(team_recent, opponent)
+    league_ortg_vals = pd.to_numeric(team_season.get("ORtg", pd.Series(dtype=float)), errors="coerce")
+    league_ortg_vals = league_ortg_vals[(league_ortg_vals >= 88) & (league_ortg_vals <= 120)]
+    league_ref = float(league_ortg_vals.median()) if not league_ortg_vals.empty else 104.0
+
+    tp = safe_float(t.get("Pace"), np.nan)
+    op = safe_float(o.get("Pace"), np.nan)
+    if pd.notna(tp) and not (70 <= tp <= 92): tp = np.nan
+    if pd.notna(op) and not (70 <= op <= 92): op = np.nan
+    season_pace = math.sqrt(max(tp, 1.0) * max(op, 1.0)) if pd.notna(tp) and pd.notna(op) else np.nanmean([tp, op])
+    recent_tp = safe_float(tr.get("Pace_L10"), safe_float(tr.get("Pace_L5"), np.nan))
+    recent_op = safe_float(orc.get("Pace_L10"), safe_float(orc.get("Pace_L5"), np.nan))
+    recent_pace = math.sqrt(max(recent_tp, 1.0) * max(recent_op, 1.0)) if pd.notna(recent_tp) and pd.notna(recent_op) else np.nan
+    pace = season_pace if pd.notna(season_pace) else 80.0
+    if pd.notna(recent_pace) and 70 <= recent_pace <= 92:
+        pace = 0.72 * pace + 0.28 * recent_pace
+    pace = float(np.clip(pace, 72.0, 89.0))
+
+    ortg = _elite_valid_rating(t.get("ORtg"), league_ref)
+    opp_drtg = _elite_valid_rating(o.get("DRtg"), league_ref)
+    season_eff = league_ref + 0.58 * (ortg - league_ref) + 0.42 * (opp_drtg - league_ref)
+    r_ortg = safe_float(tr.get("ORtg_L10"), np.nan)
+    r_opp_drtg = safe_float(orc.get("DRtg_L10"), np.nan)
+    if pd.notna(r_ortg) and pd.notna(r_opp_drtg) and 88 <= r_ortg <= 120 and 88 <= r_opp_drtg <= 120:
+        recent_eff = league_ref + 0.55 * (r_ortg - league_ref) + 0.45 * (r_opp_drtg - league_ref)
+        expected_eff = 0.76 * season_eff + 0.24 * recent_eff
+    else:
+        expected_eff = season_eff
+    core_score = pace * expected_eff / 100.0
+
+    ppg = safe_float(t.get("PTS_per_game"), np.nan)
+    allowed = safe_float(od.get("OppPTS_per_game"), safe_float(o.get("PointsAllowed_per_game"), np.nan))
+    anchor_vals = [v for v in [ppg, allowed] if pd.notna(v) and 60 <= v <= 105]
+    anchor = float(np.mean(anchor_vals)) if anchor_vals else core_score
+    score = 0.70 * core_score + 0.30 * anchor
+    ha = str(row.get("HomeAway", "") or "").upper()
+    if ha.startswith("H"):
+        score += 0.9
+    elif ha.startswith("A"):
+        score -= 0.9
+    inj_penalty, inj_names = _elite_injury_score_penalty(
+        base, team, inactive_by_team.get(team, set()), questionable_by_team.get(team, set())
+    )
+    score -= inj_penalty
+    score = float(np.clip(score, anchor - 9.0, anchor + 9.0))
+    score = float(np.clip(score, 64.0, 101.0))
+
+    gp = max(1.0, safe_float(t.get("GP"), safe_float(t.get("Games"), 1.0)))
+    team_fga_pg = safe_float(t.get("FGA_per_game"), np.nan)
+    if pd.isna(team_fga_pg):
+        total = safe_float(t.get("FGA"), np.nan)
+        team_fga_pg = total / gp if pd.notna(total) else np.nan
+    team_fta_pg = safe_float(t.get("FTA_per_game"), np.nan)
+    if pd.isna(team_fta_pg):
+        total = safe_float(t.get("FTA"), np.nan)
+        team_fta_pg = total / gp if pd.notna(total) else np.nan
+    team_tov_pg = safe_float(t.get("TOV_per_game"), np.nan)
+    if pd.isna(team_tov_pg):
+        total = safe_float(t.get("TOV"), np.nan)
+        team_tov_pg = total / gp if pd.notna(total) else 13.0
+    team_oreb_pg = safe_float(t.get("OREB_per_game"), np.nan)
+    if pd.isna(team_oreb_pg):
+        total = safe_float(t.get("OREB"), np.nan)
+        team_oreb_pg = total / gp if pd.notna(total) else 8.5
+
+    opp_fga_allowed = safe_float(od.get("OppFGA_per_game"), np.nan)
+    opp_fta_allowed = safe_float(od.get("OppFTA_per_game"), np.nan)
+    opp_tov_forced = safe_float(od.get("OppTOV_per_game"), np.nan)
+    opp_oreb_allowed = safe_float(od.get("OppOREB_per_game"), np.nan)
+    pace_ref = tp if pd.notna(tp) and tp > 0 else 80.0
+    pace_mult = float(np.clip(pace / pace_ref, 0.92, 1.08))
+    fta_base_vals = [v for v in [team_fta_pg, opp_fta_allowed] if pd.notna(v)]
+    fta_base = 0.62 * team_fta_pg + 0.38 * opp_fta_allowed if pd.notna(team_fta_pg) and pd.notna(opp_fta_allowed) else (np.mean(fta_base_vals) if fta_base_vals else 20.0)
+    fta_budget = float(np.clip(fta_base * pace_mult, 10.0, 34.0))
+    tov = 0.68 * team_tov_pg + 0.32 * opp_tov_forced if pd.notna(opp_tov_forced) else team_tov_pg
+    oreb = 0.66 * team_oreb_pg + 0.34 * opp_oreb_allowed if pd.notna(opp_oreb_allowed) else team_oreb_pg
+    derived_fga = pace - 0.44 * fta_budget + oreb - tov
+    hist_vals = [v for v in [team_fga_pg, opp_fga_allowed] if pd.notna(v)]
+    hist_fga = 0.65 * team_fga_pg + 0.35 * opp_fga_allowed if pd.notna(team_fga_pg) and pd.notna(opp_fga_allowed) else (np.mean(hist_vals) if hist_vals else derived_fga)
+    fga_budget = float(np.clip((0.58 * hist_fga * pace_mult + 0.42 * derived_fga), 58.0, 82.0))
+
+    team_ast_pg = safe_float(t.get("AST_per_game"), np.nan)
+    opp_ast_allowed = safe_float(od.get("OppAST_per_game"), np.nan)
+    recent_ast = safe_float(tr.get("AST_L10"), np.nan)
+    ast_parts = [(team_ast_pg, 0.52), (opp_ast_allowed, 0.30), (recent_ast, 0.18)]
+    ast_valid = [(v, w) for v, w in ast_parts if pd.notna(v)]
+    ast_budget = sum(v*w for v, w in ast_valid) / sum(w for _, w in ast_valid) if ast_valid else 19.5
+    ast_budget = float(np.clip(ast_budget * pace_mult, 12.0, 29.0))
+
+    fg_pct = safe_float(t.get("FGM"), np.nan) / max(safe_float(t.get("FGA"), np.nan), 1e-9) if pd.notna(safe_float(t.get("FGM"), np.nan)) and pd.notna(safe_float(t.get("FGA"), np.nan)) else 0.44
+    fg_pct = float(np.clip(fg_pct, 0.34, 0.55))
+    hist_misses = max(1.0, (team_fga_pg if pd.notna(team_fga_pg) else fga_budget) * (1.0 - fg_pct))
+    oreb_rate = float(np.clip(team_oreb_pg / hist_misses, 0.12, 0.38)) if pd.notna(team_oreb_pg) else 0.25
+    return {
+        "team": team, "opponent": opponent, "pace": pace, "team_score": score,
+        "expected_eff": expected_eff, "fga_budget": fga_budget, "fta_budget": fta_budget,
+        "ast_budget": ast_budget, "fg_pct": fg_pct, "oreb_rate": oreb_rate,
+        "injury_score_penalty": inj_penalty, "injury_names": inj_names,
+        "data_ok": not t.empty and not od.empty,
+        "latest_data": max([d for d in [pd.to_datetime(t.get("DataThrough"), errors="coerce"), pd.to_datetime(od.get("DataThrough"), errors="coerce"), pd.to_datetime(tr.get("DataThrough"), errors="coerce")] if pd.notna(d)], default=pd.NaT),
+    }
+
+
+def _elite_game_environment(
+    team: str, opponent: str, row: pd.Series, base: pd.DataFrame,
+    team_season: pd.DataFrame, team_opp: pd.DataFrame, team_recent: pd.DataFrame,
+    inactive_by_team: Dict[str, set], questionable_by_team: Dict[str, set],
+) -> Dict[str, Any]:
+    team_env = _elite_one_side_environment(team, opponent, row, base, team_season, team_opp, team_recent, inactive_by_team, questionable_by_team)
+    reverse = row.copy()
+    ha = str(row.get("HomeAway", "") or "").upper()
+    reverse["HomeAway"] = "AWAY" if ha.startswith("H") else "HOME" if ha.startswith("A") else ""
+    opp_env = _elite_one_side_environment(opponent, team, reverse, base, team_season, team_opp, team_recent, inactive_by_team, questionable_by_team)
+    team_misses = team_env["fga_budget"] * (1.0 - team_env["fg_pct"])
+    opp_misses = opp_env["fga_budget"] * (1.0 - opp_env["fg_pct"])
+    # Offensive boards use the shooting team's ORB tendency; defensive boards
+    # are the opponent misses left after opponent offensive rebounds.
+    oreb_pool = team_misses * team_env["oreb_rate"]
+    dreb_pool = opp_misses * (1.0 - opp_env["oreb_rate"])
+    spread = team_env["team_score"] - opp_env["team_score"]
+    blowout = float(np.clip((abs(spread) - 8.0) * 4.0, 0.0, 34.0))
+    return {
+        **team_env,
+        "opp_score": opp_env["team_score"],
+        "game_total": team_env["team_score"] + opp_env["team_score"],
+        "spread": spread,
+        "blowout": blowout,
+        "oreb_pool": float(np.clip(oreb_pool, 3.0, 15.0)),
+        "dreb_pool": float(np.clip(dreb_pool, 18.0, 34.0)),
+        "opp_fga_budget": opp_env["fga_budget"],
+        "opp_fg_pct": opp_env["fg_pct"],
+        "opp_oreb_rate": opp_env["oreb_rate"],
+    }
+
+
+def _elite_normalize_minutes(rot: pd.DataFrame, target_key: str, target_minutes: float) -> pd.DataFrame:
+    r = rot.copy()
+    total = pd.to_numeric(r["mins_base"], errors="coerce").fillna(0).sum()
+    r["proj_min"] = r["mins_base"] * 200.0 / max(total, 1e-9)
+    if target_key in set(r["NameKey"]) and pd.notna(target_minutes) and target_minutes > 0:
+        target_minutes = float(np.clip(target_minutes, 4.0, 40.0))
+        mask = r["NameKey"].eq(target_key)
+        other = ~mask
+        r.loc[mask, "proj_min"] = target_minutes
+        other_sum = r.loc[other, "proj_min"].sum()
+        if other_sum > 0:
+            r.loc[other, "proj_min"] *= max(0.0, 200.0-target_minutes) / other_sum
+    # Two cap/renormalization passes prevent a thin rotation from assigning
+    # impossible 45+ minute expectations.
+    for _ in range(2):
+        r["proj_min"] = r["proj_min"].clip(lower=1.5, upper=39.0)
+        diff = 200.0 - r["proj_min"].sum()
+        adjustable = (r["proj_min"] > 3.0) & (r["proj_min"] < 38.5)
+        if abs(diff) < 0.05 or not adjustable.any():
+            break
+        weights = r.loc[adjustable, "proj_min"] / max(r.loc[adjustable, "proj_min"].sum(), 1e-9)
+        r.loc[adjustable, "proj_min"] += diff * weights
+    return r
+
+
+def _elite_role_label(score: float, kind: str) -> str:
+    if kind == "SCORING":
+        return "S1 PRIMARY SCORER" if score >= 82 else "S2 SECONDARY SCORER" if score >= 66 else "S3 SUPPORT SCORER" if score >= 45 else "S4 LOW USAGE"
+    if kind == "REBOUND":
+        return "R1 PRIMARY REBOUNDER" if score >= 82 else "R2 SECONDARY REBOUNDER" if score >= 64 else "R3 SUPPORT REBOUNDER" if score >= 44 else "R4 LOW REBOUND ROLE"
+    return "C1 PRIMARY CREATOR" if score >= 82 else "C2 SECONDARY CREATOR" if score >= 64 else "C3 SUPPORT CREATOR" if score >= 44 else "C4 LOW CREATION"
+
+
+def _elite_role_rotation(
+    base: pd.DataFrame, team: str, target_key: str, target_minutes: float,
+    env: Dict[str, Any], excluded_keys: set, questionable_keys: Optional[set] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    team_base = base[base["_TeamKey"].eq(team)].copy()
+    excluded_keys = set(excluded_keys or set())
+    questionable_keys = set(questionable_keys or set())
+    excluded_rows = team_base[team_base["NameKey"].isin(excluded_keys)].copy() if excluded_keys else pd.DataFrame(columns=team_base.columns)
+    b = team_base.copy()
+    if excluded_keys:
+        b = b[~b["NameKey"].isin(excluded_keys)].copy()
+    if b.empty or target_key in excluded_keys:
+        return pd.DataFrame(), {"note": "active rotation unavailable"}
+    starter_table = _elite_starter_rate_table()
+    starter_map = {}
+    if starter_table is not None and not starter_table.empty:
+        stt = starter_table[starter_table["Team"].eq(team)]
+        starter_map = {str(r.get("NameKey")): safe_float(r.get("StarterRate"), 0.0) for _, r in stt.iterrows()}
+    records = []
+    for _, br in b.iterrows():
+        key = normalize_name(br.get("Player"))
+        mins = _pts_v2_minutes_base(br)
+        if pd.isna(mins) or mins <= 0:
+            continue
+        fga = _pts_v2_rate_for_minutes(br, "FGA", mins)
+        fta = _pts_v2_rate_for_minutes(br, "FTA", mins)
+        reb = _pts_v2_rate_for_minutes(br, "REB", mins)
+        ast = _pts_v2_rate_for_minutes(br, "AST", mins)
+        if pd.isna(fga):
+            continue
+        games = max(1.0, safe_float(br.get("Games"), safe_float(br.get("GP"), 1.0)))
+        oreb_pg = safe_float(br.get("OREB"), np.nan) / games if pd.notna(safe_float(br.get("OREB"), np.nan)) else np.nan
+        dreb_pg = safe_float(br.get("DREB"), np.nan) / games if pd.notna(safe_float(br.get("DREB"), np.nan)) else np.nan
+        usg = safe_float(br.get("USG%"), safe_float(br.get("UsageProxy"), np.nan))
+        trb = safe_float(br.get("TRB%"), safe_float(br.get("TRB%Proxy"), np.nan))
+        astp = safe_float(br.get("AST%"), safe_float(br.get("AST%Proxy"), np.nan))
+        recent_fga = safe_float(br.get("FGA_l5"), np.nan)
+        recent_min = safe_float(br.get("MIN_l5"), np.nan)
+        season_fga = safe_float(br.get("FGA_avg"), np.nan)
+        season_min = safe_float(br.get("MIN_avg"), mins)
+        recent_rate = (recent_fga/max(recent_min,1e-9))/(season_fga/max(season_min,1e-9)) if pd.notna(recent_fga) and pd.notna(recent_min) and pd.notna(season_fga) and season_fga > 0 else 1.0
+        records.append({
+            "NameKey": key, "Player": br.get("Player"), "mins_base": mins,
+            "raw_fga": max(0.0, fga), "raw_fta": max(0.0, 0.0 if pd.isna(fta) else fta),
+            "raw_reb": max(0.0, 0.0 if pd.isna(reb) else reb), "raw_ast": max(0.0, 0.0 if pd.isna(ast) else ast),
+            "raw_oreb": max(0.0, 0.0 if pd.isna(oreb_pg) else oreb_pg), "raw_dreb": max(0.0, 0.0 if pd.isna(dreb_pg) else dreb_pg),
+            "usg": usg, "trb": trb, "astp": astp, "starter_rate": starter_map.get(key, 0.0),
+            "recent_role_factor": float(np.clip(recent_rate, 0.82, 1.18)),
+            "position_group": str(br.get("PositionGroup", "Unknown") or "Unknown"), "_br": br,
+        })
+    rot = pd.DataFrame(records)
+    if rot.empty:
+        return rot, {"note": "rotation had no opportunity baselines"}
+    rot = rot.sort_values("mins_base", ascending=False)
+    top = rot.head(11).copy()
+    if target_key not in set(top["NameKey"]) and target_key in set(rot["NameKey"]):
+        top = pd.concat([top.head(10), rot[rot["NameKey"].eq(target_key)].head(1)], ignore_index=True)
+    rot = _elite_normalize_minutes(top.drop_duplicates("NameKey"), target_key, target_minutes)
+    scale = rot["proj_min"] / rot["mins_base"].clip(lower=1e-6)
+    for c in ["raw_fga", "raw_fta", "raw_reb", "raw_ast", "raw_oreb", "raw_dreb"]:
+        rot[f"exp_{c[4:]}"] = rot[c] * scale
+
+    fga_rate = rot["exp_fga"] / rot["proj_min"].clip(lower=1e-6)
+    fta_rate = rot["exp_fta"] / rot["proj_min"].clip(lower=1e-6)
+    reb_rate = rot["exp_reb"] / rot["proj_min"].clip(lower=1e-6)
+    ast_rate = rot["exp_ast"] / rot["proj_min"].clip(lower=1e-6)
+    oreb_rate = rot["exp_oreb"] / rot["proj_min"].clip(lower=1e-6)
+    dreb_rate = rot["exp_dreb"] / rot["proj_min"].clip(lower=1e-6)
+    min_pct = _elite_pct_rank(rot["proj_min"])
+    usg_pct = _elite_pct_rank(rot["usg"])
+    trb_pct = _elite_pct_rank(rot["trb"])
+    astp_pct = _elite_pct_rank(rot["astp"])
+    starter_score = pd.to_numeric(rot["starter_rate"], errors="coerce").fillna(0).clip(0,1)*100
+    recent_score = ((rot["recent_role_factor"].clip(0.82,1.18)-0.82)/0.36*100).clip(0,100)
+    position_bonus = rot["position_group"].str.upper().map({"BIG": 100, "WING": 55, "GUARD": 25}).fillna(45)
+    rot["Scoring Role Score"] = (
+        0.38*_elite_pct_rank(fga_rate) + 0.18*_elite_pct_rank(fta_rate) + 0.18*usg_pct +
+        0.12*min_pct + 0.08*starter_score + 0.06*recent_score
+    ).clip(0,100)
+    rot["Rebound Role Score"] = (
+        0.43*_elite_pct_rank(reb_rate) + 0.13*_elite_pct_rank(oreb_rate) + 0.13*_elite_pct_rank(dreb_rate) +
+        0.12*trb_pct + 0.10*min_pct + 0.06*position_bonus + 0.03*starter_score
+    ).clip(0,100)
+    rot["Creation Role Score"] = (
+        0.50*_elite_pct_rank(ast_rate) + 0.18*astp_pct + 0.12*usg_pct +
+        0.10*min_pct + 0.10*starter_score
+    ).clip(0,100)
+    # Explicit hierarchy ranks make the nightly role allocation visible.  Role
+    # *scores* are continuous inputs, but labels are hierarchy-aware so a team
+    # cannot misleadingly show three "primary creators" just because all three
+    # grade highly relative to their own teammates.
+    rot["Scoring Hierarchy Rank"] = rot["Scoring Role Score"].rank(ascending=False, method="first").astype(int)
+    rot["Rebound Hierarchy Rank"] = rot["Rebound Role Score"].rank(ascending=False, method="first").astype(int)
+    rot["Creation Hierarchy Rank"] = rot["Creation Role Score"].rank(ascending=False, method="first").astype(int)
+
+    def _hier_role(rank: int, score: float, kind: str) -> str:
+        r = int(rank); s = float(score)
+        if kind == "SCORING":
+            if r == 1: return "S1 PRIMARY SCORER"
+            if r == 2: return "S2 SECONDARY SCORER"
+            if r <= 4 and s >= 45: return "S3 SUPPORT SCORER"
+            return "S4 LOW USAGE"
+        if kind == "REBOUND":
+            if r == 1: return "R1 PRIMARY REBOUNDER"
+            if r == 2: return "R2 SECONDARY REBOUNDER"
+            if r <= 5 and s >= 42: return "R3 SUPPORT REBOUNDER"
+            return "R4 LOW REBOUND ROLE"
+        if r == 1: return "C1 PRIMARY CREATOR"
+        if r == 2: return "C2 SECONDARY CREATOR"
+        if r <= 4 and s >= 42: return "C3 SUPPORT CREATOR"
+        return "C4 LOW CREATION"
+
+    rot["Scoring Role"] = [
+        _hier_role(r, s, "SCORING") for r, s in zip(rot["Scoring Hierarchy Rank"], rot["Scoring Role Score"])
+    ]
+    rot["Rebound Role"] = [
+        _hier_role(r, s, "REBOUND") for r, s in zip(rot["Rebound Hierarchy Rank"], rot["Rebound Role Score"])
+    ]
+    rot["Creation Role"] = [
+        _hier_role(r, s, "CREATION") for r, s in zip(rot["Creation Hierarchy Rank"], rot["Creation Role Score"])
+    ]
+    rot["Role Security"] = (0.42*min_pct + 0.30*starter_score + 0.18*(100-(recent_score-50).abs()*1.25).clip(0,100) + 0.10*usg_pct).clip(0,100)
+    rot["Questionable Role"] = rot["NameKey"].isin(questionable_keys)
+    rot.loc[rot["Questionable Role"], "Role Security"] *= 0.72
+
+    # Role-aware vacancy redistribution. Removing a player from the active
+    # rotation should not benefit every teammate equally. A missing center/big
+    # opens more interior minutes and rebound share for other bigs; a missing
+    # creator opens more assist/touch share for guards/creators; a high-volume
+    # scorer opens FGA/FTA share primarily for the strongest active scorers.
+    vacancy_minutes = 0.0
+    vacancy_fga = 0.0
+    vacancy_fta = 0.0
+    vacancy_reb = 0.0
+    vacancy_ast = 0.0
+    vacancy_pos = {"BIG": 0.0, "WING": 0.0, "GUARD": 0.0, "UNKNOWN": 0.0}
+    if excluded_rows is not None and not excluded_rows.empty:
+        for _, xb in excluded_rows.iterrows():
+            xm = _pts_v2_minutes_base(xb)
+            if pd.isna(xm) or xm <= 0:
+                continue
+            xfga = _pts_v2_rate_for_minutes(xb, "FGA", xm)
+            xfta = _pts_v2_rate_for_minutes(xb, "FTA", xm)
+            xreb = _pts_v2_rate_for_minutes(xb, "REB", xm)
+            xast = _pts_v2_rate_for_minutes(xb, "AST", xm)
+            vacancy_minutes += max(0.0, xm)
+            vacancy_fga += max(0.0, 0.0 if pd.isna(xfga) else xfga)
+            vacancy_fta += max(0.0, 0.0 if pd.isna(xfta) else xfta)
+            vacancy_reb += max(0.0, 0.0 if pd.isna(xreb) else xreb)
+            vacancy_ast += max(0.0, 0.0 if pd.isna(xast) else xast)
+            pg = str(xb.get("PositionGroup", "UNKNOWN") or "UNKNOWN").upper()
+            if pg not in vacancy_pos: pg = "UNKNOWN"
+            vacancy_pos[pg] += max(0.0, xm)
+
+    vac_min_int = float(np.clip(vacancy_minutes / 40.0, 0.0, 1.5))
+    vac_score_int = float(np.clip((vacancy_fga + 0.44*vacancy_fta) / 20.0, 0.0, 1.5))
+    vac_reb_int = float(np.clip(vacancy_reb / 10.0, 0.0, 1.5))
+    vac_ast_int = float(np.clip(vacancy_ast / 8.0, 0.0, 1.5))
+    total_vac_pos = max(sum(vacancy_pos.values()), 1e-9)
+    active_pos = rot["position_group"].astype(str).str.upper().where(lambda x: x.isin(["BIG","WING","GUARD"]), "UNKNOWN")
+    same_pos_share = active_pos.map(lambda pg: vacancy_pos.get(pg, 0.0) / total_vac_pos if vacancy_minutes > 0 else 0.0).astype(float)
+    # Adjacent positions still absorb some minutes; same-position replacements
+    # get the largest lift.
+    pos_fit = (0.35 + 0.65*same_pos_share).clip(0.35, 1.0) if vacancy_minutes > 0 else pd.Series(0.0, index=rot.index)
+    scoring_fit = (rot["Scoring Role Score"] / 100.0).clip(0,1)
+    rebound_fit = (rot["Rebound Role Score"] / 100.0).clip(0,1)
+    creation_fit = (rot["Creation Role Score"] / 100.0).clip(0,1)
+    rot["Vacancy Minutes Mult"] = 1.0 + 0.10*vac_min_int*pos_fit
+    rot["Vacancy Scoring Mult"] = 1.0 + vac_score_int*(0.045*pos_fit + 0.105*scoring_fit)
+    rot["Vacancy Rebound Mult"] = 1.0 + vac_reb_int*(0.075*pos_fit + 0.125*rebound_fit)
+    rot["Vacancy Creation Mult"] = 1.0 + vac_ast_int*(0.050*pos_fit + 0.145*creation_fit)
+
+    # Apply the vacancy minute tilt and renormalize back to exactly 200 team
+    # minutes. This changes who receives the minutes, never the team-minute pool.
+    if vacancy_minutes > 0:
+        rot["proj_min"] *= rot["Vacancy Minutes Mult"]
+        rot["proj_min"] *= 200.0 / max(rot["proj_min"].sum(), 1e-9)
+        scale = rot["proj_min"] / rot["mins_base"].clip(lower=1e-6)
+        for c in ["raw_fga", "raw_fta", "raw_reb", "raw_ast", "raw_oreb", "raw_dreb"]:
+            rot[f"exp_{c[4:]}"] = rot[c] * scale
+
+    # Allocate finite team opportunities. Every increase in one player's share
+    # necessarily reduces the share available to teammates.
+    rot["fga_weight"] = rot["exp_fga"].clip(lower=.05) * (0.82 + 0.0036*rot["Scoring Role Score"]) * rot["recent_role_factor"].pow(0.20) * rot["Vacancy Scoring Mult"]
+    rot["fta_weight"] = rot["exp_fta"].clip(lower=.02) * (0.84 + 0.0032*rot["Scoring Role Score"]) * rot["Vacancy Scoring Mult"]
+    rot["ast_weight"] = rot["exp_ast"].clip(lower=.02) * (0.80 + 0.0040*rot["Creation Role Score"]) * rot["Vacancy Creation Mult"]
+    big_mult = rot["position_group"].str.upper().map({"BIG":1.12,"WING":1.00,"GUARD":0.91}).fillna(1.0)
+    rot["oreb_weight"] = (rot["exp_oreb"].clip(lower=.015) + 0.10*rot["exp_reb"]) * (0.84+0.0032*rot["Rebound Role Score"]) * big_mult * rot["Vacancy Rebound Mult"]
+    rot["dreb_weight"] = (rot["exp_dreb"].clip(lower=.02) + 0.28*rot["exp_reb"]) * (0.84+0.0032*rot["Rebound Role Score"]) * (0.96+0.04*big_mult) * rot["Vacancy Rebound Mult"]
+    rot["proj_fga"] = env["fga_budget"] * rot["fga_weight"] / max(rot["fga_weight"].sum(),1e-9)
+    rot["proj_fta"] = env["fta_budget"] * rot["fta_weight"] / max(rot["fta_weight"].sum(),1e-9)
+    rot["proj_ast"] = env["ast_budget"] * rot["ast_weight"] / max(rot["ast_weight"].sum(),1e-9)
+    rot["proj_oreb"] = env["oreb_pool"] * rot["oreb_weight"] / max(rot["oreb_weight"].sum(),1e-9)
+    rot["proj_dreb"] = env["dreb_pool"] * rot["dreb_weight"] / max(rot["dreb_weight"].sum(),1e-9)
+    rot["proj_reb"] = rot["proj_oreb"] + rot["proj_dreb"]
+
+    opp_table = _pts_v2_latest_team_table("team_opponent_stats")
+    opp_efg_med = pd.to_numeric(opp_table.get("Opp_eFG%", pd.Series(dtype=float)), errors="coerce").median() if not opp_table.empty else np.nan
+    raw_pts=[]; three_rates=[]; two_pcts=[]; three_pcts=[]; ft_pcts=[]
+    for _, r in rot.iterrows():
+        eff = _pts_v2_player_efficiency(r["_br"], _elite_row(_pts_v2_latest_team_table("team_opponent_stats"), env["opponent"]), opp_efg_med)
+        three_a = float(np.clip(r["proj_fga"]*eff["three_rate"],0,r["proj_fga"]))
+        two_a = max(0.0, r["proj_fga"]-three_a)
+        pts = 2*two_a*eff["two_pct"] + 3*three_a*eff["three_pct"] + r["proj_fta"]*eff["ft_pct"]
+        raw_pts.append(pts); three_rates.append(eff["three_rate"]); two_pcts.append(eff["two_pct"]); three_pcts.append(eff["three_pct"]); ft_pcts.append(eff["ft_pct"])
+    rot["raw_pts"] = raw_pts; rot["three_rate"] = three_rates; rot["two_pct"] = two_pcts; rot["three_pct"] = three_pcts; rot["ft_pct"] = ft_pcts
+    raw_total = float(rot["raw_pts"].sum())
+    unclipped_scale = float(env["team_score"] / raw_total) if raw_total > 0 else 1.0
+    reconciliation_clipped = not (0.82 <= unclipped_scale <= 1.18)
+    scale_total = float(np.clip(unclipped_scale, 0.82, 1.18))
+    rot["proj_pts"] = rot["raw_pts"] * scale_total
+    return rot, {
+        "note": f"{len(rot)}-player active rotation normalized to {rot['proj_min'].sum():.1f} minutes",
+        "raw_team_pts": raw_total, "team_total_scale": scale_total,
+        "team_pts_sum": float(rot["proj_pts"].sum()),
+        "team_pts_target": float(env["team_score"]),
+        "reconciliation_clipped": bool(reconciliation_clipped),
+        "vacancy_minutes": float(vacancy_minutes), "vacancy_fga": float(vacancy_fga),
+        "vacancy_reb": float(vacancy_reb), "vacancy_ast": float(vacancy_ast),
+        "fga_sum": float(rot["proj_fga"].sum()), "fta_sum": float(rot["proj_fta"].sum()),
+        "ast_sum": float(rot["proj_ast"].sum()), "reb_sum": float(rot["proj_reb"].sum()),
+    }
+
+
+def _elite_blend_component(legacy: float, challenger: float, market: str) -> Tuple[float, bool]:
+    if pd.isna(legacy):
+        return challenger, True
+    if pd.isna(challenger):
+        return legacy, False
+    if market == "REB":
+        tol = max(1.25, 0.16*max(legacy,1.0)); w = 0.16
+    elif market == "AST":
+        tol = max(1.35, 0.24*max(legacy,1.0)); w = 0.34
+    else:
+        tol = max(2.0, 0.18*max(legacy,1.0)); w = 0.25
+    agree = abs(challenger-legacy) <= tol
+    if agree:
+        return (1-w)*legacy + w*challenger, True
+    # Disagreement never gets to bulldoze the stronger legacy market.
+    return (0.92*legacy + 0.08*challenger), False
+
+
+def _elite_negbin(rng, mean_arr: np.ndarray, dispersion: float) -> np.ndarray:
+    mu = np.clip(mean_arr, 0.01, 60.0)
+    k = max(1.5, float(dispersion))
+    p = k/(k+mu)
+    return rng.negative_binomial(k, p)
+
+
+def _elite_sim_arrays(row: pd.Series, target: pd.Series, elite_reb: float, elite_ast: float, sims: int = 12000) -> Dict[str,np.ndarray]:
+    n = int(max(3000, sims))
+    mins = max(1.0, safe_float(target.get("proj_min"), safe_float(row.get("MIN Proj"),28.0)))
+    seed = stable_seed("elite_role_budget", row.get("Player"), row.get("Team"), row.get("Opponent"), ELITE_ENGINE_VERSION)
+    rng=np.random.default_rng(seed)
+    min_sd=max(1.5, mins*0.08)
+    sim_min=np.clip(rng.normal(mins,min_sd,n),4.0,40.0)
+    min_factor=sim_min/max(mins,1e-9)
+    pace_factor=np.clip(rng.normal(1.0,0.025,n),0.92,1.08)
+    role_security=safe_float(target.get("Role Security"),65.0)
+    role_sigma=float(np.interp(np.clip(role_security,30,95),[30,95],[0.15,0.055]))
+    role_shock=np.exp(rng.normal(-0.5*role_sigma**2,role_sigma,n))
+
+    fga_mean=max(.05,safe_float(target.get("proj_fga"),0.0))*min_factor*pace_factor*role_shock
+    fta_mean=max(.02,safe_float(target.get("proj_fta"),0.0))*min_factor*role_shock
+    fga=np.clip(rng.poisson(np.clip(fga_mean,.02,38)),0,42)
+    three_rate=float(np.clip(safe_float(target.get("three_rate"),.30),.01,.85))
+    two_pct=float(np.clip(safe_float(target.get("two_pct"),.50),.25,.78))
+    three_pct=float(np.clip(safe_float(target.get("three_pct"),.34),.15,.60))
+    ft_pct=float(np.clip(safe_float(target.get("ft_pct"),.80),.45,.98))
+    three_a=rng.binomial(fga.astype(int),three_rate); two_a=fga-three_a
+    fta=np.clip(rng.poisson(np.clip(fta_mean,.01,22)),0,28)
+    pts=(2*rng.binomial(two_a.astype(int),two_pct)+3*rng.binomial(three_a.astype(int),three_pct)+rng.binomial(fta.astype(int),ft_pct)).astype(float)
+    # Scale event simulation to deterministic team-total reconciliation.
+    det=max(.1,safe_float(target.get("proj_pts"),np.mean(pts)))
+    if np.mean(pts)>0: pts*=det/np.mean(pts)
+
+    reb_mu=np.clip(max(.05,elite_reb)*min_factor*pace_factor*np.exp(rng.normal(-0.5*(role_sigma*.65)**2,role_sigma*.65,n)),.02,30)
+    ast_mu=np.clip(max(.03,elite_ast)*min_factor*pace_factor*np.exp(rng.normal(-0.5*(role_sigma*.75)**2,role_sigma*.75,n)),.01,22)
+    reb=_elite_negbin(rng,reb_mu,9.0).astype(float)
+    ast=_elite_negbin(rng,ast_mu,7.0).astype(float)
+    if np.mean(reb)>0: reb*=elite_reb/np.mean(reb)
+    if np.mean(ast)>0: ast*=elite_ast/np.mean(ast)
+    return {"PTS":pts,"REB":reb,"AST":ast,"PRA":pts+reb+ast}
+
+
+def _elite_player_model(
+    row: pd.Series, base: pd.DataFrame, team_season: pd.DataFrame, team_opp: pd.DataFrame,
+    team_recent: pd.DataFrame, inactive: Dict[str,set], questionable: Dict[str,set],
+) -> Dict[str,Any]:
+    key=normalize_name(row.get("Matched Player") or row.get("Player")); team=_team_key_for_matchup(row.get("Team")); opp=_team_key_for_matchup(row.get("Opponent"))
+    mins=safe_float(row.get("MIN Proj"),np.nan)
+    if not key or not team or not opp or pd.isna(mins): return {"ok":False,"note":"identity/team/minutes incomplete"}
+    env=_elite_game_environment(team,opp,row,base,team_season,team_opp,team_recent,inactive,questionable)
+    rot,meta=_elite_role_rotation(base,team,key,mins,env,inactive.get(team,set()),questionable.get(team,set()))
+    if rot.empty or key not in set(rot["NameKey"]): return {"ok":False,"note":"target absent from active role rotation"}
+    target=rot[rot["NameKey"].eq(key)].iloc[0]
+    legacy_reb=safe_float(row.get("REB Component Opportunity"),safe_float(target["_br"].get("REB_avg"),np.nan))
+    legacy_ast=safe_float(row.get("AST Component Opportunity"),safe_float(target["_br"].get("AST_avg"),np.nan))
+    elite_reb,reb_agree=_elite_blend_component(legacy_reb,safe_float(target.get("proj_reb"),np.nan),"REB")
+    elite_ast,ast_agree=_elite_blend_component(legacy_ast,safe_float(target.get("proj_ast"),np.nan),"AST")
+    sim=_elite_sim_arrays(row,target,elite_reb,elite_ast,sims=12000)
+    flags=[]
+    if abs(meta.get("team_total_scale",1)-1)>=.075: flags.append("TEAM_TOTAL_CONFLICT")
+    if int(safe_float(target.get("Scoring Hierarchy Rank"),99)) == 1: flags.append("PRIMARY_SCORER")
+    if int(safe_float(target.get("Rebound Hierarchy Rank"),99)) == 1: flags.append("PRIMARY_REBOUNDER")
+    if int(safe_float(target.get("Creation Hierarchy Rank"),99)) == 1: flags.append("PRIMARY_CREATOR")
+    if not reb_agree: flags.append("REB_CHALLENGER_DISAGREEMENT")
+    if not ast_agree: flags.append("AST_CHALLENGER_DISAGREEMENT")
+    if env.get("injury_score_penalty",0)>0: flags.append("TEAM_INJURY_ADJUSTED")
+    if meta.get("vacancy_minutes",0)>0: flags.append("ROLE_AWARE_VACANCY_REDISTRIBUTION")
+    if meta.get("reconciliation_clipped"): flags.append("TEAM_TOTAL_RECONCILIATION_CLIPPED")
+    if key in questionable.get(team,set()): flags.append("QUESTIONABLE_ROLE")
+    if not env.get("data_ok"): flags.append("FALLBACK_TEAM_DATA")
+    pts=safe_float(target.get("proj_pts"),np.nan); fga=safe_float(target.get("proj_fga"),np.nan); fta=safe_float(target.get("proj_fta"),np.nan)
+    if pd.notna(pts) and pd.notna(fga) and fga>0:
+        implied = pts/max(fga+0.44*max(fta,0),1e-9)
+        if implied>=1.48: flags.append("HIGH_EFFICIENCY_DEPENDENCE")
+    if pd.notna(pts) and env.get("team_score",0)>0 and pts/env["team_score"]>=.36: flags.append("HIGH_TEAM_SCORING_SHARE")
+    return {"ok":True,"env":env,"rot_meta":meta,"target":target,"elite_reb":elite_reb,"elite_ast":elite_ast,"reb_agree":reb_agree,"ast_agree":ast_agree,"sim":sim,"flags":flags}
+
+
+def _elite_dist_fields(arr: np.ndarray, line: float) -> Dict[str,float]:
+    a=np.asarray(arr,dtype=float)
+    if a.size==0: return {}
+    out={"mean":float(np.mean(a)),"p10":float(np.quantile(a,.10)),"p25":float(np.quantile(a,.25)),"p50":float(np.quantile(a,.50)),"p75":float(np.quantile(a,.75)),"p90":float(np.quantile(a,.90)),"sd":float(np.std(a))}
+    if pd.notna(line):
+        out["over"]=float(np.mean(a>line)*100); out["under"]=float(np.mean(a<line)*100); out["push"]=float(np.mean(np.isclose(a,line))*100)
+    else: out.update({"over":np.nan,"under":np.nan,"push":np.nan})
+    return out
+
+
+def _attach_elite_role_budget_engine(board: pd.DataFrame, base: Optional[pd.DataFrame], mode: str) -> pd.DataFrame:
+    if board is None or board.empty: return board
+    b=_elite_latest_base(base)
+    if b.empty: return board
+    team_season=_pts_v2_latest_team_table("team_season_stats"); team_opp=_pts_v2_latest_team_table("team_opponent_stats"); team_recent=_pts_v2_latest_team_table("team_recent_stats")
+    inactive,questionable,inj_note=_elite_inactive_by_team(mode)
+    cache={}; rows=[]
+    for _,rr in board.iterrows():
+        row=rr.copy(); key=normalize_name(row.get("Matched Player") or row.get("Player")); team=_team_key_for_matchup(row.get("Team")); opp=_team_key_for_matchup(row.get("Opponent")); mins=round(safe_float(row.get("MIN Proj"),-1),2)
+        ck=(key,team,opp,mins,tuple(sorted(inactive.get(team,set()))),tuple(sorted(questionable.get(team,set()))))
+        if ck not in cache: cache[ck]=_elite_player_model(row,b,team_season,team_opp,team_recent,inactive,questionable)
+        model=cache[ck]; row["Elite Engine Version"]=ELITE_ENGINE_VERSION; row["Elite Injury Feed Note"]=inj_note
+        if not model.get("ok"):
+            row["Elite Engine Status"]="UNAVAILABLE"; row["Elite Engine Note"]=model.get("note",""); rows.append(row); continue
+        t=model["target"]; env=model["env"]; market=str(row.get("Market","")).upper(); line=safe_float(row.get("Line"),np.nan)
+        legacy=safe_float(row.get("Legacy Projection",row.get("Projection")),np.nan)
+        pts=safe_float(t.get("proj_pts"),np.nan); reb=model["elite_reb"]; ast=model["elite_ast"]
+        if market=="PTS": elite_proj=pts
+        elif market=="REB": elite_proj=reb
+        elif market=="AST": elite_proj=ast
+        elif market=="PRA": elite_proj=pts+reb+ast
+        else: elite_proj=legacy
+        arr=model["sim"].get(market,np.array([])); dist=_elite_dist_fields(arr,line)
+        # Align simulation mean to the actual selected component blend.
+        if arr.size and pd.notna(elite_proj) and safe_float(dist.get("mean"),0)>0:
+            arr=arr*(elite_proj/safe_float(dist.get("mean"),1)); dist=_elite_dist_fields(arr,line)
+        edge=elite_proj-line if pd.notna(elite_proj) and pd.notna(line) else np.nan
+        mean_side="OVER" if pd.notna(edge) and edge>0 else "UNDER" if pd.notna(edge) and edge<0 else "PUSH"
+        p50=safe_float(dist.get("p50"),elite_proj); med_side="OVER" if pd.notna(line) and p50>line else "UNDER" if pd.notna(line) and p50<line else "PUSH"
+        raw_prob=safe_float(dist.get("over"),np.nan) if mean_side=="OVER" else safe_float(dist.get("under"),np.nan) if mean_side=="UNDER" else np.nan
+        side=mean_side if mean_side==med_side and pd.notna(raw_prob) and raw_prob>=53.0 else "PASS"
+        flags=list(model.get("flags",[]))
+        if mean_side!=med_side and "PUSH" not in {mean_side,med_side}: flags.append("MEAN_P50_CONFLICT")
+        if pd.notna(edge) and abs(edge)<{"PTS":.55,"REB":.35,"AST":.30,"PRA":.85}.get(market,.5): flags.append("LOW_EDGE")
+        latest=pd.to_datetime(env.get("latest_data"),errors="coerce"); target_date=pd.to_datetime(str(row.get("SlateDate","")),errors="coerce")
+        if pd.isna(target_date):
+            try:
+                target_date = pd.to_datetime(slate_target_date(mode), errors="coerce")
+            except Exception:
+                target_date = pd.to_datetime(datetime.now(tz=app_timezone()).date(), errors="coerce")
+        age=(target_date.normalize()-latest.normalize()).days if pd.notna(latest) and pd.notna(target_date) else np.nan
+        if pd.notna(age) and age > 2:
+            flags.append("STALE_TEAM_DATA")
+        if pd.notna(age) and age > 7:
+            flags.append("CRITICAL_STALE_DATA")
+            # A 1-200 Best Plays board must never sell stale active-season
+            # inputs as a real edge.  The projection remains visible for audit,
+            # but it cannot become an official OVER/UNDER candidate.
+            side = "PASS"
+        quality = (
+            "LOW" if any(f in flags for f in ["FALLBACK_TEAM_DATA", "CRITICAL_STALE_DATA"])
+            else "MEDIUM" if "STALE_TEAM_DATA" in flags
+            else "HIGH"
+        )
+        _row_values = {
+            "Elite Engine Status":"READY","Elite Projection":round(elite_proj,2) if pd.notna(elite_proj) else np.nan,"Elite Edge":round(edge,2) if pd.notna(edge) else np.nan,"Elite Side":side,"Elite Mean Side":mean_side,"Elite Median Side":med_side,
+            "Elite Over %":round(safe_float(dist.get("over"),np.nan),1),"Elite Under %":round(safe_float(dist.get("under"),np.nan),1),"Elite P10":round(safe_float(dist.get("p10"),np.nan),2),"Elite P25":round(safe_float(dist.get("p25"),np.nan),2),"Elite P50":round(p50,2),"Elite P75":round(safe_float(dist.get("p75"),np.nan),2),"Elite P90":round(safe_float(dist.get("p90"),np.nan),2),"Elite SD":round(safe_float(dist.get("sd"),np.nan),2),
+            "Elite Projected PTS":round(pts,2),"Elite Projected REB":round(reb,2),"Elite Projected AST":round(ast,2),"Elite Projected PRA":round(pts+reb+ast,2),
+            "Elite Projected FGA":round(safe_float(t.get("proj_fga"),np.nan),2),"Elite Projected FTA":round(safe_float(t.get("proj_fta"),np.nan),2),"Elite Projected 3PA":round(safe_float(t.get("proj_fga"),0)*safe_float(t.get("three_rate"),0),2),
+            "Elite Expected Team Points":round(env["team_score"],1),"Elite Expected Opp Points":round(env["opp_score"],1),"Elite Expected Game Total":round(env["game_total"],1),"Elite Expected Pace":round(env["pace"],1),"Elite FGA Budget":round(env["fga_budget"],1),"Elite FTA Budget":round(env["fta_budget"],1),"Elite AST Budget":round(env["ast_budget"],1),"Elite OREB Pool":round(env["oreb_pool"],1),"Elite DREB Pool":round(env["dreb_pool"],1),
+            "Elite Scoring Role Score":round(safe_float(t.get("Scoring Role Score"),50),1),"Elite Scoring Role":t.get("Scoring Role",""),"Elite Rebound Role Score":round(safe_float(t.get("Rebound Role Score"),50),1),"Elite Rebound Role":t.get("Rebound Role",""),"Elite Creation Role Score":round(safe_float(t.get("Creation Role Score"),50),1),"Elite Creation Role":t.get("Creation Role",""),"Elite Role Security":round(safe_float(t.get("Role Security"),50),1),"Elite Projected Minutes":round(safe_float(t.get("proj_min"),np.nan),1),
+            "Elite Vacancy Minutes":round(safe_float(model.get("rot_meta",{}).get("vacancy_minutes"),0),1),"Elite Vacancy FGA":round(safe_float(model.get("rot_meta",{}).get("vacancy_fga"),0),1),"Elite Vacancy REB":round(safe_float(model.get("rot_meta",{}).get("vacancy_reb"),0),1),"Elite Vacancy AST":round(safe_float(model.get("rot_meta",{}).get("vacancy_ast"),0),1),"Elite Team PTS Reconciliation Scale":round(safe_float(model.get("rot_meta",{}).get("team_total_scale"),1),3),"Elite Team Player PTS Sum":round(safe_float(model.get("rot_meta",{}).get("team_pts_sum"),np.nan),1),
+            "Elite Scoring Hierarchy Rank":int(safe_float(t.get("Scoring Hierarchy Rank"),99)),"Elite Rebound Hierarchy Rank":int(safe_float(t.get("Rebound Hierarchy Rank"),99)),"Elite Creation Hierarchy Rank":int(safe_float(t.get("Creation Hierarchy Rank"),99)),
+            "Elite Team FGA Share %":round(100*safe_float(t.get("proj_fga"),0)/max(safe_float(env.get("fga_budget"),0),1e-9),1),"Elite Team PTS Share %":round(100*safe_float(t.get("proj_pts"),0)/max(safe_float(env.get("team_score"),0),1e-9),1),"Elite Team REB Share %":round(100*safe_float(reb,0)/max(safe_float(env.get("oreb_pool"),0)+safe_float(env.get("dreb_pool"),0),1e-9),1),"Elite Team AST Share %":round(100*safe_float(ast,0)/max(safe_float(env.get("ast_budget"),0),1e-9),1),
+            "Elite Role Summary":f"#{int(safe_float(t.get('Scoring Hierarchy Rank'),99))} scorer | #{int(safe_float(t.get('Rebound Hierarchy Rank'),99))} rebounder | #{int(safe_float(t.get('Creation Hierarchy Rank'),99))} creator",
+            "Elite REB Challenger Agreement":bool(model.get("reb_agree")),"Elite AST Challenger Agreement":bool(model.get("ast_agree")),"Elite Data Quality":quality,"Elite Data Age Days":age,"Elite Flags":" | ".join(dict.fromkeys(flags)),"Elite Team Injury Penalty":round(safe_float(env.get("injury_score_penalty"),0),2),"Elite Team Injury Names":env.get("injury_names",""),"Elite Promotion Status":"CHALLENGER_ONLY" if not ELITE_PROMOTE_TO_PRODUCTION else "PROMOTED",
+        }
+        for _rk, _rv in _row_values.items():
+            row[_rk] = _rv
+        rows.append(row)
+    result=pd.DataFrame(rows)
+    # Never allow the elite challenger to alter locked production output.
+    if "Legacy Projection" in result.columns and "Projection" in result.columns and not np.allclose(pd.to_numeric(result["Projection"],errors="coerce"),pd.to_numeric(result["Legacy Projection"],errors="coerce"),equal_nan=True):
+        raise RuntimeError("App119 elite challenger changed locked legacy Projection")
+    return result
+
+
+def _elite_calibrated_probability(row: pd.Series, raw_prob: float) -> Tuple[float,str]:
+    if pd.isna(raw_prob): return np.nan,"no probability"
+    # Shrink raw simulation confidence toward 50 until repeated grading proves
+    # the bucket is calibrated.  This prevents 80-100% displays from becoming
+    # false certainty.
+    shrunk=50.0+(float(raw_prob)-50.0)*0.68
+    n=int(safe_float(row.get("Calibration Samples"),0)); wr=safe_float(row.get("Calibration Win Rate %"),np.nan)
+    if n>=8 and pd.notna(wr):
+        hist_weight=min(.42,.18+n/100.0)
+        shrunk=(1-hist_weight)*shrunk+hist_weight*wr
+        return float(np.clip(shrunk,50,78)),f"simulation shrunk + {n}-pick calibration bucket"
+    return float(np.clip(shrunk,50,78)),"simulation probability conservatively shrunk"
+
+
+def _elite_agreement_score(row: pd.Series, side: str) -> Tuple[float,str]:
+    """Agreement from distinct-ish model families, not a raw vote count.
+
+    Legacy and HHS receive full votes. PTS-V2 is partially correlated with the
+    Elite opportunity engine, and the legacy Monte Carlo is highly correlated
+    with Legacy, so both are deliberately downweighted. This prevents fake
+    confidence from several wrappers around the same underlying mean.
+    """
+    weighted_votes = []
+    specs = [
+        ("Lean", 1.00),
+        ("HHS Direction", 1.00),
+        ("PTS V2 Side", 0.65),
+        ("MC Side", 0.35),
+    ]
+    for col, wt in specs:
+        v = str(row.get(col, "") or "").upper()
+        if "OVER" in v:
+            weighted_votes.append((col, "OVER", wt))
+        elif "UNDER" in v:
+            weighted_votes.append((col, "UNDER", wt))
+    if not weighted_votes:
+        return 55.0, "no independent direction votes"
+    total = sum(w for _,_,w in weighted_votes)
+    agree = sum(w for _,v,w in weighted_votes if v == side)
+    score = 100.0 * agree / max(total, 1e-9)
+    count_agree = sum(1 for _,v,_ in weighted_votes if v == side)
+    return float(score), f"{count_agree}/{len(weighted_votes)} directions agree; correlated votes downweighted"
+
+
+def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
+    if board is None or board.empty: return board
+    rows=[]
+    scales={"PTS":2.5,"REB":1.05,"AST":.90,"PRA":3.6}
+    floors={"PTS":.75,"REB":.45,"AST":.40,"PRA":1.10}
+    for _,rr in board.iterrows():
+        row=rr.copy(); market=str(row.get("Market","")).upper(); side=str(row.get("Elite Side","")).upper(); edge=abs(safe_float(row.get("Elite Edge"),np.nan))
+        raw=safe_float(row.get("Elite Over %"),np.nan) if side=="OVER" else safe_float(row.get("Elite Under %"),np.nan) if side=="UNDER" else max(safe_float(row.get("Elite Over %"),0),safe_float(row.get("Elite Under %"),0))
+        cal_prob,prob_note=_elite_calibrated_probability(row,raw)
+        prob_score=float(np.clip((cal_prob-50.0)/16.0*100.0,0,100)) if pd.notna(cal_prob) else 0.0
+        agreement,agree_note=_elite_agreement_score(row,side if side in {"OVER","UNDER"} else str(row.get("Elite Mean Side","")).upper())
+        quality=str(row.get("Elite Data Quality","LOW")).upper(); data_score={"HIGH":96,"MEDIUM":78,"LOW":52}.get(quality,60)
+        min_conf=safe_float(row.get("Minutes Confidence"),safe_float(row.get("Final Projection Confidence"),65)); min_conf=float(np.clip(min_conf,35,100))
+        role_security=float(np.clip(safe_float(row.get("Elite Role Security"),55),20,100))
+        scoring_role=float(np.clip(safe_float(row.get("Elite Scoring Role Score"),50),0,100))
+        rebound_role=float(np.clip(safe_float(row.get("Elite Rebound Role Score"),50),0,100))
+        creation_role=float(np.clip(safe_float(row.get("Elite Creation Role Score"),50),0,100))
+        if market == "PTS": role_fit = scoring_role
+        elif market == "REB": role_fit = rebound_role
+        elif market == "AST": role_fit = creation_role
+        elif market == "PRA": role_fit = 0.42*scoring_role + 0.30*rebound_role + 0.28*creation_role
+        else: role_fit = role_security
+        # Raw edge is necessary but not sufficient. Once the projection clears
+        # a market-specific minimum, bigger numerical edges receive diminishing
+        # credit instead of being treated as automatically stronger plays.
+        floor = floors.get(market, .5)
+        if pd.isna(edge) or edge <= 0:
+            edge_score = 0.0
+        else:
+            ratio = edge / max(floor, .05)
+            edge_score = float(np.clip(38.0 + 32.0 * (1.0 - math.exp(-max(0.0, ratio - 0.75) / 1.15)), 0, 78))
+            if ratio < 1.0:
+                edge_score *= ratio
+        n=int(safe_float(row.get("Calibration Samples"),0)); wr=safe_float(row.get("Calibration Win Rate %"),np.nan)
+        cal_score=float(np.clip((wr-45)/20*100,0,100)) if n>=8 and pd.notna(wr) else 55.0
+        base_score=(
+            0.30*prob_score + 0.15*agreement + 0.14*data_score + 0.10*min_conf +
+            0.07*edge_score + 0.08*role_security + 0.10*role_fit + 0.06*cal_score
+        )
+        flags=str(row.get("Elite Flags","") or "").upper(); penalty=0.0; reasons=[]
+        penalty_map={
+            "MEAN_P50_CONFLICT":12,"FALLBACK_TEAM_DATA":18,"STALE_TEAM_DATA":12,"CRITICAL_STALE_DATA":36,"TEAM_TOTAL_CONFLICT":7,"TEAM_TOTAL_RECONCILIATION_CLIPPED":10,"QUESTIONABLE_ROLE":9,
+            "HIGH_EFFICIENCY_DEPENDENCE":7,"HIGH_TEAM_SCORING_SHARE":5,"ROLE_UNCERTAINTY":6,"MINUTES_UNCERTAINTY":7,
+            "REB_CHALLENGER_DISAGREEMENT":4 if market in {"REB","PRA"} else 0,"AST_CHALLENGER_DISAGREEMENT":5 if market in {"AST","PRA"} else 0,
+        }
+        for key,p in penalty_map.items():
+            if p and key in flags: penalty+=p; reasons.append(f"{key} -{p}")
+        if str(row.get("Projection Readiness","")).upper()=="BLOCKED": penalty+=25; reasons.append("projection readiness blocked -25")
+        if str(row.get("Injury Status","")).upper() in {"OUT","DOUBTFUL","INACTIVE"}: penalty+=40; reasons.append("player unavailable -40")
+        if pd.isna(edge) or edge<floors.get(market,.5): penalty+=8; reasons.append("thin edge -8")
+        if side not in {"OVER","UNDER"}: penalty+=16; reasons.append("mean/median/probability gate not cleared -16")
+        score=float(np.clip(base_score-penalty,0,100))
+        row["Elite Raw Probability %"]=round(raw,1) if pd.notna(raw) else np.nan; row["Elite Calibrated Probability %"]=round(cal_prob,1) if pd.notna(cal_prob) else np.nan
+        row["Elite Agreement Score"]=round(agreement,1); row["Elite Agreement Note"]=agree_note; row["Elite Edge Reliability Score"]=round(edge_score,1); row["Elite Market Role Fit"]=round(role_fit,1); row["Elite Risk Penalty"]=round(penalty,1); row["Elite Rank Score"]=round(score,2); row["Elite Rank Note"]=prob_note+(" | "+" | ".join(reasons) if reasons else "")
+        rows.append(row)
+    out=pd.DataFrame(rows)
+    # Correlated markets from the same player should not monopolize the very top
+    # of the board.  We keep every play but lightly penalize the duplicates.
+    out["Elite Correlation Penalty"]=0.0; out["Elite Team Stack Penalty"]=0.0
+    if "NameKey" not in out.columns: out["NameKey"]=out.get("Player",pd.Series("",index=out.index)).map(normalize_name)
+    for (_,side),idxs in out.groupby(["NameKey",out.get("Elite Side",pd.Series("",index=out.index))]).groups.items():
+        ids=list(idxs); ids=sorted(ids,key=lambda i:safe_float(out.at[i,"Elite Rank Score"],0),reverse=True)
+        for order,i in enumerate(ids[1:],start=1):
+            m=str(out.at[i,"Market"]); first=str(out.at[ids[0],"Market"])
+            if "PRA" in {m,first}:
+                out.at[i,"Elite Correlation Penalty"] = min(8.0, 4.0 + 1.5*order)
+            else:
+                out.at[i,"Elite Correlation Penalty"] = min(4.0, 1.5 + order)
+    # Same-team PTS/PRA OVER stacks compete for the same finite scoring budget.
+    # The opportunity allocator already reconciles totals; this ranking penalty
+    # prevents highly correlated teammate overs from monopolizing the top 10.
+    overmask=out.get("Elite Side",pd.Series("",index=out.index)).astype(str).eq("OVER") & out.get("Market",pd.Series("",index=out.index)).astype(str).isin(["PTS","PRA"])
+    for team,idxs in out[overmask].groupby("Team").groups.items():
+        ids=sorted(list(idxs),key=lambda i:safe_float(out.at[i,"Elite Rank Score"],0),reverse=True)
+        if "Elite Expected Team Points" in out.columns:
+            team_totals=[safe_float(out.at[i,"Elite Expected Team Points"],np.nan) for i in ids]
+            team_total=max([v for v in team_totals if pd.notna(v)] or [80.0])
+        else:
+            team_total=80.0
+        for order,i in enumerate(ids[1:],start=1):
+            p = 0.0
+            if team_total < 87.0:
+                p += min(6.0, 1.5*order)
+            # PTS share gives a direct measure of how much of the same finite
+            # team score the ranked overs are asking for.
+            shares = [safe_float(out.at[j,"Elite Team PTS Share %"],0.0) for j in ids[:order+1] if "Elite Team PTS Share %" in out.columns]
+            if shares and sum(shares) >= 62.0:
+                p += min(5.0, 1.5 + 0.8*order)
+            out.at[i,"Elite Team Stack Penalty"] = min(9.0, p)
+    out["Elite Rank Score"]=(pd.to_numeric(out["Elite Rank Score"],errors="coerce").fillna(0)-out["Elite Correlation Penalty"]-out["Elite Team Stack Penalty"]).clip(0,100).round(2)
+    def status(r):
+        sc=safe_float(r.get("Elite Rank Score"),0); p=safe_float(r.get("Elite Calibrated Probability %"),0); side=str(r.get("Elite Side","")).upper(); market=str(r.get("Market","")).upper(); e=abs(safe_float(r.get("Elite Edge"),0)); floor=floors.get(market,.5)
+        flags=str(r.get("Elite Flags","") or "").upper()
+        if side not in {"OVER","UNDER"}: return "TRACK"
+        if "CRITICAL_STALE_DATA" in flags or "FALLBACK_TEAM_DATA" in flags: return "TRACK"
+        if str(r.get("Projection Readiness","")).upper() == "BLOCKED": return "TRACK"
+        if sc>=82 and p>=60 and e>=floor*1.4: return "ELITE"
+        if sc>=74 and p>=58 and e>=floor: return "STRONG"
+        if sc>=66 and p>=56: return "PLAYABLE"
+        if sc>=58 and p>=54 and e>=floor*0.75: return "LEAN"
+        return "TRACK"
+    out["Elite Status"]=out.apply(status,axis=1)
+    # Rank ONLY real candidate plays 1 -> 200. PASS/TRACK/unready rows remain
+    # visible for audit but cannot consume a number that the user interprets as
+    # a recommended play.
+    _line_series = pd.to_numeric(out["Line"], errors="coerce") if "Line" in out.columns else pd.Series(np.nan, index=out.index, dtype=float)
+    _elite_series = pd.to_numeric(out["Elite Projection"], errors="coerce") if "Elite Projection" in out.columns else pd.Series(np.nan, index=out.index, dtype=float)
+    valid = _line_series.notna() & _elite_series.notna()
+    valid &= out.get("Elite Side", pd.Series("", index=out.index)).astype(str).str.upper().isin(["OVER","UNDER"])
+    valid &= out.get("Elite Status", pd.Series("TRACK", index=out.index)).astype(str).str.upper().isin(["ELITE","STRONG","PLAYABLE","LEAN"])
+    if "Projection Readiness" in out.columns:
+        valid &= out["Projection Readiness"].astype(str).str.upper().eq("READY")
+    _sort_cols=[c for c in ["Elite Rank Score","Elite Calibrated Probability %","Elite Market Role Fit"] if c in out.columns]
+    order=out[valid].sort_values(_sort_cols,ascending=[False]*len(_sort_cols)).index.tolist() if _sort_cols else out[valid].index.tolist()
+    rank_map={idx:rank for rank,idx in enumerate(order[:ELITE_MAX_RANK],start=1)}
+    out["Elite Rank"]=[rank_map.get(i,np.nan) for i in out.index]
+    out["Elite Best Play"]=[f"#{int(rank_map[i])} {out.at[i,'Elite Side']}" if i in rank_map else "UNRANKED" for i in out.index]
+    # Market rank helps identify the best PTS/REB/AST/PRA play separately.
+    out["Elite Market Rank"] = np.nan
+    for mk, idxs in out[valid].groupby("Market").groups.items():
+        ids = sorted(list(idxs), key=lambda i: safe_float(out.at[i,"Elite Rank Score"],0), reverse=True)
+        for mr, i in enumerate(ids, start=1):
+            out.at[i,"Elite Market Rank"] = mr
+    return out.sort_values(["Elite Rank","Elite Rank Score"],ascending=[True,False],na_position="last")
+
+
+def render_elite_rank_card(row: pd.Series) -> None:
+    rank = safe_float(row.get("Elite Rank"), np.nan)
+    rank_txt = f"#{int(rank)}" if pd.notna(rank) else "-"
+    player = html.escape(str(row.get("Player", "")))
+    team = html.escape(str(row.get("Team", "")))
+    opp = html.escape(str(row.get("Opponent", "")))
+    market = html.escape(str(row.get("Market", "")))
+    side = html.escape(str(row.get("Elite Side", "TRACK")))
+    status = html.escape(str(row.get("Elite Status", "TRACK")))
+    proj = safe_float(row.get("Elite Projection"), np.nan)
+    line = safe_float(row.get("Line"), np.nan)
+    edge = safe_float(row.get("Elite Edge"), np.nan)
+    prob = safe_float(row.get("Elite Calibrated Probability %"), np.nan)
+    score = safe_float(row.get("Elite Rank Score"), np.nan)
+    roles = " | ".join([str(row.get(c, "")) for c in ["Elite Scoring Role", "Elite Rebound Role", "Elite Creation Role"] if str(row.get(c, "") or "")])
+    role_summary = html.escape(str(row.get("Elite Role Summary", "") or ""))
+    fga_share = safe_float(row.get("Elite Team FGA Share %"), np.nan)
+    pts_share = safe_float(row.get("Elite Team PTS Share %"), np.nan)
+    reb_share = safe_float(row.get("Elite Team REB Share %"), np.nan)
+    ast_share = safe_float(row.get("Elite Team AST Share %"), np.nan)
+    share_bits = []
+    if pd.notna(fga_share): share_bits.append(f"FGA share {fga_share:.1f}%")
+    if pd.notna(pts_share): share_bits.append(f"PTS share {pts_share:.1f}%")
+    if pd.notna(reb_share): share_bits.append(f"REB share {reb_share:.1f}%")
+    if pd.notna(ast_share): share_bits.append(f"AST share {ast_share:.1f}%")
+    shares = html.escape(" | ".join(share_bits))
+    flags = html.escape(str(row.get("Elite Flags", "") or "None"))
+    st.markdown(
+        f"""<div style='border:1px solid rgba(168,85,247,.42);border-radius:16px;padding:12px 14px;margin:9px 0;background:rgba(15,10,30,.88)'>
+        <div style='display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap'><b style='font-size:1.05rem;color:#f8fafc'>{rank_txt} {player} | {market}</b><b style='color:#facc15'>{status} | {score:.1f}</b></div>
+        <div style='margin-top:5px;color:#c4b5fd'>{team} vs {opp} | <b style='color:#4ade80'>{side}</b> | proj {proj:.2f} vs {line:.2f} | edge {edge:+.2f} | calibrated {prob:.1f}%</div>
+        <div style='margin-top:5px;color:#94a3b8;font-size:.78rem'>{html.escape(roles)}</div>
+        <div style='margin-top:4px;color:#a78bfa;font-size:.74rem'>{role_summary}</div>
+        <div style='margin-top:4px;color:#67e8f9;font-size:.72rem'>{shares}</div>
+        <div style='margin-top:5px;color:#fca5a5;font-size:.72rem'>{flags}</div></div>""",
+        unsafe_allow_html=True,
+    )
 
 def make_projection_board(lines, logs, base, mode: Optional[str] = None):
     """Final projection authority; working Underdog pull remains unchanged."""
@@ -15215,6 +17140,8 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
     board = _strong_trust_enrich_board(board, active_mode)
     board = _apply_full_winning_play_stack(board, base, active_mode)
     if board is not None and not board.empty:
+        board = _attach_pts_v2_challenger(board, base)
+        board = _attach_elite_role_budget_engine(board, base, active_mode)
         board = _reattach_line_audit_columns(board, lines)
         board = _attach_player_prop_slate_coverage(board, active_mode)
         board = _attach_projection_data_readiness(board, logs, active_mode)
@@ -15228,6 +17155,7 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
             equal_nan=True,
         ):
             raise RuntimeError("HHS challenger changed the legacy Projection column")
+        board = _elite_rank_board(board)
         board["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
         board["LineParserVersion"] = LINE_PARSER_VERSION
         save_dataset("projection_board", board)
@@ -15284,8 +17212,8 @@ with tabs[0]:
         render_grouped_player_board("All Lines", use_ud, logs_global, master_global)
 
 with tabs[1]:
-    st.subheader("Best Bets / Tier 1–8 Official Board")
-    st.caption("Clean official board using edge, Monte Carlo, Bayesian confidence, data score, role confidence, line source reliability, similarity, pace, rest/travel, blowout, bench rotation, line movement, EV/Kelly, and model disagreement.")
+    st.subheader("Elite Best Plays / Rank 1–200")
+    st.caption("Only projection-ready OVER/UNDER candidates receive #1-#200 ranks. Ranking uses game environment, finite team opportunity budgets, hierarchy-aware player roles, distributions, calibration, independent-model agreement, freshness, and correlation/risk penalties. PASS/TRACK rows stay unranked. Elite remains a challenger until untouched grading proves promotion.")
     board_path = CACHE_FILES["projection_board"]
     if board_path.exists():
         try:
@@ -15303,22 +17231,26 @@ with tabs[1]:
             key="best_bets_include_tracked",
             help="Best Bets normally shows only projection-ready OVER/UNDER candidates. The full live board remains available in Player Cards.",
         )
+        max_rank = st.slider("Show ranked plays through", min_value=10, max_value=200, value=50, step=10, key="elite_best_bets_max_rank")
+        elite_status_options = [x for x in ["ELITE","STRONG","PLAYABLE","LEAN","TRACK"] if x in set(bb.get("Elite Status", pd.Series(dtype=str)).dropna().astype(str))]
+        elite_status_filter = st.multiselect("Elite status", elite_status_options, default=elite_status_options[:4] if elite_status_options else [])
         tier_options = sorted(bb.get("Tier", pd.Series(dtype=str)).dropna().unique().tolist())
-        tier_filter = st.multiselect("Tier filter", tier_options, default=tier_options[:4] if tier_options else [])
+        tier_filter = []
         show = bb.copy()
         if not include_tracked:
             if "Projection Readiness" in show.columns:
                 show = show[show["Projection Readiness"].astype(str).str.upper().eq("READY")]
-            if "Lean" in show.columns:
-                show = show[show["Lean"].astype(str).str.upper().isin(["OVER", "UNDER"])]
-            if "Official" in show.columns:
-                blocked = show["Official"].astype(str).str.upper().isin(["PASS", "NO", "TRACK", ""])
-                show = show[~blocked]
-        if tier_filter and "Tier" in show.columns:
-            show = show[show["Tier"].isin(tier_filter)]
-        sort_cols = [c for c in ["Official Play Score", "Edge"] if c in show.columns]
+            if "Elite Side" in show.columns:
+                show = show[show["Elite Side"].astype(str).str.upper().isin(["OVER", "UNDER"])]
+            if "Elite Status" in show.columns:
+                show = show[show["Elite Status"].astype(str).str.upper().isin(["ELITE", "STRONG", "PLAYABLE", "LEAN"])]
+        if "Elite Rank" in show.columns:
+            show = show[pd.to_numeric(show["Elite Rank"], errors="coerce").le(max_rank)].copy()
+        if elite_status_filter and "Elite Status" in show.columns:
+            show = show[show["Elite Status"].isin(elite_status_filter)]
+        sort_cols = [c for c in ["Elite Rank", "Elite Rank Score"] if c in show.columns]
         if sort_cols:
-            show = show.sort_values(sort_cols, ascending=False)
+            show = show.sort_values(sort_cols, ascending=[True, False][:len(sort_cols)], na_position="last")
         st.metric("Best Bet Rows", len(show))
         if show.empty and not bb.empty and not include_tracked:
             st.info(
@@ -15332,9 +17264,9 @@ with tabs[1]:
                 st.dataframe(health_issues, use_container_width=True, hide_index=True)
         card_view = st.toggle("Show player cards", value=True, key="best_bets_card_view")
         if card_view:
-            for _, rr in show.head(40).iterrows():
-                render_card(rr)
-        display_cols = [c for c in ["Projection Readiness", "Projection Missing Inputs", "Projection Data Through", "Projection Data Age Days", "Player Games Available", "Player Last Game", "Full Live Board Rows", "Projected Live Rows", "Unprojected Live Rows", "Tier", "Official", "Clean Risk", "Playable Gate", "Winning Play Score", "Projection Engine Version", "LineParserVersion", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided", "Slate Player Prop Coverage", "Slate Missing From Player Props", "Opening Line", "CLV", "Projection", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+            for _, rr in show.head(50).iterrows():
+                render_elite_rank_card(rr)
+        display_cols = [c for c in ["Elite Rank", "Elite Market Rank", "Elite Status", "Elite Rank Score", "Elite Best Play", "Elite Side", "Elite Projection", "Elite Edge", "Elite Calibrated Probability %", "Elite P50", "Elite Scoring Role", "Elite Rebound Role", "Elite Creation Role", "Elite Role Security", "Elite Market Role Fit", "Elite Role Summary", "Elite Scoring Hierarchy Rank", "Elite Rebound Hierarchy Rank", "Elite Creation Hierarchy Rank", "Elite Team FGA Share %", "Elite Team PTS Share %", "Elite Team REB Share %", "Elite Team AST Share %", "Elite Expected Team Points", "Elite Expected Opp Points", "Elite Expected Game Total", "Elite Projected FGA", "Elite Projected FTA", "Elite Vacancy Minutes", "Elite Vacancy FGA", "Elite Vacancy REB", "Elite Vacancy AST", "Elite Team Player PTS Sum", "Elite Projected PTS", "Elite Projected REB", "Elite Projected AST", "Elite Flags", "Elite Agreement Score", "Elite Data Quality", "Elite Risk Penalty", "Projection Readiness", "Projection Missing Inputs", "Projection Data Through", "Projection Data Age Days", "Player Games Available", "Player Last Game", "Full Live Board Rows", "Projected Live Rows", "Unprojected Live Rows", "Tier", "Official", "Clean Risk", "Playable Gate", "Winning Play Score", "Projection Engine Version", "LineParserVersion", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided", "Slate Player Prop Coverage", "Slate Missing From Player Props", "Opening Line", "CLV", "Projection", "Legacy Projection", "Challenger Projection", "PTS V2 Projection", "PTS V2 Side", "PTS V2 Edge", "PTS V2 Over %", "PTS V2 Under %", "PTS V2 P50", "PTS V2 Projected FGA", "PTS V2 Projected 3PA", "PTS V2 Projected FTA", "PTS V2 Usage %", "PTS V2 Team FGA Share %", "PTS V2 Team Total Scale", "PTS V2 Flags", "PTS V2 Data Quality", "PRA V2 Projection", "V2 Market Policy", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
         st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
