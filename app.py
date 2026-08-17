@@ -4774,7 +4774,7 @@ def _historical_make_projection_board_2(lines, logs, base, mode: Optional[str] =
 # ============================================================
 # Logs / backup tools
 # ============================================================
-def save_officials(df, save_all_real_lines: bool = True):
+def _historical_save_officials_app120(df, save_all_real_lines: bool = True):
     """Save a before-game snapshot reliably.
 
     Primary behavior: save official-gate plays. If the strict gate produced zero
@@ -6569,7 +6569,7 @@ def render_card(r):
             if col in r and _val(r.get(col), ""):
                 st.markdown(f"**{col}:** {_val(r.get(col))}")
 
-def dataset_status_table():
+def _historical_dataset_status_table_app120():
     rows = []
     for k, path in CACHE_FILES.items():
         if path.exists():
@@ -6598,7 +6598,7 @@ def kpi_card(label: str, value: Any, sub: str = ""):
 def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, strong: int = 0):
     st.markdown("""
     <div class='owp-hero'>
-      <div class='owp-title'>WNBA PROP ENGINE v4.0.0<br/>LEGACY + HHS CHALLENGER</div>
+      <div class='owp-title'>WNBA PROP ENGINE APP121<br/>ELITE FINAL AUTHORITY + HHS AUDIT</div>
       <div class='owp-subtitle'>Railway-safe load → Refresh only when clicked → Save every real-line projection → Grade</div>
     </div>
     """, unsafe_allow_html=True)
@@ -6697,7 +6697,10 @@ def pull_espn_wnba_scoreboard_context(mode: str = "Today", force: bool = False) 
             if isinstance(payload, dict) and payload.get("cache_key") == cache_key:
                 events = payload.get("events", [])
                 if events:
-                    return pd.DataFrame(events), pd.DataFrame(payload.get("injuries", []))
+                    inj_cached = pd.DataFrame(payload.get("injuries", []))
+                    if not inj_cached.empty and "FetchedAt" not in inj_cached.columns:
+                        inj_cached["FetchedAt"] = payload.get("fetched_at", "")
+                    return pd.DataFrame(events), inj_cached
         except Exception:
             pass
     url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard?dates={_today_yyyymmdd(mode)}"
@@ -6725,6 +6728,7 @@ def pull_espn_wnba_scoreboard_context(mode: str = "Today", force: bool = False) 
                         "Status": inj.get("status") or inj.get("type") or "",
                         "Detail": inj.get("details") or inj.get("detail") or "",
                         "Source": "ESPN scoreboard",
+                        "FetchedAt": now_iso(),
                     })
             if home and away:
                 events_out.append({
@@ -6750,16 +6754,29 @@ def load_automated_injury_table(mode: str = "Today", force: bool = False) -> pd.
     Manual statuses remain strongest because they are user-controlled.
     """
     rows = []
-    # Existing manual JSON list.
+    # Existing manual JSON list. Same-day edits are deliberate overrides; old
+    # files are allowed to lose to fresher official feeds.
+    try:
+        manual_json_mtime = pd.Timestamp(INJURY_STATUS_FILE.stat().st_mtime, unit="s").isoformat() if INJURY_STATUS_FILE.exists() else ""
+    except Exception:
+        manual_json_mtime = ""
     for r in load_json(INJURY_STATUS_FILE, []):
         if isinstance(r, dict):
-            rr = dict(r); rr.setdefault("Source", "Manual injury status"); rows.append(rr)
+            rr = dict(r); rr.setdefault("Source", "Manual injury status")
+            rr.setdefault("FetchedAt", rr.get("UpdatedAt") or rr.get("SavedAt") or manual_json_mtime)
+            rows.append(rr)
     # Optional uploaded CSV with richer statuses.
     manual_csv = LOCAL_DIR / "wnba_injury_status.csv"
     m = _safe_read_csv_path(manual_csv)
+    try:
+        manual_csv_mtime = pd.Timestamp(manual_csv.stat().st_mtime, unit="s").isoformat() if manual_csv.exists() else ""
+    except Exception:
+        manual_csv_mtime = ""
     if not m.empty:
         for _, r in m.iterrows():
-            rr = r.to_dict(); rr.setdefault("Source", "Uploaded injury CSV"); rows.append(rr)
+            rr = r.to_dict(); rr.setdefault("Source", "Uploaded injury CSV")
+            rr.setdefault("FetchedAt", rr.get("UpdatedAt") or rr.get("SavedAt") or manual_csv_mtime)
+            rows.append(rr)
     # ESPN scoreboard injuries.
     _, espn_inj = pull_espn_wnba_scoreboard_context(mode, force=force)
     if not espn_inj.empty:
@@ -9642,7 +9659,7 @@ def _slate_matchup_label(row: pd.Series) -> str:
     return team or opp or "WNBA SLATE"
 
 
-def build_copy_paste_slate(df: pd.DataFrame, best_only: bool = False, max_rows: int = 0) -> str:
+def _historical_build_copy_paste_slate_app120(df: pd.DataFrame, best_only: bool = False, max_rows: int = 0) -> str:
     """Create a clean matchup-grouped tracking slate from every real line."""
     if df is None or df.empty:
         return "No projections available."
@@ -10256,6 +10273,10 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         _ml_elite_base = pd.DataFrame(); _ml_team_season = pd.DataFrame(); _ml_team_opp = pd.DataFrame(); _ml_team_recent = pd.DataFrame()
         _ml_inactive, _ml_questionable = {}, {}
         _ml_injury_note = f"elite ML context unavailable: {str(_ml_elite_exc)[:120]}"
+    try:
+        _ml_injury_summary = _app121_injury_summary_by_team(mode)
+    except Exception:
+        _ml_injury_summary = {}
 
     cards = []
     game_rows = []
@@ -10296,7 +10317,7 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         if pd.isna(_ml_target):
             try: _ml_target = pd.to_datetime(slate_target_date(mode), errors="coerce")
             except Exception: _ml_target = pd.to_datetime(datetime.now(tz=app_timezone()).date(), errors="coerce")
-        _ml_age = (_ml_target.normalize()-_ml_latest.normalize()).days if pd.notna(_ml_latest) and pd.notna(_ml_target) else np.nan
+        _ml_age = _app121_context_lag_days(a,b,_ml_latest,_ml_target)
         if _elite_ml_env is None or not (_elite_ml_env or {}).get("data_ok"):
             _ml_fresh_factor, _ml_fresh_status = 0.35, "FALLBACK"
         elif pd.notna(_ml_age) and _ml_age > 7:
@@ -10327,7 +10348,13 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         source_note = html.escape(str(p.get("source", "schedule")))
         game_date_note = html.escape(str(p.get("game_date", "")))
         ml_fresh_note = html.escape(f"{_ml_fresh_status}{(' · '+str(int(_ml_age))+'d') if pd.notna(_ml_age) else ''}")
-        ml_injury_names = html.escape(str((_elite_ml_env or {}).get("injury_names", "") or ""))
+        _inj_bits=[]
+        if _ml_injury_summary.get(a): _inj_bits.append(f"{a}: {_ml_injury_summary.get(a)}")
+        if _ml_injury_summary.get(b): _inj_bits.append(f"{b}: {_ml_injury_summary.get(b)}")
+        if not _inj_bits:
+            _fallback_inj=str((_elite_ml_env or {}).get("injury_names", "") or "").strip()
+            if _fallback_inj and _fallback_inj.lower() != "none": _inj_bits.append(f"{a}: {_fallback_inj}")
+        ml_injury_names = html.escape(" | ".join(_inj_bits))
         fav_label = html.escape(str(ml_team))
         ml_note = f"{fav_label} FAV" if ml_prob >= 50 else "NO CLEAR FAV"
         game_rows.append({
@@ -10355,8 +10382,10 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
             "Raw Sim Favorite Win Probability": round(max(raw_a_win, 100.0-raw_a_win), 1),
             "ML Data Freshness": _ml_fresh_status,
             "ML Data Age Days": _ml_age,
-            "ML Injury Adjusted": bool(_elite_ml_env is not None and (_elite_ml_env or {}).get("data_ok")),
-            "ML Injury Names Away": str((_elite_ml_env or {}).get("injury_names", "")),
+            "ML Injury Adjusted": bool(_ml_injury_summary.get(a) or _ml_injury_summary.get(b)),
+            "ML Injury Names Away": str(_ml_injury_summary.get(a, "")),
+            "ML Injury Names Home": str(_ml_injury_summary.get(b, "")),
+            "ML Injury Summary": " | ".join(_inj_bits),
             "ML Injury Feed Note": str(_ml_injury_note),
         })
         cards.append(
@@ -13211,14 +13240,14 @@ def render_hhs_model_tab() -> None:
     coverage = repository.coverage()
     st.subheader("Her Hoop Stats / Model Comparison")
     st.caption(
-        "Legacy remains the active production model. HHS and Hybrid are challenger outputs only; "
-        "the app never crawls subscriber pages or promotes an unvalidated blend."
+        "Final Resolved is the active production authority. Legacy, HHS, Hybrid, and raw Elite component outputs remain visible for audit/comparison; "
+        "the app never crawls subscriber pages or silently promotes an unvalidated external blend."
     )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("HHS datasets", f"{coverage['datasets_available']}/{coverage['datasets_expected']}")
     c2.metric("HHS rows", f"{coverage['rows_loaded']:,}")
     c3.metric("Last HHS refresh", coverage["last_refresh"] or "not loaded")
-    c4.metric("Active model", "LEGACY")
+    c4.metric("Active model", "FINAL RESOLVED")
     auto_report = pd.DataFrame(st.session_state.get("wnba_hhs_auto_refresh_report", []))
     if not auto_report.empty:
         auto_status = ", ".join(sorted(auto_report.get("Status", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()))
@@ -13367,7 +13396,7 @@ def _stable_load_or_repair_cached_board(mode: str, base: Optional[pd.DataFrame])
     return board, label
 
 
-def _refresh_core_projection_data(mode: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+def _app120_refresh_core_projection_data(mode: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     """Refresh current-season inputs on an explicit user refresh.
 
     Existing caches are preserved when the remote source is unavailable.
@@ -16134,7 +16163,7 @@ def _elite_starter_rate_table() -> pd.DataFrame:
     return d.groupby(["NameKey", "Team"], as_index=False).agg(StarterRate=("StarterNum", "mean"), StarterGames=("StarterNum", "count"))
 
 
-def _elite_inactive_by_team(mode: str) -> Tuple[Dict[str, set], Dict[str, set], str]:
+def _app120_elite_inactive_by_team(mode: str) -> Tuple[Dict[str, set], Dict[str, set], str]:
     out: Dict[str, set] = {}
     questionable: Dict[str, set] = {}
     note = "injury feed unavailable"
@@ -16445,7 +16474,7 @@ def _elite_one_side_environment(
         "ast_budget": ast_budget, "fg_pct": fg_pct, "oreb_rate": oreb_rate,
         "injury_score_penalty": inj_penalty, "injury_names": inj_names,
         "data_ok": not t.empty and not od.empty,
-        "latest_data": max([d for d in [pd.to_datetime(t.get("DataThrough"), errors="coerce"), pd.to_datetime(od.get("DataThrough"), errors="coerce"), pd.to_datetime(tr.get("DataThrough"), errors="coerce")] if pd.notna(d)], default=pd.NaT),
+        "latest_data": min([d for d in [pd.to_datetime(t.get("DataThrough"), errors="coerce"), pd.to_datetime(od.get("DataThrough"), errors="coerce"), pd.to_datetime(tr.get("DataThrough"), errors="coerce")] if pd.notna(d)], default=pd.NaT),
     }
 
 
@@ -16885,7 +16914,7 @@ def _attach_elite_role_budget_engine(board: pd.DataFrame, base: Optional[pd.Data
                 target_date = pd.to_datetime(slate_target_date(mode), errors="coerce")
             except Exception:
                 target_date = pd.to_datetime(datetime.now(tz=app_timezone()).date(), errors="coerce")
-        age=(target_date.normalize()-latest.normalize()).days if pd.notna(latest) and pd.notna(target_date) else np.nan
+        age=_app121_context_lag_days(team,opp,latest,target_date)
         if pd.notna(age) and age > 2:
             flags.append("STALE_TEAM_DATA")
         if pd.notna(age) and age > 7:
@@ -16966,7 +16995,7 @@ def _elite_agreement_score(row: pd.Series, side: str) -> Tuple[float,str]:
     return float(score), f"{count_agree}/{len(weighted_votes)} directions agree; correlated votes downweighted"
 
 
-def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
+def _app120_elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
     if board is None or board.empty: return board
     rows=[]
     scales={"PTS":2.5,"REB":1.05,"AST":.90,"PRA":3.6}
@@ -17130,35 +17159,392 @@ def render_elite_rank_card(row: pd.Series) -> None:
         unsafe_allow_html=True,
     )
 
+
+# ============================================================
+# App 121 — FINAL AUTHORITY / LIVE CONTEXT / INJURY SCENARIOS
+# ============================================================
+APP_VERSION = "WNBA v4.5.0 - App121 Elite Final Authority + Live Context"
+LEGACY_PROJECTION_ENGINE_VERSION = PROJECTION_ENGINE_VERSION
+PROJECTION_ENGINE_VERSION = "APP121_FINAL_AUTHORITY"
+PROJECTION_ENGINE_NOTE = "Final authority: PTS Elite role-budget; REB Legacy protected; AST Legacy protected pending V2; PRA replaces only the PTS component. Elite #1-#200 and all saves use Final Resolved Projection."
+ELITE_ENGINE_VERSION = "ELITE_ROLE_BUDGET_V4_APP121"
+FINAL_RESOLVER_VERSION = "FINAL_RESOLVER_V1_APP121"
+INJURY_SCENARIO_VERSION = "CANONICAL_INJURY_SCENARIO_V1_APP121"
+LIVE_TEAM_CONTEXT_VERSION = "LIVE_TEAM_CONTEXT_FROM_PLAYER_LOGS_V1_APP121"
+
+
+def _app121_team_game_table_from_logs(logs: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if logs is None or logs.empty: return pd.DataFrame()
+    d=standardize_player_logs(logs)
+    if d is None or d.empty: return pd.DataFrame()
+    d=d.copy(); d["Season"]=pd.to_numeric(d.get("Season"),errors="coerce")
+    latest=d["Season"].dropna().max()
+    if pd.notna(latest): d=d[d["Season"].eq(latest)].copy()
+    if "Played" in d.columns: d=d[d["Played"].fillna(False).astype(bool)].copy()
+    d["Team"]=d.get("Team","").map(_team_key_for_matchup); d["Opponent"]=d.get("Opponent","").map(_team_key_for_matchup)
+    d["GameDate"]=pd.to_datetime(d.get("GameDate"),errors="coerce")
+    if "NameKey" not in d.columns: d["NameKey"]=d.get("Player",pd.Series("",index=d.index)).map(normalize_name)
+    game_key=d.get("GameID",pd.Series("",index=d.index)).astype(str)
+    pair_a=d[["Team","Opponent"]].astype(str).min(axis=1); pair_b=d[["Team","Opponent"]].astype(str).max(axis=1)
+    fallback=d["GameDate"].dt.strftime("%Y-%m-%d").fillna("")+"|"+pair_a+"|"+pair_b
+    d["_GameKey"]=game_key.where(game_key.str.len().gt(3)&~game_key.str.lower().isin(["nan","none"]),fallback)
+    d=d.sort_values("GameDate").drop_duplicates(["_GameKey","Team","NameKey"],keep="last")
+    numeric=["PTS","FGA","FGM","FG3A","FG3M","FTA","FTM","TOV","OREB","DREB","REB","AST","STL","BLK"]
+    for c in numeric: d[c]=pd.to_numeric(d.get(c),errors="coerce").fillna(0.0)
+    if d.empty: return pd.DataFrame()
+    agg={c:(c,"sum") for c in numeric}
+    tg=d.groupby(["_GameKey","Team","Opponent"],as_index=False).agg(GameDate=("GameDate","max"),Season=("Season","max"),**agg)
+    tg=tg[(tg["Team"].astype(str).str.len()>0)&(tg["Opponent"].astype(str).str.len()>0)].copy()
+    tg["Poss"]=(tg["FGA"]+0.44*tg["FTA"]-tg["OREB"]+tg["TOV"]).clip(lower=45.0,upper=115.0)
+    opp=tg[["_GameKey","Team","Poss","PTS"]].rename(columns={"Team":"Opponent","Poss":"OppPoss","PTS":"OppPTSJoin"})
+    tg=tg.merge(opp,on=["_GameKey","Opponent"],how="left")
+    tg["GamePoss"]=tg[["Poss","OppPoss"]].mean(axis=1,skipna=True)
+    tg["ORtgGame"]=100*tg["PTS"]/tg["Poss"].replace(0,np.nan); tg["DRtgGame"]=100*tg["OppPTSJoin"]/tg["OppPoss"].replace(0,np.nan)
+    return tg.sort_values("GameDate").reset_index(drop=True)
+
+
+def _app121_merge_team_table(existing: pd.DataFrame, fresh: pd.DataFrame, key: str="Team") -> pd.DataFrame:
+    if fresh is None or fresh.empty: return existing if existing is not None else pd.DataFrame()
+    if existing is None or existing.empty or key not in existing.columns: return fresh.reset_index(drop=True)
+    e=existing.copy(); f=fresh.copy(); e[key]=e[key].map(_team_key_for_matchup); f[key]=f[key].map(_team_key_for_matchup)
+    replaced=set(f[key].dropna().astype(str)); e=e[~e[key].astype(str).isin(replaced)].copy()
+    return pd.concat([e,f],ignore_index=True,sort=False)
+
+
+def _app121_rebuild_live_team_context(logs: Optional[pd.DataFrame]) -> Dict[str,Any]:
+    tg=_app121_team_game_table_from_logs(logs)
+    if tg.empty: return {"Live Team Context":"not rebuilt: no completed team-game rows"}
+    counts=tg.groupby("Team")["_GameKey"].nunique(); eligible=set(counts[counts>=3].index.astype(str)); tg=tg[tg["Team"].isin(eligible)].copy()
+    if tg.empty: return {"Live Team Context":"not rebuilt: insufficient team-game coverage"}
+    season_rows=[]; recent_rows=[]; opp_rows=[]
+    for team,g in tg.groupby("Team"):
+        gp=max(1,len(g)); poss=g["Poss"].sum(); oppposs=g["OppPoss"].sum(skipna=True); pts=g["PTS"].sum(); opppts=g["OppPTSJoin"].sum(skipna=True)
+        row={"Team":team,"Season":int(pd.to_numeric(g["Season"],errors="coerce").dropna().max()),"GP":gp,"Games":gp,"PTS":pts,"FGA":g["FGA"].sum(),"FGM":g["FGM"].sum(),"FG3A":g["FG3A"].sum(),"FG3M":g["FG3M"].sum(),"FTA":g["FTA"].sum(),"FTM":g["FTM"].sum(),"TOV":g["TOV"].sum(),"OREB":g["OREB"].sum(),"DREB":g["DREB"].sum(),"REB":g["REB"].sum(),"AST":g["AST"].sum(),"PTS_per_game":pts/gp,"FGA_per_game":g["FGA"].mean(),"FTA_per_game":g["FTA"].mean(),"TOV_per_game":g["TOV"].mean(),"OREB_per_game":g["OREB"].mean(),"AST_per_game":g["AST"].mean(),"PointsAllowed_per_game":g["OppPTSJoin"].mean(),"Pace":g["GamePoss"].mean(),"ORtg":100*pts/max(poss,1e-9),"DRtg":100*opppts/max(oppposs,1e-9) if oppposs>0 else np.nan,"DataThrough":g["GameDate"].max(),"ContextSource":LIVE_TEAM_CONTEXT_VERSION}
+        row["NetRtg"]=row["ORtg"]-row["DRtg"] if pd.notna(row["DRtg"]) else np.nan; row["eFG%"]=(row["FGM"]+0.5*row["FG3M"])/max(row["FGA"],1e-9); row["TS%"] = row["PTS"]/(2*max(row["FGA"]+0.44*row["FTA"],1e-9)); season_rows.append(row)
+        gs=g.sort_values("GameDate"); rec={"Team":team,"Season":row["Season"],"DataThrough":g["GameDate"].max(),"ContextSource":LIVE_TEAM_CONTEXT_VERSION}
+        for n in [5,10]:
+            z=gs.tail(n); zp=z["Poss"].sum(); zop=z["OppPoss"].sum(skipna=True); rec[f"PTS_L{n}"]=z["PTS"].mean(); rec[f"AST_L{n}"]=z["AST"].mean(); rec[f"Pace_L{n}"]=z["GamePoss"].mean(); rec[f"ORtg_L{n}"]=100*z["PTS"].sum()/max(zp,1e-9); rec[f"DRtg_L{n}"]=100*z["OppPTSJoin"].sum(skipna=True)/max(zop,1e-9) if zop>0 else np.nan; rec[f"FGA_L{n}"]=z["FGA"].mean(); rec[f"FTA_L{n}"]=z["FTA"].mean(); rec[f"REB_L{n}"]=z["REB"].mean()
+        recent_rows.append(rec)
+    for defense,g in tg.groupby("Opponent"):
+        gp=max(1,len(g)); fga=g["FGA"].sum(); fgm=g["FGM"].sum(); fg3m=g["FG3M"].sum(); opp_rows.append({"Team":defense,"Season":int(pd.to_numeric(g["Season"],errors="coerce").dropna().max()),"GP":gp,"OppPTS_per_game":g["PTS"].mean(),"OppFGA_per_game":g["FGA"].mean(),"OppFTA_per_game":g["FTA"].mean(),"OppTOV_per_game":g["TOV"].mean(),"OppOREB_per_game":g["OREB"].mean(),"OppREB_per_game":g["REB"].mean(),"OppAST_per_game":g["AST"].mean(),"Opp_eFG%":(fgm+0.5*fg3m)/max(fga,1e-9),"DataThrough":g["GameDate"].max(),"ContextSource":LIVE_TEAM_CONTEXT_VERSION})
+    fresh_season=pd.DataFrame(season_rows); fresh_recent=pd.DataFrame(recent_rows); fresh_opp=pd.DataFrame(opp_rows)
+    save_dataset("team_season_stats",_app121_merge_team_table(load_dataset("team_season_stats"),fresh_season)); save_dataset("team_recent_stats",_app121_merge_team_table(load_dataset("team_recent_stats"),fresh_recent)); save_dataset("team_opponent_stats",_app121_merge_team_table(load_dataset("team_opponent_stats"),fresh_opp))
+    ranks=fresh_season[[c for c in ["Team","Season","Pace","ORtg","DRtg","NetRtg","eFG%","TS%","DataThrough"] if c in fresh_season.columns]].copy()
+    if not ranks.empty:
+        ranks["PaceRank"]=ranks["Pace"].rank(ascending=False,method="min"); ranks["ORtgRank"]=ranks["ORtg"].rank(ascending=False,method="min"); ranks["DRtgRank"]=ranks["DRtg"].rank(ascending=True,method="min"); ranks["NetRtgRank"]=ranks["NetRtg"].rank(ascending=False,method="min"); ranks["ContextSource"]=LIVE_TEAM_CONTEXT_VERSION; save_dataset("team_ranks",_app121_merge_team_table(load_dataset("team_ranks"),ranks))
+    try: _cached_ml_team_context.clear()
+    except Exception: pass
+    latest=pd.to_datetime(tg["GameDate"],errors="coerce").max(); return {"Live Team Context":f"rebuilt {len(eligible)} teams from {len(tg)} team-games","Live Team Data Through":str(latest.date()) if pd.notna(latest) else "unknown"}
+
+
+_refresh_core_projection_data_app120 = _app120_refresh_core_projection_data
+def _refresh_core_projection_data(mode: str) -> Tuple[pd.DataFrame,pd.DataFrame,Dict[str,Any]]:
+    logs,master,report=_refresh_core_projection_data_app120(mode)
+    try: report.update(_app121_rebuild_live_team_context(logs))
+    except Exception as exc: report["Live Team Context"]=f"rebuild failed; prior cache retained: {str(exc)[:160]}"
+    if logs is not None and not logs.empty:
+        try: master,_=build_master_features(); report["Master Features After Team Context"]=f"rebuilt {len(master)} players"
+        except Exception as exc: report["Master Features After Team Context"]=f"prior master retained: {str(exc)[:120]}"
+    # Clear model caches whose inputs may have changed during this refresh.
+    for _fn_name in ["_app121_latest_completed_team_dates","_elite_starter_rate_table","_elite_current_shot_context","_cached_ml_team_context"]:
+        try:
+            _fn=globals().get(_fn_name)
+            if _fn is not None and hasattr(_fn,"clear"): _fn.clear()
+        except Exception:
+            pass
+    return logs,master,report
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _app121_latest_completed_team_dates() -> Dict[str,pd.Timestamp]:
+    """Latest actually-played game by team; rest days are not data staleness."""
+    try: logs=load_dataset("player_game_logs")
+    except Exception: logs=pd.DataFrame()
+    tg=_app121_team_game_table_from_logs(logs)
+    if tg is None or tg.empty: return {}
+    return {str(team):pd.to_datetime(g["GameDate"],errors="coerce").max() for team,g in tg.groupby("Team")}
+
+
+def _app121_context_lag_days(team: str, opponent: str, data_through: Any, target_date: Any) -> float:
+    latest=pd.to_datetime(data_through,errors="coerce")
+    dates=_app121_latest_completed_team_dates()
+    expected_vals=[pd.to_datetime(dates.get(_team_key_for_matchup(x)),errors="coerce") for x in [team,opponent]]
+    expected_vals=[d for d in expected_vals if pd.notna(d)]
+    # Both sides' contexts are needed, so current means data reaches the older
+    # of the two teams' latest completed games. This avoids penalizing rest days.
+    expected=min(expected_vals) if expected_vals else pd.to_datetime(target_date,errors="coerce")
+    if pd.isna(latest) or pd.isna(expected): return np.nan
+    return float(max(0,(expected.normalize()-latest.normalize()).days))
+
+
+def _app121_status_priority(status: str) -> int:
+    s=str(status or "").upper(); order=[("OUT",100),("INACTIVE",98),("SUSPENDED",96),("NOT PLAY",95),("DOUBTFUL",90),("QUESTIONABLE",80),("GTD",80),("GAME TIME",80),("DAY-TO-DAY",75),("PROBABLE",55),("AVAILABLE",25),("ACTIVE",20),("NOT LISTED",10)]; return max([v for k,v in order if k in s] or [0])
+
+def _app121_truthy(value: Any) -> bool: return str(value or "").strip().upper() in {"1","TRUE","YES","Y","ON","FORCE","OVERRIDE"}
+
+def _app121_injury_timestamp(row: pd.Series) -> pd.Timestamp:
+    for c in ["FetchedAt","UpdatedAt","Updated","SavedAt","Timestamp","AsOf","Date","ReportDate"]:
+        if c in row.index:
+            dt=pd.to_datetime(row.get(c),errors="coerce",utc=True)
+            if pd.notna(dt):
+                try: return dt.tz_convert(None)
+                except Exception:
+                    try: return dt.tz_localize(None)
+                    except Exception: return dt
+    return pd.NaT
+
+def _app121_injury_source_priority(row: pd.Series, mode: str) -> Tuple[int,pd.Timestamp]:
+    src=str(row.get("Source","") or "").upper(); ts=_app121_injury_timestamp(row); explicit=any(_app121_truthy(row.get(c)) for c in ["ManualOverride","Override","Force","Authoritative"] if c in row.index)
+    if explicit: return 1000,ts
+    target=pd.to_datetime(slate_target_date(mode) or app_today(),errors="coerce"); same_day=bool(pd.notna(ts) and pd.notna(target) and ts.date()==target.date())
+    if "MANUAL" in src or "UPLOADED INJURY" in src: return (950 if same_day else 620),ts
+    if "OFFICIAL WNBA" in src: return 900,ts
+    if "ESPN" in src: return 820,ts
+    if "OFFICIAL" in src: return 780,ts
+    return 500,ts
+
+def _app121_canonical_injury_records(mode: str) -> Tuple[Dict[Tuple[str,str],Dict[str,Any]],str]:
+    table,note=_combined_live_injury_table(mode); records={}
+    if table is None or table.empty: return records,note
+    for _,r in table.iterrows():
+        nk=normalize_name(r.get("NameKey") or r.get("Player")); tk=_team_key_for_matchup(r.get("TeamKey") or r.get("Team"));
+        if not nk: continue
+        status=str(r.get("StatusKey") or r.get("Status") or "").strip().upper(); priority,ts=_app121_injury_source_priority(r,mode)
+        rec={"player":str(r.get("Player","") or "").strip(),"status":status,"reason":str(r.get("Reason",r.get("Injury",r.get("Detail",""))) or ""),"source":str(r.get("Source","") or "injury feed"),"team":tk,"timestamp":ts,"source_priority":priority}
+        new_key=(priority,int(ts.value) if pd.notna(ts) else -1,_app121_status_priority(status))
+        for key in [(nk,tk),(nk,"")]:
+            old=records.get(key); oldts=old.get("timestamp",pd.NaT) if old else pd.NaT; oldkey=(int(old.get("source_priority",0)) if old else 0,int(oldts.value) if old is not None and pd.notna(oldts) else -1,_app121_status_priority(old.get("status")) if old else -1)
+            if old is None or new_key>oldkey: records[key]=rec
+    return records,note
+
+def _app121_recent_dnp_keys(logs: Optional[pd.DataFrame]) -> set:
+    if logs is None or logs.empty: return set()
+    try: d=standardize_player_logs(logs)
+    except Exception: return set()
+    if d is None or d.empty: return set()
+    d=d.copy(); d["GameDate"]=pd.to_datetime(d.get("GameDate"),errors="coerce")
+    if "NameKey" not in d.columns: d["NameKey"]=d.get("Player",pd.Series("",index=d.index)).map(normalize_name)
+    d["_TeamKey"]=d["Team"].map(_team_key_for_matchup) if "Team" in d.columns else ""; d=d.sort_values("GameDate"); recent=set(); last=d.groupby("NameKey",as_index=False).tail(1); bad=pd.Series(False,index=last.index)
+    if "DNP" in last.columns: bad|=last["DNP"].fillna(False).astype(bool)
+    if "Played" in last.columns: bad|=~last["Played"].fillna(True).astype(bool)
+    recent.update(last.loc[bad,"NameKey"].astype(str)); played=d.copy()
+    if "Played" in played.columns: played=played[played["Played"].fillna(True).astype(bool)].copy()
+    if not played.empty:
+        team_latest=played.groupby("_TeamKey")["GameDate"].max().to_dict()
+        for nk,g in played.groupby("NameKey"):
+            latest=g["GameDate"].max(); team=str(g.iloc[-1].get("_TeamKey","") or ""); tl=team_latest.get(team,pd.NaT); mins=pd.to_numeric(g.get("MIN",g.get("Minutes",pd.Series(dtype=float))),errors="coerce"); role_min=float(mins.tail(10).mean()) if not mins.empty and mins.notna().any() else 0.0
+            if pd.notna(latest) and pd.notna(tl) and tl>latest and role_min>=8.0: recent.add(str(nk))
+    return recent
+
+def _attach_canonical_injury_state(board: pd.DataFrame, mode: str, logs: Optional[pd.DataFrame]=None) -> pd.DataFrame:
+    if board is None or board.empty: return board
+    records,note=_app121_canonical_injury_records(mode); recent_dnp=_app121_recent_dnp_keys(logs if logs is not None else load_dataset("player_game_logs")); rows=[]
+    team_uncertain={}
+    for (ik,it),irec in records.items():
+        if not it: continue
+        ist=str(irec.get("status","") or "").upper()
+        if any(tag in ist for tag in ["PROBABLE","QUESTIONABLE","GTD","GAME TIME","DAY-TO-DAY"]):
+            team_uncertain.setdefault(it,[]).append((ik,str(irec.get("player","") or ik),ist))
+    for _,rr in board.iterrows():
+        r=rr.copy(); nk=normalize_name(r.get("Matched Player") or r.get("Player")); tk=_team_key_for_matchup(r.get("Team")); rec=records.get((nk,tk)) or records.get((nk,"")); status=str((rec or {}).get("status") or r.get("Injury Status") or "NOT LISTED").upper().strip(); reason=str((rec or {}).get("reason") or r.get("Injury Report Reason") or "").strip(); source=str((rec or {}).get("source") or r.get("Injury Source") or "none listed"); returning=bool(nk in recent_dnp and any(x in status for x in ["PROBABLE","QUESTIONABLE","GTD","AVAILABLE","ACTIVE"])); teammate_uncertain=[x for x in team_uncertain.get(tk,[]) if x[0]!=nk]
+        if any(x in status for x in ["OUT","INACTIVE","SUSPENDED","NOT PLAY","DOUBTFUL"]): state="UNAVAILABLE"; gate="BLOCK"; avail=.05; min_mult=0.; shrink=0.
+        elif any(x in status for x in ["QUESTIONABLE","GTD","GAME TIME","DAY-TO-DAY"]): state="GAME_TIME_DECISION"; gate="WAIT_FOR_CONFIRMATION"; avail=.55; min_mult=.82 if returning else .88; shrink=.45
+        elif "PROBABLE" in status: state="PROBABLE_RETURN" if returning else "PROBABLE"; gate="CAUTION"; avail=.88; min_mult=.94 if returning else .98; shrink=.78 if returning else .90
+        else: state="ACTIVE_OR_NOT_LISTED"; gate="CLEAR"; avail=.98; min_mult=1.; shrink=1.
+        r["Canonical Injury Status"]=status; r["Canonical Injury State"]=state; r["Canonical Injury Reason"]=reason; r["Canonical Injury Source"]=source; r["Canonical Injury Feed Note"]=note; r["Canonical Availability Probability"]=round(100*avail,1); r["Return From Injury Flag"]=returning; r["Injury Scenario Minutes Multiplier"]=min_mult; r["Injury Scenario Probability Shrink"]=shrink; r["Injury Recommendation Gate"]=gate; r["Team Availability Uncertainty"]=bool(teammate_uncertain); r["Team Availability Uncertainty Names"]="; ".join(f"{nm} {st}" for _,nm,st in teammate_uncertain[:5]); r["Injury Status"]=status; r["Availability"]=status; rows.append(r)
+    return pd.DataFrame(rows)
+
+def _app121_injury_summary_by_team(mode: str) -> Dict[str,str]:
+    records,_=_app121_canonical_injury_records(mode); out={}; seen=set()
+    for (nk,team),rec in records.items():
+        if not team or (nk,team) in seen: continue
+        seen.add((nk,team)); status=str(rec.get("status","") or "").upper()
+        if _app121_status_priority(status)<50: continue
+        nm=str(rec.get("player","") or "").strip() or nk; out.setdefault(team,[]).append(f"{nm} {status}")
+    return {team:"; ".join(dict.fromkeys(bits)) for team,bits in out.items() if bits}
+
+# Shared canonical truth for both Elite role budgets and Moneyline.
+def _elite_inactive_by_team(mode: str) -> Tuple[Dict[str,set],Dict[str,set],str]:
+    inactive={}; questionable={}; records,note=_app121_canonical_injury_records(mode); seen=set()
+    for (nk,team),rec in records.items():
+        if not team or not nk or (nk,team) in seen: continue
+        seen.add((nk,team)); status=str(rec.get("status","") or "").upper()
+        if any(tag in status for tag in ["OUT","DOUBTFUL","INACTIVE","SUSPENDED","NOT PLAY"]): inactive.setdefault(team,set()).add(nk)
+        elif any(tag in status for tag in ["QUESTIONABLE","GTD","GAME TIME","DAY-TO-DAY"]): questionable.setdefault(team,set()).add(nk)
+    return inactive,questionable,note
+
+
+def _app121_side_prob_from_normal(line: float, mean: float, legacy_sd: float, side: str) -> Tuple[float,float]:
+    sd=max(.65,legacy_sd); over=_normal_over_probability(line,mean,sd) if pd.notna(line) and pd.notna(mean) else np.nan; return over,(100-over if pd.notna(over) else np.nan)
+
+
+def _attach_final_resolved_projection(board: pd.DataFrame) -> pd.DataFrame:
+    if board is None or board.empty: return board
+    out=board.copy()
+    if "Legacy Projection" not in out.columns: out["Legacy Projection"]=pd.to_numeric(out.get("Projection"),errors="coerce")
+    if "Legacy Edge" not in out.columns: out["Legacy Edge"]=pd.to_numeric(out.get("Edge"),errors="coerce")
+    if "Legacy Lean" not in out.columns: out["Legacy Lean"]=out.get("Lean","")
+    if "Legacy Over %" not in out.columns: out["Legacy Over %"]=pd.to_numeric(out.get("Over %"),errors="coerce")
+    if "Legacy Under %" not in out.columns: out["Legacy Under %"]=pd.to_numeric(out.get("Under %"),errors="coerce")
+    rows=[]
+    for _,rr in out.iterrows():
+        r=rr.copy(); market=str(r.get("Market","")).upper(); line=safe_float(r.get("Line"),np.nan); legacy=safe_float(r.get("Legacy Projection"),safe_float(r.get("Projection"),np.nan)); elite_market=safe_float(r.get("Elite Projection"),np.nan); elite_pts=safe_float(r.get("Elite Projected PTS"),np.nan); source="LEGACY_PROTECTED"
+        if market=="PTS" and pd.notna(elite_market): proj=elite_market; source="ELITE_PTS_ROLE_BUDGET"
+        elif market=="REB": proj=legacy; source="REB_LEGACY_PROTECTED"
+        elif market=="AST": proj=legacy; source="AST_LEGACY_PROTECTED_PENDING_V2"
+        elif market=="PRA" and pd.notna(elite_pts):
+            base_pts=safe_float(r.get("PRA Component PTS"),safe_float(r.get("PTS Component Opportunity"),np.nan))
+            if pd.notna(base_pts) and pd.notna(legacy): proj=max(0.,legacy+(elite_pts-base_pts)); source="PRA_ELITE_PTS_PLUS_PROTECTED_REB_AST"
+            elif pd.notna(elite_market): proj=elite_market; source="ELITE_PRA_FALLBACK"
+            else: proj=legacy
+        else: proj=legacy
+        gate=str(r.get("Injury Recommendation Gate","CLEAR")); mult=safe_float(r.get("Injury Scenario Minutes Multiplier"),1.); proj_before_injury=proj
+        if gate in {"CAUTION","WAIT_FOR_CONFIRMATION"} and pd.notna(proj): proj=max(0.,proj*mult); source+="+INJURY_SCENARIO"
+        if market in {"PTS","PRA"} and pd.notna(elite_market):
+            over=safe_float(r.get("Elite Over %"),np.nan); under=safe_float(r.get("Elite Under %"),np.nan); rawp50=safe_float(r.get("Elite P50"),elite_market)
+            if market=="PRA" and pd.notna(proj_before_injury):
+                p50=rawp50+(proj_before_injury-elite_market) if pd.notna(rawp50) else proj_before_injury
+                if pd.notna(line): over,under=_app121_side_prob_from_normal(line,proj, safe_float(r.get("Elite SD"),6.5),"OVER")
+            else: p50=rawp50
+        else: over=safe_float(r.get("Legacy Over %"),np.nan); under=safe_float(r.get("Legacy Under %"),np.nan); p50=safe_float(r.get("MC Median"),proj)
+        if gate in {"CAUTION","WAIT_FOR_CONFIRMATION"} and pd.notna(line) and pd.notna(proj):
+            sd=safe_float(r.get("Elite SD"),safe_float(r.get("Volatility"),{"PTS":4.5,"REB":2.3,"AST":2.,"PRA":6.5}.get(market,4.))); over,under=_app121_side_prob_from_normal(line,proj,sd,"OVER")
+            if pd.notna(p50) and pd.notna(proj_before_injury): p50=p50+(proj-proj_before_injury)
+        shrink=safe_float(r.get("Injury Scenario Probability Shrink"),1.); over=50+(over-50)*shrink if pd.notna(over) else np.nan; under=100-over if pd.notna(over) else np.nan; edge=proj-line if pd.notna(proj) and pd.notna(line) else np.nan; side="OVER" if pd.notna(edge) and edge>0 else "UNDER" if pd.notna(edge) and edge<0 else "PASS"
+        if gate in {"BLOCK","WAIT_FOR_CONFIRMATION"}: side="PASS"
+        ages=[v for v in [safe_float(r.get("Elite Data Age Days"),np.nan),safe_float(r.get("Projection Data Age Days"),np.nan)] if pd.notna(v)]; age=max(ages) if ages else np.nan
+        if pd.notna(age) and age>7: side="PASS"
+        mean_side="OVER" if pd.notna(edge) and edge>0 else "UNDER" if pd.notna(edge) and edge<0 else "PUSH"; med_side="OVER" if pd.notna(line) and pd.notna(p50) and p50>line else "UNDER" if pd.notna(line) and pd.notna(p50) and p50<line else "PUSH"
+        r["Final Resolved Projection"]=round(proj,2) if pd.notna(proj) else np.nan; r["Final Resolved Edge"]=round(edge,2) if pd.notna(edge) else np.nan; r["Final Resolved Side"]=side; r["Final Resolved Mean Side"]=mean_side; r["Final Resolved Median Side"]=med_side; r["Final Mean P50 Agreement"]=bool(mean_side==med_side and mean_side in {"OVER","UNDER"}); r["Final Resolved Over %"]=round(over,1) if pd.notna(over) else np.nan; r["Final Resolved Under %"]=round(under,1) if pd.notna(under) else np.nan; r["Final Resolved P50"]=round(p50,2) if pd.notna(p50) else np.nan; r["Final Projection Source"]=source; r["Final Resolver Version"]=FINAL_RESOLVER_VERSION; rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def _attach_final_calibration_context(board: pd.DataFrame) -> pd.DataFrame:
+    if board is None or board.empty: return board
+    out=board.copy(); grades=_graded_result_rows(); final_grades=pd.DataFrame()
+    if grades is not None and not grades.empty:
+        auth=pd.Series(False,index=grades.index)
+        for c in ["Saved Projection Authority","Production Projection Authority","ProjectionAuthority","Projection Engine Version","Final Resolver Version"]:
+            if c in grades.columns: auth|=grades[c].astype(str).str.upper().str.contains("FINAL_RESOLVED|APP121_FINAL_AUTHORITY|FINAL_RESOLVER",regex=True,na=False)
+        final_grades=grades[auth].copy()
+    if final_grades.empty: cal=pd.DataFrame()
+    else:
+        final_grades["EdgeBucket"]=final_grades["EdgeNum"].map(lambda x:_bucket_label(x,[.75,1.25,2.,3.],["e<0.75","e0.75-1.25","e1.25-2.0","e2.0-3.0","e3+"])); final_grades["ProbBucket"]=final_grades["ProbNum"].map(lambda x:_bucket_label(x,[56,60,63,66],["p<56","p56-60","p60-63","p63-66","p66+"])); cal=final_grades.groupby(["Market","Lean","EdgeBucket","ProbBucket"],dropna=False).agg(CalibrationSamples=("Win","count"),CalibrationWins=("Win","sum"),CalibrationWinRate=("Win","mean")).reset_index()
+    if cal is None or cal.empty:
+        out["Calibration Label"]="NO_HISTORY"; out["Calibration Samples"]=0; out["Calibration Win Rate %"]=np.nan; out["Auto Threshold Add"]=0.; out["Calibration Note"]="Final Resolved calibration starts clean; Legacy grading is audit-only."; out["Calibration Authority"]="FINAL_RESOLVED_ONLY"; return out
+    lookup={(str(r.get("Market","")),str(r.get("Lean","")),str(r.get("EdgeBucket","")),str(r.get("ProbBucket",""))):r for _,r in cal.iterrows()}; rows=[]
+    for _,rr in out.iterrows():
+        r=rr.copy(); market=str(r.get("Market","")).upper(); side=str(r.get("Final Resolved Side","PASS")).upper(); edge=abs(safe_float(r.get("Final Resolved Edge"),np.nan)); prob=safe_float(r.get("Final Resolved Over %"),np.nan) if side=="OVER" else safe_float(r.get("Final Resolved Under %"),np.nan) if side=="UNDER" else np.nan; eb=_bucket_label(edge,[.75,1.25,2.,3.],["e<0.75","e0.75-1.25","e1.25-2.0","e2.0-3.0","e3+"]); pb=_bucket_label(prob,[56,60,63,66],["p<56","p56-60","p60-63","p63-66","p66+"]); hit=lookup.get((market,side,eb,pb)) if side in {"OVER","UNDER"} else None
+        if hit is None: r["Calibration Label"]="NO_BUCKET_HISTORY" if side in {"OVER","UNDER"} else "PASS_NO_BUCKET"; r["Calibration Samples"]=0; r["Calibration Win Rate %"]=np.nan; r["Auto Threshold Add"]=0.; r["Calibration Note"]=f"No Final Resolved graded bucket for {market}/{side}/{eb}/{pb}."
+        else:
+            n=int(safe_float(hit.get("CalibrationSamples"),0)); wr=safe_float(hit.get("CalibrationWinRate"),np.nan); label="HOT_BUCKET" if n>=8 and pd.notna(wr) and wr>=.60 else "COLD_BUCKET" if n>=8 and pd.notna(wr) and wr<.52 else "SMALL_SAMPLE" if n<8 else "NEUTRAL_BUCKET"; r["Calibration Label"]=label; r["Calibration Samples"]=n; r["Calibration Win Rate %"]=round(wr*100,1) if pd.notna(wr) else np.nan; r["Auto Threshold Add"]=.35 if label=="COLD_BUCKET" else .15 if label=="SMALL_SAMPLE" else 0.; r["Calibration Note"]=f"Final authority {market}/{side}/{eb}/{pb}: {n} graded, {wr:.1%} wins." if pd.notna(wr) else f"Final authority bucket {n} graded."
+        r["Calibration Authority"]="FINAL_RESOLVED_ONLY"; rows.append(r)
+    return pd.DataFrame(rows)
+
+
+_elite_rank_board_app120 = _app120_elite_rank_board
+def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
+    if board is None or board.empty: return board
+    x=board.copy()
+    for src,dst in [("Elite Projection","Elite Raw Projection"),("Elite Edge","Elite Raw Edge"),("Elite Side","Elite Raw Side"),("Elite Over %","Elite Raw Over %"),("Elite Under %","Elite Raw Under %"),("Elite P50","Elite Raw P50")]:
+        if src in x.columns and dst not in x.columns: x[dst]=x[src]
+    for src,dst in {"Final Resolved Projection":"Elite Projection","Final Resolved Edge":"Elite Edge","Final Resolved Side":"Elite Side","Final Resolved Over %":"Elite Over %","Final Resolved Under %":"Elite Under %","Final Resolved P50":"Elite P50"}.items():
+        if src in x.columns: x[dst]=x[src]
+    if "Final Resolved Mean Side" in x.columns: x["Elite Mean Side"]=x["Final Resolved Mean Side"]
+    if "Final Resolved Median Side" in x.columns: x["Elite Median Side"]=x["Final Resolved Median Side"]
+    flags=x.get("Elite Flags",pd.Series("",index=x.index)).fillna("").astype(str)
+    if "Final Mean P50 Agreement" in x.columns: flags=flags+np.where(~x["Final Mean P50 Agreement"].fillna(False).astype(bool)," | MEAN_P50_CONFLICT","")
+    gate=x.get("Injury Recommendation Gate",pd.Series("CLEAR",index=x.index)).astype(str).str.upper(); ret=x.get("Return From Injury Flag",pd.Series(False,index=x.index)).fillna(False).astype(bool); team_unc=x.get("Team Availability Uncertainty",pd.Series(False,index=x.index)).fillna(False).astype(bool); flags=flags+np.where(gate.eq("WAIT_FOR_CONFIRMATION")," | INJURY_WAIT_FOR_CONFIRMATION | MINUTES_UNCERTAINTY | ROLE_UNCERTAINTY","")+np.where(gate.eq("BLOCK")," | PLAYER_UNAVAILABLE","")+np.where(gate.eq("CAUTION")," | PROBABLE_LIMIT_RISK | MINUTES_UNCERTAINTY","")+np.where(ret," | RETURN_FROM_INJURY | ROLE_UNCERTAINTY","")+np.where(team_unc," | TEAMMATE_AVAILABILITY_UNCERTAINTY | ROLE_UNCERTAINTY",""); x["Elite Flags"]=flags.str.strip(" |")
+    if "Projection Readiness" in x.columns: x.loc[gate.isin(["WAIT_FOR_CONFIRMATION","BLOCK"]),"Projection Readiness"]="BLOCKED"
+    ranked=_elite_rank_board_app120(x); ranked["Elite Rank Authority"]="FINAL_RESOLVED_PROJECTION"; return ranked
+
+
+def _promote_final_authority(board: pd.DataFrame) -> pd.DataFrame:
+    if board is None or board.empty or "Final Resolved Projection" not in board.columns: return board
+    out=board.copy(); out["Projection"]=pd.to_numeric(out["Final Resolved Projection"],errors="coerce"); out["Edge"]=pd.to_numeric(out.get("Final Resolved Edge"),errors="coerce"); out["Lean"]=out.get("Final Resolved Side",out.get("Lean","PASS")); out["Over %"]=pd.to_numeric(out.get("Final Resolved Over %"),errors="coerce"); out["Under %"]=pd.to_numeric(out.get("Final Resolved Under %"),errors="coerce"); status=out.get("Elite Status",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); side=out.get("Final Resolved Side",pd.Series("PASS",index=out.index)).astype(str).str.upper(); rec=status.isin(["ELITE","STRONG","PLAYABLE","LEAN"])&side.isin(["OVER","UNDER"])&pd.to_numeric(out.get("Elite Rank"),errors="coerce").notna(); out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),"PASS"); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP121_FINAL_AUTHORITY"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
+
+
+def build_copy_paste_slate(df: pd.DataFrame, best_only: bool=False, max_rows: int=0) -> str:
+    if df is None or df.empty: return "No projections available."
+    work=df.copy()
+    for c in ["Line","Projection","Final Resolved Projection","Final Resolved Edge","Elite Rank","Elite Rank Score","Elite Calibrated Probability %","MIN Proj"]:
+        if c in work.columns: work[c]=pd.to_numeric(work[c],errors="coerce")
+    work=work[pd.to_numeric(work.get("Line"),errors="coerce").notna()&pd.to_numeric(work.get("Projection"),errors="coerce").notna()].copy()
+    if "Source" in work.columns: work=work[~work["Source"].astype(str).str.upper().str.contains("NO LINE|TRACKED ONLY|MISSING",na=False)]
+    if work.empty: return "No real-line projections available."
+    work["_matchup"]=work.apply(_slate_matchup_label,axis=1)
+    if best_only:
+        ranked=pd.to_numeric(work.get("Elite Rank"),errors="coerce"); work=work[ranked.notna()&ranked.between(1,ELITE_MAX_RANK)].copy()
+        if work.empty: return "No Elite-ranked plays passed freshness, injury, readiness and confidence gates."
+        work=work.sort_values("Elite Rank")
+    else:
+        work["_rank_sort"]=pd.to_numeric(work.get("Elite Rank"),errors="coerce").fillna(9999); work=work.sort_values(["_matchup","_rank_sort","Player","Market"],kind="stable")
+    if max_rows and max_rows>0: work=work.head(max_rows)
+    def line_text(r):
+        rank=safe_float(r.get("Elite Rank"),np.nan); ranktxt=f"#{int(rank)} " if pd.notna(rank) else ""; side=str(r.get("Final Resolved Side",r.get("Lean","PASS"))).upper(); sidechar="O" if side=="OVER" else "U" if side=="UNDER" else "PASS"; player=str(r.get("Player","Player")); market=str(r.get("Market","PROP")).upper(); line=_fmt_num_compact(r.get("Line"),1); proj=_fmt_num_compact(r.get("Final Resolved Projection",r.get("Projection")),2); prob=safe_float(r.get("Elite Calibrated Probability %"),np.nan); score=safe_float(r.get("Elite Rank Score"),np.nan); mins=_fmt_num_compact(r.get("MIN Proj"),1); status=str(r.get("Elite Status","TRACK")); src=str(r.get("Final Projection Source","FINAL")); extras=[]
+        if pd.notna(prob): extras.append(f"{prob:.0f}%")
+        if pd.notna(score): extras.append(f"score {score:.1f}")
+        if mins!="—": extras.append(f"MIN {mins}")
+        return f"• {ranktxt}{player} — {sidechar} {line} {market} — {proj} FINAL — {status}"+(" — "+" | ".join(extras) if extras else "")+f" — {src}"
+    if best_only:
+        return "\n".join(["ELITE BEST PLAYS — GLOBAL #1-#200"]+[line_text(r)+f" — {str(r.get('_matchup','') or '')}" for _,r in work.iterrows()])
+    blocks=[]
+    for matchup,g in work.groupby("_matchup",sort=False): blocks.append("\n".join([str(matchup)]+[line_text(r) for _,r in g.iterrows()]))
+    return "\n\n".join(blocks)
+
+
+def save_officials(df, save_all_real_lines: bool=True):
+    if df is None or getattr(df,"empty",True): return 0
+    work=df.copy()
+    if "Line" not in work.columns or "Projection" not in work.columns: return 0
+    work["Line"]=pd.to_numeric(work["Line"],errors="coerce"); work["Projection"]=pd.to_numeric(work["Projection"],errors="coerce"); valid=work[work["Line"].notna()&work["Projection"].notna()].copy()
+    if "Source" in valid.columns: valid=valid[~valid["Source"].astype(str).str.upper().str.contains("NO LINE|TRACKED ONLY|MISSING",na=False)]
+    if valid.empty: return 0
+    official_mask=valid.get("Elite Rank",pd.Series(np.nan,index=valid.index)).notna()&valid.get("Final Resolved Side",pd.Series("PASS",index=valid.index)).astype(str).str.upper().isin(["OVER","UNDER"]); plays=valid.copy() if save_all_real_lines else valid[official_mask].copy(); log=load_json(OFFICIAL_LOG,[]); log=log if isinstance(log,list) else []; stamp=now_iso(); existing={(str(i.get("SlateDate","")),normalize_name(i.get("Player","")),str(i.get("Market","")).upper(),str(i.get("Line","")),str(i.get("SavedAt",""))[:10]) for i in log}; saved=0
+    for _,r in plays.iterrows():
+        row={k:_json_safe(v) if not isinstance(v,(dict,list)) else v for k,v in r.to_dict().items()}; row["SavedAt"]=stamp; row["Result"]="PENDING"; row["Actual"]=None; is_rec=bool(official_mask.get(r.name,False)); row["SnapshotType"]="ELITE_RANKED" if is_rec else "TRACKED_REAL_LINE"; row["WasOfficialAtSave"]=is_rec; row["Saved Projection Authority"]="FINAL_RESOLVED_PROJECTION"; row["Saved Elite Rank"]=_json_safe(r.get("Elite Rank")); row["Saved Elite Status"]=_json_safe(r.get("Elite Status")); slate_date=str(row.get("SlateDate") or row.get("GameDate") or row.get("Start") or "")[:10]; key=(slate_date,normalize_name(row.get("Player","")),str(row.get("Market","")).upper(),str(row.get("Line","")),stamp[:10])
+        if key in existing: continue
+        log.append(row); existing.add(key); saved+=1
+    save_json(OFFICIAL_LOG,log); hist=load_json(LINE_HISTORY_FILE,[]); hist=hist if isinstance(hist,list) else []
+    for _,r in valid.iterrows(): hist.append({"SavedAt":stamp,"Player":_json_safe(r.get("Player")),"Market":_json_safe(r.get("Market")),"Line":_json_safe(r.get("Line")),"Source":_json_safe(r.get("Source")),"Projection":_json_safe(r.get("Projection")),"ProjectionAuthority":"FINAL_RESOLVED_PROJECTION"})
+    save_json(LINE_HISTORY_FILE,hist); return saved
+
+
+def dataset_status_table():
+    rows=[]; target=app_today()
+    for k,path in CACHE_FILES.items():
+        if not path.exists(): rows.append({"Dataset":k,"Status":"⏳ output — created by Refresh" if k=="projection_board" else "❌ missing","File":str(path),"Rows":0,"Columns":0,"Data Through":"","Data Age":"","File Updated":""}); continue
+        try:
+            df=pd.read_csv(path,low_memory=False); through=pd.NaT
+            for c in ["DataThrough","GameDate","SlateDate","EventDate"]:
+                if c in df.columns:
+                    cand=pd.to_datetime(df[c],errors="coerce",utc=True).max()
+                    if pd.notna(cand) and (pd.isna(through) or cand>through): through=cand
+            if pd.isna(through):
+                for c in ["UpdatedAt","FetchedAt"]:
+                    if c in df.columns:
+                        cand=pd.to_datetime(df[c],errors="coerce",utc=True).max()
+                        if pd.notna(cand) and (pd.isna(through) or cand>through): through=cand
+            if pd.notna(through): day=through.tz_convert(None).date() if getattr(through,"tzinfo",None) else through.date(); age=(target-day).days; data_through=str(day); age_txt=f"{age}d"
+            else: data_through="n/a"; age_txt="n/a"
+            status="✅ cached"
+            if k!="projection_board" and age_txt.endswith("d"):
+                av=int(age_txt[:-1]); status="🚨 cached but critical stale" if av>7 else "⚠️ cached but stale" if av>2 else status
+            rows.append({"Dataset":k,"Status":status,"File":str(path),"Rows":len(df),"Columns":len(df.columns),"Data Through":data_through,"Data Age":age_txt,"File Updated":datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")})
+        except Exception: rows.append({"Dataset":k,"Status":"⚠️ read issue","File":str(path),"Rows":0,"Columns":0,"Data Through":"","Data Age":"","File Updated":""})
+    return pd.DataFrame(rows)
+
 def make_projection_board(lines, logs, base, mode: Optional[str] = None):
-    """Final projection authority; working Underdog pull remains unchanged."""
-    active_mode = mode or "Today"
-    board = _build_live_projection_inputs(lines, base, active_mode)
-    board = _strict_attach_opponent_context(board, active_mode)
-    board = _strict_market_isolated_rebuild(board, base)
-    board = _stable_attach_context_audit_only(board, base)
-    board = _strong_trust_enrich_board(board, active_mode)
-    board = _apply_full_winning_play_stack(board, base, active_mode)
+    """App121 final projection authority; Underdog pull/parser remains unchanged."""
+    active_mode=mode or "Today"
+    board=_build_live_projection_inputs(lines,base,active_mode); board=_strict_attach_opponent_context(board,active_mode); board=_strict_market_isolated_rebuild(board,base); board=_stable_attach_context_audit_only(board,base); board=_strong_trust_enrich_board(board,active_mode); board=_apply_full_winning_play_stack(board,base,active_mode)
     if board is not None and not board.empty:
-        board = _attach_pts_v2_challenger(board, base)
-        board = _attach_elite_role_budget_engine(board, base, active_mode)
-        board = _reattach_line_audit_columns(board, lines)
-        board = _attach_player_prop_slate_coverage(board, active_mode)
-        board = _attach_projection_data_readiness(board, logs, active_mode)
-    board = _ensure_full_live_board_coverage(board, lines, active_mode)
+        board=_attach_pts_v2_challenger(board,base); board=_attach_canonical_injury_state(board,active_mode,logs); board=_attach_elite_role_budget_engine(board,base,active_mode); board=_reattach_line_audit_columns(board,lines); board=_attach_player_prop_slate_coverage(board,active_mode); board=_attach_projection_data_readiness(board,logs,active_mode)
+    board=_ensure_full_live_board_coverage(board,lines,active_mode)
     if board is not None and not board.empty:
-        legacy_projection = pd.to_numeric(board["Projection"], errors="coerce").copy()
-        board = attach_model_comparison(board, repository=HHSRepository(), simulations=10_000)
-        if not np.allclose(
-            pd.to_numeric(board["Projection"], errors="coerce"),
-            legacy_projection,
-            equal_nan=True,
-        ):
-            raise RuntimeError("HHS challenger changed the legacy Projection column")
-        board = _elite_rank_board(board)
-        board["Projection Engine Version"] = PROJECTION_ENGINE_VERSION
-        board["LineParserVersion"] = LINE_PARSER_VERSION
-        save_dataset("projection_board", board)
+        legacy_projection=pd.to_numeric(board["Projection"],errors="coerce").copy(); board=attach_model_comparison(board,repository=HHSRepository(),simulations=10_000)
+        if not np.allclose(pd.to_numeric(board["Projection"],errors="coerce"),legacy_projection,equal_nan=True): raise RuntimeError("HHS challenger changed the pre-resolver legacy Projection column")
+        board=_attach_canonical_injury_state(board,active_mode,logs); board=_attach_final_resolved_projection(board); board=_attach_final_calibration_context(board); board=_elite_rank_board(board); board=_promote_final_authority(board); board["LineParserVersion"]=LINE_PARSER_VERSION; board["Injury Scenario Version"]=INJURY_SCENARIO_VERSION; save_dataset("projection_board",board)
     return board
 
 
@@ -17189,14 +17575,24 @@ try:
     if _startup_board is not None and not _startup_board.empty:
         _startup_versions = set(_startup_board.get("Projection Engine Version", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
         _startup_parser_versions = set(_startup_board.get("LineParserVersion", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
-        if "LineParserVersion" not in _startup_board.columns or LINE_PARSER_VERSION not in _startup_parser_versions:
+        if "LineParserVersion" not in _startup_board.columns or LINE_PARSER_VERSION not in _startup_parser_versions or PROJECTION_ENGINE_VERSION not in _startup_versions:
+            # Never repair an old model board into the new authority. Preserve a
+            # diagnostic backup, remove the active cache, and require Refresh.
+            try:
+                _qstamp=datetime.now(tz=app_timezone()).strftime("%Y%m%d_%H%M%S")
+                _qpath=LOCAL_DIR / f"wnba_projection_board_incompatible_{_qstamp}.csv"
+                _startup_board.to_csv(_qpath,index=False)
+                _active_path=CACHE_FILES.get("projection_board")
+                if _active_path and Path(_active_path).exists(): Path(_active_path).unlink()
+                st.session_state["wnba_app121_refresh_required"]="Incompatible pre-App121 projection cache quarantined. Press Refresh Today before using Best Plays."
+            except Exception as _qexc:
+                st.session_state["wnba_app121_refresh_required"]=f"Projection cache incompatible; Refresh required. Quarantine warning: {str(_qexc)[:120]}"
             _startup_board = pd.DataFrame()
-        elif PROJECTION_ENGINE_VERSION not in _startup_versions:
-            _startup_board = _stable_repair_projection_board(_startup_board, master_global)
-            save_dataset("projection_board", _startup_board)
 except Exception as _stable_startup_exc:
     st.session_state["wnba_stable_startup_repair_error"] = str(_stable_startup_exc)[:240]
 
+if st.session_state.get("wnba_app121_refresh_required"):
+    st.warning(st.session_state.get("wnba_app121_refresh_required"))
 
 tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Moneyline", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports", "HHS / Models"])
 
@@ -17213,7 +17609,7 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Elite Best Plays / Rank 1–200")
-    st.caption("Only projection-ready OVER/UNDER candidates receive #1-#200 ranks. Ranking uses game environment, finite team opportunity budgets, hierarchy-aware player roles, distributions, calibration, independent-model agreement, freshness, and correlation/risk penalties. PASS/TRACK rows stay unranked. Elite remains a challenger until untouched grading proves promotion.")
+    st.caption("Only projection-ready OVER/UNDER candidates receive #1-#200 ranks. Ranking uses game environment, finite team opportunity budgets, hierarchy-aware player roles, distributions, calibration, independent-model agreement, freshness, and correlation/risk penalties. PASS/TRACK rows stay unranked. Final Resolved is the production ranking authority; Legacy and raw Elite/HHS remain visible only for audit and untouched model comparison.")
     board_path = CACHE_FILES["projection_board"]
     if board_path.exists():
         try:
