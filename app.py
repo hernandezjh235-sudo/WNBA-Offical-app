@@ -110,7 +110,7 @@ from wnba_hhs.evaluation import (
 from wnba_hhs.schema import DATASET_KEYS
 from wnba_hhs.snapshots import ProjectionSnapshotStore
 
-APP_VERSION = "WNBA v4.6.0 - App122 Post-Grade Role Calibration"
+APP_VERSION = "WNBA v4.6.1 - App123 App122 Refresh Hotfix"
 LINE_PARSER_VERSION = "UD_BASE_CARD_MAINLINE_V5"
 MONEYLINE_FEED_VERSION = "V367_UNDERDOG_GAME_SLATE_ELITE_INJURY_FRESHNESS"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
@@ -6609,7 +6609,7 @@ def kpi_card(label: str, value: Any, sub: str = ""):
 def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, strong: int = 0):
     st.markdown("""
     <div class='owp-hero'>
-      <div class='owp-title'>WNBA PROP ENGINE APP122<br/>POST-GRADE ROLE CALIBRATION + HHS AUDIT</div>
+      <div class='owp-title'>WNBA PROP ENGINE APP123<br/>APP122 POST-GRADE + REFRESH HOTFIX</div>
       <div class='owp-subtitle'>Railway-safe load → Refresh only when clicked → Save every real-line projection → Grade</div>
     </div>
     """, unsafe_allow_html=True)
@@ -11062,7 +11062,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v4.6.0 - App122 Post-Grade Role Calibration"
+APP_VERSION = "WNBA v4.6.1 - App123 App122 Refresh Hotfix"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -12603,7 +12603,7 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v4.6.0 - App122 Post-Grade Role Calibration"
+APP_VERSION = "WNBA v4.6.1 - App123 App122 Refresh Hotfix"
 PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = "LEGACY LOCKED: season-isolated Bayesian baseline + bounded minutes/matchup. PTS V2 is a separate challenger and never overwrites legacy Projection."
 PTS_V2_ENGINE_VERSION = "PTS_V2_TEAM_CONSTRAINED_CHALLENGER_V1"
@@ -13835,7 +13835,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v4.6.0 - App122 Post-Grade Role Calibration"
+APP_VERSION = "WNBA v4.6.1 - App123 App122 Refresh Hotfix"
 PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = (
     "LEGACY LOCKED for A/B testing. Current-season inputs are isolated; prior seasons live only in explicit *_prior fields. "
@@ -16647,6 +16647,91 @@ def _elite_role_label(score: float, kind: str) -> str:
     return "C1 PRIMARY CREATOR" if score >= 82 else "C2 SECONDARY CREATOR" if score >= 64 else "C3 SUPPORT CREATOR" if score >= 44 else "C4 LOW CREATION"
 
 
+
+def _elite_prepare_base(base: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the player baseline used by the Elite role-budget engine.
+
+    App 122 called this helper during Refresh Today but the helper itself was
+    accidentally omitted from the build.  Keep this routine intentionally
+    conservative: it does not change any projection formula or weights.  It
+    only guarantees the identity/team/position columns the Elite rotation
+    engine requires and removes duplicate/stale player rows deterministically.
+    """
+    if base is None or not isinstance(base, pd.DataFrame) or base.empty:
+        return pd.DataFrame()
+
+    b = base.copy()
+
+    # Canonical player identity.
+    if "Player" not in b.columns:
+        for c in ["Matched Player", "PlayerName", "player_name", "Name"]:
+            if c in b.columns:
+                b["Player"] = b[c]
+                break
+    if "Player" not in b.columns:
+        return pd.DataFrame()
+
+    if "NameKey" not in b.columns:
+        b["NameKey"] = b["Player"].map(normalize_name)
+    else:
+        nk = b["NameKey"].fillna("").astype(str).str.strip()
+        missing = nk.eq("")
+        if missing.any():
+            b.loc[missing, "NameKey"] = b.loc[missing, "Player"].map(normalize_name)
+        b["NameKey"] = b["NameKey"].fillna("").astype(str).map(normalize_name)
+
+    # Canonical team identity used by every Elite matchup/rotation function.
+    if "Team" not in b.columns:
+        for c in ["Team_Team", "team", "TeamAbbr", "TeamAbbreviation"]:
+            if c in b.columns:
+                b["Team"] = b[c]
+                break
+    if "Team" not in b.columns:
+        b["Team"] = ""
+    b["_TeamKey"] = b["Team"].map(_team_key_for_matchup)
+
+    # Stable position group.  Existing valid PositionGroup values are retained;
+    # missing/unknown values are derived from Position when possible.
+    if "PositionGroup" not in b.columns:
+        b["PositionGroup"] = "Unknown"
+    if "Position" not in b.columns:
+        b["Position"] = ""
+    pg = b["PositionGroup"].fillna("").astype(str).str.strip()
+    bad_pg = pg.eq("") | pg.str.upper().isin(["UNKNOWN", "NAN", "NONE"])
+    if bad_pg.any():
+        b.loc[bad_pg, "PositionGroup"] = b.loc[bad_pg, "Position"].map(position_group)
+    b["PositionGroup"] = b["PositionGroup"].fillna("Unknown").astype(str)
+
+    # Numeric fields used downstream.  Coercion only; no model-side imputation.
+    for c in [
+        "Season", "Games", "GP", "MIN_avg", "MIN_l3", "MIN_l5", "MIN_l10", "MIN_l20",
+        "PTS_avg", "REB_avg", "AST_avg", "PRA_avg", "FGA_avg", "FGA_l5", "FGA_l10",
+        "FG3A_avg", "FTA_avg", "FGA", "FGM", "FG3A", "FG3M", "FTA", "FTM",
+        "TOV", "OREB", "DREB", "USG%", "AST%", "TRB%", "UsageProxy",
+        "AST%Proxy", "TRB%Proxy", "StarterRate"
+    ]:
+        if c in b.columns:
+            b[c] = pd.to_numeric(b[c], errors="coerce")
+
+    if "LastGame" in b.columns:
+        b["_EliteLastGameSort"] = pd.to_datetime(b["LastGame"], errors="coerce")
+    else:
+        b["_EliteLastGameSort"] = pd.NaT
+    b["_EliteSeasonSort"] = pd.to_numeric(b.get("Season", np.nan), errors="coerce")
+    b["_EliteGamesSort"] = pd.to_numeric(b.get("Games", b.get("GP", np.nan)), errors="coerce").fillna(0)
+
+    # Only usable player/team identities can enter a finite team opportunity
+    # budget.  If duplicates exist, keep the newest/current-most baseline.
+    b = b[b["NameKey"].astype(str).str.len().gt(0) & b["_TeamKey"].astype(str).str.len().gt(0)].copy()
+    if b.empty:
+        return b
+    b = b.sort_values(
+        ["NameKey", "_EliteSeasonSort", "_EliteLastGameSort", "_EliteGamesSort"],
+        na_position="first",
+    ).drop_duplicates("NameKey", keep="last")
+
+    return b.drop(columns=["_EliteLastGameSort", "_EliteSeasonSort", "_EliteGamesSort"], errors="ignore").reset_index(drop=True)
+
 def _elite_role_rotation(
     base: pd.DataFrame, team: str, target_key: str, target_minutes: float,
     env: Dict[str, Any], excluded_keys: set, questionable_keys: Optional[set] = None,
@@ -17173,9 +17258,9 @@ def render_elite_rank_card(row: pd.Series) -> None:
 # ============================================================
 # App 122 — POST-GRADE FINAL AUTHORITY / LIVE CONTEXT / RETURN-ROLE SCENARIOS
 # ============================================================
-APP_VERSION = "WNBA v4.6.0 - App122 Post-Grade Role Calibration"
+APP_VERSION = "WNBA v4.6.1 - App123 App122 Refresh Hotfix"
 LEGACY_PROJECTION_ENGINE_VERSION = PROJECTION_ENGINE_VERSION
-PROJECTION_ENGINE_VERSION = "APP122_POST_GRADE_AUTHORITY"
+PROJECTION_ENGINE_VERSION = "APP123_POST_GRADE_AUTHORITY_HOTFIX"
 PROJECTION_ENGINE_NOTE = "App122 final authority: robust team-score ensemble; PTS Elite role-budget with return-role scenarios; REB Legacy protected; AST Legacy protected pending V2; PRA replaces only PTS. Extreme edges and unproven OVERs require stronger evidence before #1-#200 promotion."
 ELITE_ENGINE_VERSION = "ELITE_ROLE_BUDGET_V5_APP122"
 FINAL_RESOLVER_VERSION = "FINAL_RESOLVER_V2_APP122"
@@ -17558,7 +17643,7 @@ def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
     flags=x.get("Elite Flags",pd.Series("",index=x.index)).fillna("").astype(str); gate=x.get("Injury Recommendation Gate",pd.Series("CLEAR",index=x.index)).astype(str).str.upper(); ret=x.get("Return From Injury Flag",pd.Series(False,index=x.index)).fillna(False).astype(bool); team_unc=x.get("Team Availability Uncertainty",pd.Series(False,index=x.index)).fillna(False).astype(bool)
     if "Final Mean P50 Agreement" in x.columns: flags=flags+np.where(~x["Final Mean P50 Agreement"].fillna(False).astype(bool)," | MEAN_P50_CONFLICT","")
     flags=flags+np.where(gate.eq("WAIT")," | INJURY_WAIT_FOR_CONFIRMATION | MINUTES_UNCERTAINTY | ROLE_UNCERTAINTY","")+np.where(gate.eq("BLOCK")," | PLAYER_UNAVAILABLE","")+np.where(gate.eq("CAUTION")," | RETURN_OR_PROBABLE_CAUTION | MINUTES_UNCERTAINTY","")+np.where(ret," | RETURN_FROM_INJURY | ROLE_UNCERTAINTY","")+np.where(team_unc," | TEAMMATE_AVAILABILITY_UNCERTAINTY | ROLE_UNCERTAINTY",""); x["Elite Flags"]=flags.str.strip(" |")
-    ranked=_elite_rank_board_app120(x); ranked["Elite Rank Authority"]="FINAL_RESOLVED_PROJECTION_APP122"; return ranked
+    ranked=_elite_rank_board_app120(x); ranked["Elite Rank Authority"]="FINAL_RESOLVED_PROJECTION_APP123"; return ranked
 
 
 def _promote_final_authority(board: pd.DataFrame) -> pd.DataFrame:
@@ -17566,7 +17651,7 @@ def _promote_final_authority(board: pd.DataFrame) -> pd.DataFrame:
     out=board.copy(); out["Projection"]=pd.to_numeric(out["Final Resolved Projection"],errors="coerce"); out["Edge"]=pd.to_numeric(out.get("Final Resolved Edge"),errors="coerce"); out["Lean"]=out.get("Final Resolved Side",out.get("Lean","PASS")); out["Over %"]=pd.to_numeric(out.get("Final Resolved Over %"),errors="coerce"); out["Under %"]=pd.to_numeric(out.get("Final Resolved Under %"),errors="coerce")
     status=out.get("Elite Status",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); side=out.get("Final Resolved Side",pd.Series("PASS",index=out.index)).astype(str).str.upper(); rank=pd.to_numeric(out.get("Elite Rank"),errors="coerce"); rec=status.isin(["ELITE","STRONG","PLAYABLE","LEAN"])&side.isin(["OVER","UNDER"])&rank.notna(); rec_state=out.get("Final Recommendation State",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); readiness=out.get("Projection Readiness",pd.Series("READY",index=out.index)).astype(str).str.upper(); valid=pd.to_numeric(out.get("Line"),errors="coerce").notna()&pd.to_numeric(out.get("Projection"),errors="coerce").notna()
     fallback=np.where(~valid,"PASS",np.where(rec_state.eq("BLOCK")|readiness.eq("BLOCK"),"BLOCK",np.where(rec_state.eq("WAIT")|readiness.eq("WAIT"),"WAIT","TRACK")))
-    out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),fallback); out["Recommendation State"]=np.where(rec,status,fallback); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP122_POST_GRADE_AUTHORITY"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY_APP122"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
+    out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),fallback); out["Recommendation State"]=np.where(rec,status,fallback); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP123_POST_GRADE_AUTHORITY_HOTFIX"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY_APP123"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
 
 
 def build_copy_paste_slate(df: pd.DataFrame, best_only: bool=False, max_rows: int=0) -> str:
@@ -17689,15 +17774,15 @@ try:
                 _startup_board.to_csv(_qpath,index=False)
                 _active_path=CACHE_FILES.get("projection_board")
                 if _active_path and Path(_active_path).exists(): Path(_active_path).unlink()
-                st.session_state["wnba_app122_refresh_required"]="Incompatible pre-App122 projection cache quarantined. Press Refresh Today before using Best Plays."
+                st.session_state["wnba_app123_refresh_required"]="Incompatible pre-App122 projection cache quarantined. Press Refresh Today before using Best Plays."
             except Exception as _qexc:
-                st.session_state["wnba_app122_refresh_required"]=f"Projection cache incompatible; Refresh required. Quarantine warning: {str(_qexc)[:120]}"
+                st.session_state["wnba_app123_refresh_required"]=f"Projection cache incompatible; Refresh required. Quarantine warning: {str(_qexc)[:120]}"
             _startup_board = pd.DataFrame()
 except Exception as _stable_startup_exc:
     st.session_state["wnba_stable_startup_repair_error"] = str(_stable_startup_exc)[:240]
 
-if st.session_state.get("wnba_app122_refresh_required"):
-    st.warning(st.session_state.get("wnba_app122_refresh_required"))
+if st.session_state.get("wnba_app123_refresh_required"):
+    st.warning(st.session_state.get("wnba_app123_refresh_required"))
 
 tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Moneyline", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports", "HHS / Models"])
 
