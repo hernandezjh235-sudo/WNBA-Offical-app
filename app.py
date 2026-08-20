@@ -13,6 +13,15 @@ Line-source build:
 """
 
 
+# APP 125 MINUTES/ROLE/AST CHANGES
+# - App124 PTS/PRA means remain intact as the baseline winner.
+# - Minutes/Rotation V2 uses recency, starter role, coach/team rotation bands and actual game-log volatility.
+# - Empirical with/without teammate effects are used only with enough current-season samples and are heavily shrunk.
+# - AST V2 blends finite team creation budget, recent assist rate and protected Legacy AST; only stable rows promote.
+# - REB V2 is challenger/audit only; production REB remains protected.
+# - Rank learning uses only prior completed Final-Resolved grades, minimum sample thresholds and a +/-4 point cap.
+# - No hard-coded side preference or previous-game winner is used.
+
 # APP 122 POST-GRADE CHANGES
 # - Readiness uses missing completed games, not calendar rest days.
 # - Valid unranked projections display TRACK/WAIT/BLOCK instead of generic PASS.
@@ -110,7 +119,7 @@ from wnba_hhs.evaluation import (
 from wnba_hhs.schema import DATASET_KEYS
 from wnba_hhs.snapshots import ProjectionSnapshotStore
 
-APP_VERSION = "WNBA v4.7.0 - App124 PTS PRA Rank Stability"
+APP_VERSION = "WNBA v4.8.0 - App125 Minutes Role AST Challenger"
 LINE_PARSER_VERSION = "UD_BASE_CARD_MAINLINE_V5"
 MONEYLINE_FEED_VERSION = "V367_UNDERDOG_GAME_SLATE_ELITE_INJURY_FRESHNESS"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
@@ -11062,7 +11071,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v4.7.0 - App124 PTS PRA Rank Stability"
+APP_VERSION = "WNBA v4.8.0 - App125 Minutes Role AST Challenger"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -12603,7 +12612,7 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v4.7.0 - App124 PTS PRA Rank Stability"
+APP_VERSION = "WNBA v4.8.0 - App125 Minutes Role AST Challenger"
 PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = "LEGACY LOCKED: season-isolated Bayesian baseline + bounded minutes/matchup. PTS V2 is a separate challenger and never overwrites legacy Projection."
 PTS_V2_ENGINE_VERSION = "PTS_V2_TEAM_CONSTRAINED_CHALLENGER_V1"
@@ -13835,7 +13844,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v4.7.0 - App124 PTS PRA Rank Stability"
+APP_VERSION = "WNBA v4.8.0 - App125 Minutes Role AST Challenger"
 PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = (
     "LEGACY LOCKED for A/B testing. Current-season inputs are isolated; prior seasons live only in explicit *_prior fields. "
@@ -16775,6 +16784,265 @@ def _app124_stabilized_target_minutes(row: pd.Series, br: pd.Series, target_minu
     stabilized=float(np.clip(stabilized,6.0,39.0))
     return stabilized,{"raw":row_min,"anchor":anchor,"ratio":stabilized/max(anchor,1e-9),"note":note,"returning":returning}
 
+
+# ============================================================
+# App 125 — Minutes/Rotation V2, empirical with/without effects,
+# AST V2 stable blend, REB V2 challenger, and rank learning.
+# ============================================================
+_APP125_LOG_CACHE = None
+_APP125_WO_CACHE = {}
+_APP125_RANK_CAL_CACHE = None
+_APP125_TEAM_ROTATION_CACHE = {}
+
+
+def _app125_latest_player_logs() -> pd.DataFrame:
+    """Return current-season played player-game rows for empirical role work."""
+    global _APP125_LOG_CACHE
+    if isinstance(_APP125_LOG_CACHE, pd.DataFrame):
+        return _APP125_LOG_CACHE
+    try:
+        d = load_dataset("player_game_logs")
+    except Exception:
+        d = pd.DataFrame()
+    if d is None or d.empty:
+        _APP125_LOG_CACHE = pd.DataFrame(); return _APP125_LOG_CACHE
+    try:
+        d = standardize_player_logs(d)
+    except Exception:
+        d = d.copy()
+    if d is None or d.empty:
+        _APP125_LOG_CACHE = pd.DataFrame(); return _APP125_LOG_CACHE
+    d=d.copy()
+    if "NameKey" not in d.columns: d["NameKey"]=d.get("Player",pd.Series("",index=d.index)).map(normalize_name)
+    d["NameKey"]=d["NameKey"].fillna("").astype(str).map(normalize_name)
+    d["TeamKey"]=d.get("Team",pd.Series("",index=d.index)).map(_team_key_for_matchup)
+    d["GameDate"]=pd.to_datetime(d.get("GameDate"),errors="coerce")
+    if "Season" in d.columns:
+        d["Season"]=pd.to_numeric(d["Season"],errors="coerce")
+        latest=d["Season"].dropna().max()
+        if pd.notna(latest): d=d[d["Season"].eq(latest)].copy()
+    if "Played" in d.columns: d=d[d["Played"].fillna(False).astype(bool)].copy()
+    for c in ["MIN","PTS","REB","AST","FGA","FTA","FG3A"]:
+        if c in d.columns: d[c]=pd.to_numeric(d[c],errors="coerce")
+    # Stable game identity for with/without lookups.
+    if "GameID" in d.columns:
+        gid=d["GameID"].fillna("").astype(str)
+    else: gid=pd.Series("",index=d.index)
+    opp=d.get("Opponent",pd.Series("",index=d.index)).map(_team_key_for_matchup)
+    pair_a=pd.concat([d["TeamKey"],opp],axis=1).min(axis=1); pair_b=pd.concat([d["TeamKey"],opp],axis=1).max(axis=1)
+    fallback=d["GameDate"].dt.strftime("%Y-%m-%d").fillna("")+"|"+pair_a.astype(str)+"|"+pair_b.astype(str)
+    d["_GameKey"]=gid.where(gid.str.len().gt(3)&~gid.str.lower().isin(["nan","none"]),fallback)
+    d=d.sort_values("GameDate").drop_duplicates(["_GameKey","TeamKey","NameKey"],keep="last")
+    _APP125_LOG_CACHE=d.reset_index(drop=True)
+    return _APP125_LOG_CACHE
+
+
+def _app125_team_rotation_profile(team: str) -> Dict[str,float]:
+    """Empirical coach/team rotation bands from the last 10 completed games."""
+    tk=_team_key_for_matchup(team)
+    if tk in _APP125_TEAM_ROTATION_CACHE: return _APP125_TEAM_ROTATION_CACHE[tk]
+    d=_app125_latest_player_logs()
+    neutral={"starter_band":31.0,"bench_band":18.0,"rotation_players":8.0,"tightness":0.5,"games":0}
+    if d.empty or not tk: _APP125_TEAM_ROTATION_CACHE[tk]=neutral; return neutral
+    td=d[d["TeamKey"].eq(tk)].copy()
+    if td.empty: _APP125_TEAM_ROTATION_CACHE[tk]=neutral; return neutral
+    games=td.groupby("_GameKey")["GameDate"].max().sort_values().tail(10).index.tolist()
+    starter_bands=[]; bench_bands=[]; counts=[]
+    for g in games:
+        mins=pd.to_numeric(td[td["_GameKey"].eq(g)]["MIN"],errors="coerce").dropna().sort_values(ascending=False).tolist()
+        mins=[float(x) for x in mins if x>0]
+        if len(mins)<5: continue
+        starter_bands.append(float(np.mean(mins[:5])))
+        if len(mins)>=8: bench_bands.append(float(np.mean(mins[5:8])))
+        elif len(mins)>5: bench_bands.append(float(np.mean(mins[5:])))
+        counts.append(sum(1 for x in mins if x>=12))
+    if not starter_bands: _APP125_TEAM_ROTATION_CACHE[tk]=neutral; return neutral
+    sb=float(np.median(starter_bands)); bb=float(np.median(bench_bands)) if bench_bands else 17.0; rp=float(np.median(counts)) if counts else 8.0
+    # Tight rotations have high starter minutes and fewer 12+ minute players.
+    tight=float(np.clip(.50+.06*(sb-30)-.07*(rp-8),0,1))
+    out={"starter_band":sb,"bench_band":bb,"rotation_players":rp,"tightness":tight,"games":len(starter_bands)}
+    _APP125_TEAM_ROTATION_CACHE[tk]=out; return out
+
+
+def _app125_minutes_v2(br: pd.Series, hint: float=np.nan, return_adj: Optional[Dict[str,Any]]=None, team: str="") -> Tuple[float,Dict[str,Any]]:
+    """Coach/role-aware minute estimate with a distribution and confidence.
+
+    Current-line hint remains important, but L3/L5/L10, season workload,
+    starter rate, lineup share, and empirical game-to-game volatility prevent a
+    single stale rotation assumption from collapsing a healthy regular's role.
+    """
+    return_adj=return_adj or {}
+    vals={k:safe_float(br.get(k),np.nan) for k in ["MIN_l3","MIN_l5","MIN_l10","MIN_l20","MIN_avg"]}
+    hint=safe_float(hint,np.nan)
+    starter=float(np.clip(safe_float(br.get("StarterRate"),0.0),0,1))
+    lineup=float(np.clip(safe_float(br.get("LineupShare"),0.0),0,1))
+    role_conf=float(np.clip(safe_float(br.get("RoleConfidence"),60),20,100))
+    team_prof=_app125_team_rotation_profile(team or br.get("Team"))
+    # Recency-weighted central estimate; median anchor makes it robust to one odd game.
+    seq=[(vals["MIN_l3"],.24),(vals["MIN_l5"],.24),(vals["MIN_l10"],.20),(vals["MIN_l20"],.12),(vals["MIN_avg"],.20)]
+    good=[(v,w) for v,w in seq if pd.notna(v) and 3<=v<=40]
+    if good:
+        center=sum(v*w for v,w in good)/sum(w for _,w in good)
+        med=float(np.median([v for v,_ in good]))
+        center=.70*center+.30*med
+    else: center=hint if pd.notna(hint) else 24.0
+    if pd.notna(hint) and 2<=hint<=40:
+        # Trust a current projection more for stable starters; less for volatile/bench roles.
+        hint_w=.55 if starter>=.60 or role_conf>=72 else .42
+        center=hint_w*hint+(1-hint_w)*center
+    # Coach/team rotation band is a light anchor, never a replacement for player history.
+    if safe_float(team_prof.get("games"),0)>=4:
+        if starter>=.65: center=.90*center+.10*safe_float(team_prof.get("starter_band"),center)
+        elif starter<=.30: center=.92*center+.08*safe_float(team_prof.get("bench_band"),center)
+    # Pull true starters away from implausibly low minutes absent a return scenario.
+    if not return_adj and starter>=.65 and vals["MIN_l10"]>=25:
+        center=max(center,.82*vals["MIN_l10"])
+    if not return_adj and lineup>=.60 and vals["MIN_l5"]>=24:
+        center=max(center,.80*vals["MIN_l5"])
+    logs=_app125_latest_player_logs(); nk=normalize_name(br.get("NameKey") or br.get("Player")); tk=_team_key_for_matchup(team or br.get("Team"))
+    hist=pd.DataFrame()
+    if not logs.empty and nk:
+        hist=logs[logs["NameKey"].eq(nk)].sort_values("GameDate").tail(10)
+    if not hist.empty and "MIN" in hist.columns:
+        mins=pd.to_numeric(hist["MIN"],errors="coerce").dropna()
+        sd=float(mins.std(ddof=0)) if len(mins)>=3 else 5.0
+        p25=float(mins.quantile(.25)) if len(mins)>=3 else max(0,center-5)
+        p75=float(mins.quantile(.75)) if len(mins)>=3 else min(40,center+5)
+    else:
+        sd=max(3.5,safe_float(br.get("MIN_Std10"),5.0)); p25=max(0,center-1.0*sd); p75=min(40,center+1.0*sd)
+    returning=bool(return_adj)
+    gate=str(return_adj.get("gate","CLEAR") or "CLEAR").upper()
+    if returning:
+        mult=float(np.clip(safe_float(return_adj.get("expected_min_mult"),1.0),.55,1.0))
+        expected=center*mult
+        # Current hint can already contain restriction; blend rather than double multiply.
+        if pd.notna(hint): expected=.58*hint+.42*expected
+        center=expected
+        sd=max(sd,5.5 if gate=="WAIT" else 4.5)
+    center=float(np.clip(center,4.0,39.0))
+    p25=float(np.clip(min(p25,center-.20*sd),0,39)); p75=float(np.clip(max(p75,center+.20*sd),4,40))
+    span=max(1.0,p75-p25)
+    conf=100 - 5.0*sd - 1.5*span + 18*starter + 8*lineup + .18*(role_conf-50) + 5*safe_float(team_prof.get("tightness"),.5)
+    if returning: conf-=12 if gate=="WAIT" else 7
+    conf=float(np.clip(conf,25,94))
+    return center,{"p25":p25,"p75":p75,"sd":sd,"confidence":conf,"starter":starter,"lineup":lineup,"history_n":len(hist),"returning":returning,"team_starter_band":safe_float(team_prof.get("starter_band"),np.nan),"team_bench_band":safe_float(team_prof.get("bench_band"),np.nan),"team_rotation_players":safe_float(team_prof.get("rotation_players"),np.nan),"team_rotation_tightness":safe_float(team_prof.get("tightness"),np.nan)}
+
+
+def _app125_with_without_effect(target_key: str, team: str, absent_keys: set) -> Dict[str,Any]:
+    """Empirical current-season target-player effect when listed teammates sit.
+
+    Uses game-level appearance data already in the cache. Small samples are
+    aggressively shrunk to 1.00 so this can never become a one-game hot-hand hack.
+    """
+    absent=tuple(sorted(k for k in set(absent_keys or set()) if k and k!=target_key))
+    ck=(target_key,team,absent)
+    if ck in _APP125_WO_CACHE: return _APP125_WO_CACHE[ck]
+    neutral={"minutes_mult":1.0,"fga_mult":1.0,"fta_mult":1.0,"ast_mult":1.0,"reb_mult":1.0,"samples_without":0,"samples_with":0,"confidence":0.0,"note":"no empirical absence sample"}
+    if not absent: _APP125_WO_CACHE[ck]=neutral; return neutral
+    d=_app125_latest_player_logs()
+    if d.empty: _APP125_WO_CACHE[ck]=neutral; return neutral
+    td=d[(d["TeamKey"].eq(team))&(d["NameKey"].eq(target_key))].copy()
+    if td.empty: _APP125_WO_CACHE[ck]=neutral; return neutral
+    teamgames=d[d["TeamKey"].eq(team)][["_GameKey","NameKey"]].drop_duplicates()
+    appear=teamgames.groupby("_GameKey")["NameKey"].agg(set).to_dict()
+    td["_AbsentCount"]=[sum(1 for k in absent if k not in appear.get(g,set())) for g in td["_GameKey"]]
+    wo=td[td["_AbsentCount"].gt(0)].tail(12); wi=td[td["_AbsentCount"].eq(0)].tail(18)
+    if len(wo)<2 or len(wi)<3: _APP125_WO_CACHE[ck]=neutral; return neutral
+    def rate(frame,col):
+        vals=pd.to_numeric(frame.get(col),errors="coerce")
+        if col=="MIN": return float(vals.mean())
+        mins=pd.to_numeric(frame.get("MIN"),errors="coerce").clip(lower=1)
+        return float((vals/mins).mean())
+    mults={}
+    for col,name,lo,hi in [("MIN","minutes_mult",.82,1.20),("FGA","fga_mult",.84,1.22),("FTA","fta_mult",.82,1.28),("AST","ast_mult",.82,1.28),("REB","reb_mult",.86,1.20)]:
+        a=rate(wo,col); b=rate(wi,col)
+        raw=a/max(b,1e-6) if pd.notna(a) and pd.notna(b) else 1.0
+        # Shrink hard toward neutral. 2 without games has only ~22% weight.
+        rel=min(.62, len(wo)/(len(wo)+7.0))*min(1.0,len(wi)/8.0)
+        mults[name]=float(np.clip(1.0+rel*(raw-1.0),lo,hi))
+    conf=float(np.clip(100*min(.70,len(wo)/8)*min(1.0,len(wi)/10),0,70))
+    out={**mults,"samples_without":len(wo),"samples_with":len(wi),"confidence":conf,"note":f"with/without {len(wo)} absent vs {len(wi)} present games; shrunk"}
+    _APP125_WO_CACHE[ck]=out; return out
+
+
+def _app125_ast_v2(row: pd.Series, br: pd.Series, target: pd.Series, protected_ast: float) -> Tuple[float,Dict[str,Any]]:
+    """Creation-budget AST challenger with conservative stable promotion."""
+    team_budget=safe_float(target.get("proj_ast"),np.nan)
+    mins=max(1.0,safe_float(target.get("proj_min"),safe_float(row.get("MIN Proj"),24)))
+    recent=[]
+    for c,mcol in [("AST_l3","MIN_l3"),("AST_l5","MIN_l5"),("AST_l10","MIN_l10"),("AST_avg","MIN_avg")]:
+        a=safe_float(br.get(c),np.nan); m=safe_float(br.get(mcol),np.nan)
+        if pd.notna(a) and pd.notna(m) and m>0: recent.append(a/m*mins)
+    hist=float(np.median(recent)) if recent else safe_float(protected_ast,np.nan)
+    astp=safe_float(br.get("AST%"),safe_float(br.get("AST%Proxy"),np.nan))
+    if pd.notna(astp) and 0 <= astp <= 1.5: astp *= 100.0
+    creation=safe_float(target.get("Creation Role Score"),50)
+    # AST% is used as a modest role modifier, never as a direct assist conversion.
+    astp_mult=float(np.clip(0.90+(astp/25.0)*.10,0.88,1.12)) if pd.notna(astp) else 1.0
+    role_anchor=hist*astp_mult*(0.90+0.20*creation/100.0) if pd.notna(hist) else np.nan
+    vals=[v for v in [team_budget,hist,role_anchor,protected_ast] if pd.notna(v)]
+    if not vals: return np.nan,{"stable":False,"spread":np.nan,"confidence":0,"note":"AST V2 unavailable"}
+    if pd.notna(team_budget) and pd.notna(hist) and pd.notna(protected_ast):
+        proj=.45*team_budget+.30*hist+.25*protected_ast
+    else: proj=float(np.mean(vals))
+    spread=float(max(vals)-min(vals)) if len(vals)>=2 else 0.0
+    if spread>=2.5: proj=.65*proj+.35*float(np.median(vals))
+    min_conf=safe_float(target.get("Minutes V2 Confidence"),60); role_sec=safe_float(target.get("Role Security"),55)
+    stable=spread<=1.75 and min_conf>=62 and role_sec>=58 and not bool(target.get("Questionable Role",False)) and not bool(target.get("Return Scenario",False))
+    conf=float(np.clip(72-12*max(0,spread-1.0)+.15*(min_conf-60)+.12*(role_sec-55),35,88))
+    return float(np.clip(proj,0,15)),{"stable":stable,"spread":spread,"confidence":conf,"team_budget":team_budget,"hist":hist,"protected":protected_ast,"note":"creation budget + recent rate + protected anchor"}
+
+
+def _app125_reb_v2_challenger(br: pd.Series, target: pd.Series, protected_reb: float) -> Tuple[float,Dict[str,Any]]:
+    """Rebound challenger only. Production REB stays protected until proven."""
+    budget=safe_float(target.get("proj_reb"),np.nan); mins=max(1.0,safe_float(target.get("proj_min"),24))
+    recent=[]
+    for c,mcol in [("REB_l3","MIN_l3"),("REB_l5","MIN_l5"),("REB_l10","MIN_l10"),("REB_avg","MIN_avg")]:
+        a=safe_float(br.get(c),np.nan); m=safe_float(br.get(mcol),np.nan)
+        if pd.notna(a) and pd.notna(m) and m>0: recent.append(a/m*mins)
+    hist=float(np.median(recent)) if recent else safe_float(protected_reb,np.nan)
+    vals=[v for v in [budget,hist,protected_reb] if pd.notna(v)]
+    if not vals: return np.nan,{"spread":np.nan,"stable":False}
+    proj=.45*budget+.25*hist+.30*protected_reb if all(pd.notna(v) for v in [budget,hist,protected_reb]) else float(np.mean(vals))
+    spread=float(max(vals)-min(vals)) if len(vals)>=2 else 0.0
+    stable=spread<=1.6 and safe_float(target.get("Minutes V2 Confidence"),0)>=64
+    return float(np.clip(proj,0,20)),{"spread":spread,"stable":stable,"budget":budget,"hist":hist}
+
+
+def _app125_rank_learning_adjustment(row: pd.Series) -> Tuple[float,str,int]:
+    """Small leakage-safe adjustment from prior completed Final-Resolved grades.
+
+    Requires at least 12 historical samples in a comparable market/rank bucket;
+    caps the adjustment at +/-4. No prior sample means no adjustment.
+    """
+    global _APP125_RANK_CAL_CACHE
+    if _APP125_RANK_CAL_CACHE is None:
+        try: log=load_json(OFFICIAL_LOG,[])
+        except Exception: log=[]
+        recs=[]
+        for x in (log if isinstance(log,list) else []):
+            res=str(x.get("Result","")).upper()
+            auth=str(x.get("Saved Projection Authority",x.get("Projection Authority",""))).upper()
+            if res not in {"WIN","LOSS","W","L"} or "FINAL" not in auth: continue
+            rank=safe_float(x.get("Saved Elite Rank",x.get("Elite Rank")),np.nan)
+            if pd.isna(rank): continue
+            recs.append({"market":str(x.get("Market","")).upper(),"rank":rank,"win":1 if res in {"WIN","W"} else 0})
+        _APP125_RANK_CAL_CACHE=pd.DataFrame(recs)
+    d=_APP125_RANK_CAL_CACHE
+    if d is None or d.empty: return 0.0,"no prior rank learning",0
+    rank=safe_float(row.get("Elite Rank"),np.nan); market=str(row.get("Market","")).upper()
+    # Use intended bucket from score order when rank not yet assigned: broader market only.
+    sub=d[d["market"].eq(market)] if market else d
+    if pd.notna(rank):
+        lo,hi=(1,10) if rank<=10 else (11,25) if rank<=25 else (26,50) if rank<=50 else (51,100) if rank<=100 else (101,200)
+        sub=sub[(sub["rank"]>=lo)&(sub["rank"]<=hi)]
+    n=len(sub)
+    if n<12: return 0.0,f"rank learning waiting ({n}/12)",n
+    wr=float(sub["win"].mean())
+    # Bayesian shrink to 50% before converting to a small score adjustment.
+    shr=(sub["win"].sum()+8)/(n+16)
+    adj=float(np.clip((shr-.50)*22.0,-4.0,4.0))
+    return adj,f"prior final-authority market/rank bucket {n} samples, {wr*100:.1f}% raw",n
 def _elite_role_rotation(
     base: pd.DataFrame, team: str, target_key: str, target_minutes: float,
     env: Dict[str, Any], excluded_keys: set, questionable_keys: Optional[set] = None,
@@ -16819,22 +17087,38 @@ def _elite_role_rotation(
         season_min = safe_float(br.get("MIN_avg"), mins)
         recent_rate = (recent_fga/max(recent_min,1e-9))/(season_fga/max(season_min,1e-9)) if pd.notna(recent_fga) and pd.notna(recent_min) and pd.notna(season_fga) and season_fga > 0 else 1.0
         adj = return_adjustments.get(key, {})
-        min_mult = float(np.clip(safe_float(adj.get("expected_min_mult"), 1.0), 0.55, 1.0))
         usage_mult = float(np.clip(safe_float(adj.get("usage_mult"), 1.0), 0.65, 1.0))
-        adj_mins = mins * min_mult
+        minute_hint = target_minutes if key == target_key else np.nan
+        adj_mins, min_meta_v2 = _app125_minutes_v2(br, minute_hint, adj, team)
+        base_min_for_scale=max(1e-6,mins)
+        min_mult=float(np.clip(adj_mins/base_min_for_scale,0.45,1.45))
+        wo=_app125_with_without_effect(key,team,excluded_keys)
+        adj_mins*=float(np.clip(safe_float(wo.get("minutes_mult"),1.0),.90,1.12))
+        min_mult=float(np.clip(adj_mins/base_min_for_scale,0.45,1.45))
         records.append({
             "NameKey": key, "Player": br.get("Player"), "mins_base": adj_mins,
-            "raw_fga": max(0.0, fga) * min_mult * usage_mult,
-            "raw_fta": max(0.0, 0.0 if pd.isna(fta) else fta) * min_mult * usage_mult,
-            "raw_reb": max(0.0, 0.0 if pd.isna(reb) else reb) * min_mult,
-            "raw_ast": max(0.0, 0.0 if pd.isna(ast) else ast) * min_mult * usage_mult,
-            "raw_oreb": max(0.0, 0.0 if pd.isna(oreb_pg) else oreb_pg) * min_mult,
-            "raw_dreb": max(0.0, 0.0 if pd.isna(dreb_pg) else dreb_pg) * min_mult,
+            "raw_fga": max(0.0, fga) * min_mult * usage_mult * safe_float(wo.get("fga_mult"),1.0),
+            "raw_fta": max(0.0, 0.0 if pd.isna(fta) else fta) * min_mult * usage_mult * safe_float(wo.get("fta_mult"),1.0),
+            "raw_reb": max(0.0, 0.0 if pd.isna(reb) else reb) * min_mult * safe_float(wo.get("reb_mult"),1.0),
+            "raw_ast": max(0.0, 0.0 if pd.isna(ast) else ast) * min_mult * usage_mult * safe_float(wo.get("ast_mult"),1.0),
+            "raw_oreb": max(0.0, 0.0 if pd.isna(oreb_pg) else oreb_pg) * min_mult * safe_float(wo.get("reb_mult"),1.0),
+            "raw_dreb": max(0.0, 0.0 if pd.isna(dreb_pg) else dreb_pg) * min_mult * safe_float(wo.get("reb_mult"),1.0),
             "usg": usg, "trb": trb, "astp": astp, "starter_rate": starter_map.get(key, 0.0),
             "recent_role_factor": float(np.clip(recent_rate, 0.82, 1.18)),
             "position_group": str(br.get("PositionGroup", "Unknown") or "Unknown"), "_br": br,
-            "Return Scenario": bool(adj), "Return Expected Minutes Multiplier": min_mult,
+            "Return Scenario": bool(adj), "Return Expected Minutes Multiplier": safe_float(adj.get("expected_min_mult"),1.0),
             "Return Usage Multiplier": usage_mult,
+            "Minutes V2 Confidence": safe_float(min_meta_v2.get("confidence"),60),
+            "Minutes V2 P25": safe_float(min_meta_v2.get("p25"),np.nan),
+            "Minutes V2 P75": safe_float(min_meta_v2.get("p75"),np.nan),
+            "Minutes V2 SD": safe_float(min_meta_v2.get("sd"),np.nan),
+            "Team Rotation Starter Band": safe_float(min_meta_v2.get("team_starter_band"),np.nan),
+            "Team Rotation Bench Band": safe_float(min_meta_v2.get("team_bench_band"),np.nan),
+            "Team Rotation Players": safe_float(min_meta_v2.get("team_rotation_players"),np.nan),
+            "Team Rotation Tightness": safe_float(min_meta_v2.get("team_rotation_tightness"),np.nan),
+            "With/Without Confidence": safe_float(wo.get("confidence"),0),
+            "With/Without Samples": int(safe_float(wo.get("samples_without"),0)),
+            "With/Without Note": str(wo.get("note","") or ""),
         })
     rot = pd.DataFrame(records)
     if rot.empty:
@@ -16845,7 +17129,8 @@ def _elite_role_rotation(
         top = pd.concat([top.head(10), rot[rot["NameKey"].eq(target_key)].head(1)], ignore_index=True)
     target_adj = return_adjustments.get(target_key, {})
     target_br = top.loc[top["NameKey"].eq(target_key), "_br"].iloc[0] if target_key in set(top["NameKey"]) else pd.Series(dtype=object)
-    target_minutes_eff, target_min_meta = _app124_stabilized_target_minutes(pd.Series(dtype=object), target_br, target_minutes, target_adj)
+    target_minutes_eff = safe_float(top.loc[top["NameKey"].eq(target_key),"mins_base"].iloc[0], target_minutes) if target_key in set(top["NameKey"]) else target_minutes
+    target_min_meta = {"note":"App125 Minutes/Rotation V2","confidence":safe_float(top.loc[top["NameKey"].eq(target_key),"Minutes V2 Confidence"].iloc[0],60) if target_key in set(top["NameKey"]) else 50}
     rot = _elite_normalize_minutes(top.drop_duplicates("NameKey"), target_key, target_minutes_eff)
     scale = rot["proj_min"] / rot["mins_base"].clip(lower=1e-6)
     for c in ["raw_fga", "raw_fta", "raw_reb", "raw_ast", "raw_oreb", "raw_dreb"]:
@@ -16891,7 +17176,8 @@ def _elite_role_rotation(
     rot["Scoring Role"] = [_hier_role(r, s, "SCORING") for r, s in zip(rot["Scoring Hierarchy Rank"], rot["Scoring Role Score"])]
     rot["Rebound Role"] = [_hier_role(r, s, "REBOUND") for r, s in zip(rot["Rebound Hierarchy Rank"], rot["Rebound Role Score"])]
     rot["Creation Role"] = [_hier_role(r, s, "CREATION") for r, s in zip(rot["Creation Hierarchy Rank"], rot["Creation Role Score"])]
-    rot["Role Security"] = (0.42*min_pct + 0.30*starter_score + 0.18*(100-(recent_score-50).abs()*1.25).clip(0,100) + 0.10*usg_pct).clip(0,100)
+    min_v2_conf=pd.to_numeric(rot.get("Minutes V2 Confidence"),errors="coerce").fillna(60).clip(20,100)
+    rot["Role Security"] = (0.36*min_pct + 0.27*starter_score + 0.15*(100-(recent_score-50).abs()*1.25).clip(0,100) + 0.10*usg_pct + 0.12*min_v2_conf).clip(0,100)
     rot["Questionable Role"] = rot["NameKey"].isin(questionable_keys)
     rot.loc[rot["Questionable Role"], "Role Security"] *= 0.72
     if "Return Scenario" in rot.columns:
@@ -17078,7 +17364,11 @@ def _elite_player_model(
     legacy_ast=safe_float(row.get("Legacy Projection",row.get("Projection")),np.nan) if str(row.get("Market",""))=="AST" else protected_ast
     elite_reb,reb_agree=_elite_blend_component(legacy_reb,safe_float(target.get("proj_reb"),np.nan),"REB")
     elite_ast,ast_agree=_elite_blend_component(legacy_ast,safe_float(target.get("proj_ast"),np.nan),"AST")
-    sims=_elite_sim_arrays(row,target,elite_reb,elite_ast)
+    ast_v2,ast_v2_meta=_app125_ast_v2(row,br,target,legacy_ast)
+    reb_v2,reb_v2_meta=_app125_reb_v2_challenger(br,target,legacy_reb)
+    # AST V2 is promoted only when the independent creation families agree.
+    production_ast=ast_v2 if bool(ast_v2_meta.get("stable",False)) and pd.notna(ast_v2) else legacy_ast
+    sims=_elite_sim_arrays(row,target,elite_reb,production_ast)
     flags=[]
     if not env.get("data_ok"): flags.append("FALLBACK_TEAM_DATA")
     if meta.get("reconciliation_clipped"): flags.append("TEAM_TOTAL_RECONCILIATION_CLIPPED")
@@ -17089,6 +17379,9 @@ def _elite_player_model(
     if spread>=4.5: flags.append("PTS_MODEL_DISAGREEMENT")
     if compression_guard: flags.append("MINUTES_COMPRESSION_GUARD")
     if compression<.78: flags.append("LOW_PROJECTED_MINUTES_VS_BASELINE")
+    minv2_conf=safe_float(target.get("Minutes V2 Confidence"),60); minv2_span=safe_float(target.get("Minutes V2 P75"),np.nan)-safe_float(target.get("Minutes V2 P25"),np.nan)
+    if minv2_conf<55 or (pd.notna(minv2_span) and minv2_span>12): flags.append("MINUTES_V2_HIGH_UNCERTAINTY")
+    if safe_float(target.get("With/Without Confidence"),0)>=35 and safe_float(target.get("With/Without Samples"),0)>=3: flags.append("EMPIRICAL_WITH_WITHOUT_ROLE")
     if safe_float(target.get("proj_pts"),0)>0 and safe_float(env.get("team_score"),0)>0 and safe_float(target.get("proj_pts"),0)/max(safe_float(env.get("team_score"),1),1e-9)>.34: flags.append("HIGH_TEAM_SCORING_SHARE")
     ppfga=safe_float(target.get("proj_pts"),0)/max(safe_float(target.get("proj_fga"),0)+.44*safe_float(target.get("proj_fta"),0),1e-9)
     if ppfga>1.48: flags.append("HIGH_EFFICIENCY_DEPENDENCE")
@@ -17096,6 +17389,8 @@ def _elite_player_model(
     return {
         "ok":True,"target":target,"rotation":rot,"env":env,"rot_meta":meta,
         "elite_reb":elite_reb,"elite_ast":elite_ast,"protected_reb":protected_reb,"protected_ast":protected_ast,
+        "ast_v2":ast_v2,"ast_v2_meta":ast_v2_meta,"production_ast":production_ast,
+        "reb_v2":reb_v2,"reb_v2_meta":reb_v2_meta,
         "reb_agree":reb_agree,"ast_agree":ast_agree,"sim":sims,"flags":flags,
         "pts_budget":budget_pts,"pts_opportunity_anchor":opp_pts,"pts_baseline_anchor":base_pts,
         "pts_model_spread":spread,"pts_stability":stability,"minutes_compression_ratio":compression,
@@ -17167,6 +17462,22 @@ def _attach_elite_role_budget_engine(board: pd.DataFrame, base: pd.DataFrame, mo
             "Elite Projected PTS":round(pts,2),"Elite Projected REB":round(reb,2),"Elite Projected AST":round(ast,2),"Elite Projected PRA":round(pts+pra_reb+pra_ast,2),
             "Elite PRA Protected REB Component":round(pra_reb,2) if pd.notna(pra_reb) else np.nan,"Elite PRA Protected AST Component":round(pra_ast,2) if pd.notna(pra_ast) else np.nan,
             "Elite PTS Budget Projection":round(safe_float(model.get("pts_budget"),np.nan),2),"Elite PTS Opportunity Anchor":round(safe_float(model.get("pts_opportunity_anchor"),np.nan),2),"Elite PTS Baseline Anchor":round(safe_float(model.get("pts_baseline_anchor"),np.nan),2),"Elite PTS Model Spread":round(safe_float(model.get("pts_model_spread"),np.nan),2),"Elite PTS Stability Score":round(safe_float(model.get("pts_stability"),np.nan),1),"Elite Minutes Compression Ratio":round(safe_float(model.get("minutes_compression_ratio"),np.nan),3),
+            "Elite Minutes V2 Confidence":round(safe_float(t.get("Minutes V2 Confidence"),np.nan),1) if pd.notna(safe_float(t.get("Minutes V2 Confidence"),np.nan)) else np.nan,
+            "Elite Minutes V2 P25":round(safe_float(t.get("Minutes V2 P25"),np.nan),2) if pd.notna(safe_float(t.get("Minutes V2 P25"),np.nan)) else np.nan,
+            "Elite Minutes V2 P75":round(safe_float(t.get("Minutes V2 P75"),np.nan),2) if pd.notna(safe_float(t.get("Minutes V2 P75"),np.nan)) else np.nan,
+            "Elite Team Rotation Starter Band":round(safe_float(t.get("Team Rotation Starter Band"),np.nan),2) if pd.notna(safe_float(t.get("Team Rotation Starter Band"),np.nan)) else np.nan,
+            "Elite Team Rotation Bench Band":round(safe_float(t.get("Team Rotation Bench Band"),np.nan),2) if pd.notna(safe_float(t.get("Team Rotation Bench Band"),np.nan)) else np.nan,
+            "Elite Team Rotation Tightness":round(safe_float(t.get("Team Rotation Tightness"),np.nan),3) if pd.notna(safe_float(t.get("Team Rotation Tightness"),np.nan)) else np.nan,
+            "Elite With Without Confidence":round(safe_float(t.get("With/Without Confidence"),0),1),
+            "Elite With Without Samples":int(safe_float(t.get("With/Without Samples"),0)),
+            "Elite With Without Note":str(t.get("With/Without Note","") or ""),
+            "Elite AST V2 Projection":round(safe_float(model.get("ast_v2"),np.nan),3) if pd.notna(safe_float(model.get("ast_v2"),np.nan)) else np.nan,
+            "Elite AST V2 Stable":bool(model.get("ast_v2_meta",{}).get("stable",False)),
+            "Elite AST V2 Spread":round(safe_float(model.get("ast_v2_meta",{}).get("spread"),np.nan),3) if pd.notna(safe_float(model.get("ast_v2_meta",{}).get("spread"),np.nan)) else np.nan,
+            "Elite AST V2 Confidence":round(safe_float(model.get("ast_v2_meta",{}).get("confidence"),np.nan),1) if pd.notna(safe_float(model.get("ast_v2_meta",{}).get("confidence"),np.nan)) else np.nan,
+            "Elite REB V2 Challenger":round(safe_float(model.get("reb_v2"),np.nan),3) if pd.notna(safe_float(model.get("reb_v2"),np.nan)) else np.nan,
+            "Elite REB V2 Stable":bool(model.get("reb_v2_meta",{}).get("stable",False)),
+            "Elite REB V2 Spread":round(safe_float(model.get("reb_v2_meta",{}).get("spread"),np.nan),3) if pd.notna(safe_float(model.get("reb_v2_meta",{}).get("spread"),np.nan)) else np.nan,
             "Elite Projected FGA":round(safe_float(t.get("proj_fga"),np.nan),2),"Elite Projected FTA":round(safe_float(t.get("proj_fta"),np.nan),2),"Elite Projected 3PA":round(safe_float(t.get("proj_fga"),0)*safe_float(t.get("three_rate"),0),2),
             "Elite Expected Team Points":round(env["team_score"],1),"Elite Expected Opp Points":round(env["opp_score"],1),"Elite Expected Game Total":round(env["game_total"],1),"Elite Expected Pace":round(env["pace"],1),"Elite FGA Budget":round(env["fga_budget"],1),"Elite FTA Budget":round(env["fta_budget"],1),"Elite AST Budget":round(env["ast_budget"],1),"Elite OREB Pool":round(env["oreb_pool"],1),"Elite DREB Pool":round(env["dreb_pool"],1),
             "Elite Score Core":env.get("score_core"),"Elite Score Season Anchor":env.get("score_season_anchor"),"Elite Score Recent Anchor":env.get("score_recent_anchor"),"Elite Score Estimate Range":env.get("score_component_range"),
@@ -17182,7 +17493,7 @@ def _attach_elite_role_budget_engine(board: pd.DataFrame, base: pd.DataFrame, mo
         rows.append(row)
     result=pd.DataFrame(rows)
     if "Legacy Projection" in result.columns and "Projection" in result.columns and not np.allclose(pd.to_numeric(result["Projection"],errors="coerce"),pd.to_numeric(result["Legacy Projection"],errors="coerce"),equal_nan=True):
-        raise RuntimeError("App124 elite challenger changed locked legacy Projection before final resolver")
+        raise RuntimeError("App125 elite challenger changed locked legacy Projection before final resolver")
     return result
 
 
@@ -17234,7 +17545,7 @@ def _app120_elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
     for _,rr in board.iterrows():
         row=rr.copy(); market=str(row.get("Market","")).upper(); side=str(row.get("Elite Side","")).upper(); edge=abs(safe_float(row.get("Elite Edge"),np.nan)); raw=safe_float(row.get("Elite Over %"),np.nan) if side=="OVER" else safe_float(row.get("Elite Under %"),np.nan) if side=="UNDER" else max(safe_float(row.get("Elite Over %"),0),safe_float(row.get("Elite Under %"),0))
         cal_prob,prob_note=_elite_calibrated_probability(row,raw); prob_score=float(np.clip((cal_prob-50.0)/16.0*100.0,0,100)) if pd.notna(cal_prob) else 0.0; agreement,agree_note=_elite_agreement_score(row,side if side in {"OVER","UNDER"} else str(row.get("Elite Mean Side","")).upper())
-        quality=str(row.get("Elite Data Quality","LOW")).upper(); data_score={"HIGH":96,"MEDIUM":78,"LOW":52}.get(quality,60); min_conf=float(np.clip(safe_float(row.get("Minutes Confidence"),safe_float(row.get("Final Projection Confidence"),65)),35,100)); role_security=float(np.clip(safe_float(row.get("Elite Role Security"),55),20,100)); scoring=float(np.clip(safe_float(row.get("Elite Scoring Role Score"),50),0,100)); reb=float(np.clip(safe_float(row.get("Elite Rebound Role Score"),50),0,100)); creation=float(np.clip(safe_float(row.get("Elite Creation Role Score"),50),0,100))
+        quality=str(row.get("Elite Data Quality","LOW")).upper(); data_score={"HIGH":96,"MEDIUM":78,"LOW":52}.get(quality,60); min_conf=float(np.clip(safe_float(row.get("Elite Minutes V2 Confidence"),safe_float(row.get("Minutes Confidence"),safe_float(row.get("Final Projection Confidence"),65))),35,100)); role_security=float(np.clip(safe_float(row.get("Elite Role Security"),55),20,100)); scoring=float(np.clip(safe_float(row.get("Elite Scoring Role Score"),50),0,100)); reb=float(np.clip(safe_float(row.get("Elite Rebound Role Score"),50),0,100)); creation=float(np.clip(safe_float(row.get("Elite Creation Role Score"),50),0,100))
         role_fit=scoring if market=="PTS" else reb if market=="REB" else creation if market=="AST" else 0.42*scoring+0.30*reb+0.28*creation if market=="PRA" else role_security
         floor=floors.get(market,.5)
         if pd.isna(edge) or edge<=0: edge_score=0.
@@ -17346,14 +17657,14 @@ def render_elite_rank_card(row: pd.Series) -> None:
 # ============================================================
 # App 122 — POST-GRADE FINAL AUTHORITY / LIVE CONTEXT / RETURN-ROLE SCENARIOS
 # ============================================================
-APP_VERSION = "WNBA v4.7.0 - App124 PTS PRA Rank Stability"
+APP_VERSION = "WNBA v4.8.0 - App125 Minutes Role AST Challenger"
 LEGACY_PROJECTION_ENGINE_VERSION = PROJECTION_ENGINE_VERSION
-PROJECTION_ENGINE_VERSION = "APP124_PTS_PRA_RANK_STABILITY"
-PROJECTION_ENGINE_NOTE = "App124 authority: robust three-family PTS mean + stabilized minutes; REB Legacy protected; AST Legacy protected; PRA = stabilized Elite PTS + direct protected REB/AST; rank stability and side-neutral promotion."
-ELITE_ENGINE_VERSION = "ELITE_ROLE_BUDGET_V6_APP124"
-FINAL_RESOLVER_VERSION = "FINAL_RESOLVER_V3_APP124"
-INJURY_SCENARIO_VERSION = "CANONICAL_RETURN_ROLE_SCENARIO_V3_APP124"
-LIVE_TEAM_CONTEXT_VERSION = "LIVE_TEAM_CONTEXT_FROM_PLAYER_LOGS_V3_APP124"
+PROJECTION_ENGINE_VERSION = "APP125_MINUTES_ROLE_AST_CHALLENGER"
+PROJECTION_ENGINE_NOTE = "App125 authority: App124 PTS/PRA preserved; Minutes/Rotation V2 + empirical with/without role effects; AST V2 stable-blend production; REB V2 challenger only; rank learning from prior final-authority grades."
+ELITE_ENGINE_VERSION = "ELITE_ROLE_BUDGET_V7_APP125"
+FINAL_RESOLVER_VERSION = "FINAL_RESOLVER_V4_APP125"
+INJURY_SCENARIO_VERSION = "CANONICAL_RETURN_ROLE_SCENARIO_V4_APP125"
+LIVE_TEAM_CONTEXT_VERSION = "LIVE_TEAM_CONTEXT_FROM_PLAYER_LOGS_V4_APP125"
 
 
 def _app121_team_game_table_from_logs(logs: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -17646,7 +17957,7 @@ def _attach_final_resolved_projection(board: pd.DataFrame) -> pd.DataFrame:
     if "Legacy Under %" not in out.columns: out["Legacy Under %"]=pd.to_numeric(out.get("Under %"),errors="coerce")
     rows=[]
     for _,rr in out.iterrows():
-        r=rr.copy(); market=str(r.get("Market","")).upper(); line=safe_float(r.get("Line"),np.nan); legacy=safe_float(r.get("Legacy Projection"),safe_float(r.get("Projection"),np.nan)); elite_market=safe_float(r.get("Elite Projection"),np.nan); elite_pts=safe_float(r.get("Elite Projected PTS"),np.nan); source="LEGACY_PROTECTED"
+        r=rr.copy(); market=str(r.get("Market","")).upper(); line=safe_float(r.get("Line"),np.nan); legacy=safe_float(r.get("Legacy Projection"),safe_float(r.get("Projection"),np.nan)); elite_market=safe_float(r.get("Elite Projection"),np.nan); elite_pts=safe_float(r.get("Elite Projected PTS"),np.nan); source="LEGACY_PROTECTED"; ast_v2_promoted=False
         returning=bool(r.get("Return From Injury Flag",False)); gate=str(r.get("Injury Recommendation Gate","CLEAR")).upper(); min_mult=float(np.clip(safe_float(r.get("Return Expected Minutes Multiplier"),safe_float(r.get("Injury Scenario Minutes Multiplier"),1.)),0.,1.)); elite_return_applied=bool(r.get("Elite Return Scenario Applied",False))
         base_pts=safe_float(r.get("PRA Component PTS"),safe_float(r.get("PTS Component Opportunity"),np.nan))
         if market=="PTS" and pd.notna(elite_market):
@@ -17655,7 +17966,11 @@ def _attach_final_resolved_projection(board: pd.DataFrame) -> pd.DataFrame:
         elif market=="REB":
             proj=legacy*min_mult if returning and pd.notna(legacy) else legacy; source="REB_LEGACY_PROTECTED"+("+RETURN_MINUTES_SCENARIO" if returning else "")
         elif market=="AST":
-            proj=legacy*min_mult if returning and pd.notna(legacy) else legacy; source="AST_LEGACY_PROTECTED_PENDING_V2"+("+RETURN_MINUTES_SCENARIO" if returning else "")
+            ast_v2=safe_float(r.get("Elite AST V2 Projection"),np.nan); ast_stable=bool(r.get("Elite AST V2 Stable",False)); ast_conf=safe_float(r.get("Elite AST V2 Confidence"),0)
+            if ast_stable and ast_conf>=60 and pd.notna(ast_v2) and not returning:
+                proj=ast_v2; source="AST_APP125_CREATION_BUDGET_STABLE_BLEND"; ast_v2_promoted=True
+            else:
+                proj=legacy*min_mult if returning and pd.notna(legacy) else legacy; source="AST_LEGACY_PROTECTED_WITH_V2_CHALLENGER"+("+RETURN_MINUTES_SCENARIO" if returning else "")
         elif market=="PRA" and pd.notna(elite_pts):
             pra_reb=safe_float(r.get("Elite PRA Protected REB Component"),np.nan); pra_ast=safe_float(r.get("Elite PRA Protected AST Component"),np.nan)
             if pd.notna(pra_reb) and pd.notna(pra_ast):
@@ -17685,7 +18000,9 @@ def _attach_final_resolved_projection(board: pd.DataFrame) -> pd.DataFrame:
                 if returning and elite_return_applied and pd.notna(line): over,under=_app121_side_prob_from_normal(line,proj,safe_float(r.get("Elite SD"),4.5),"OVER")
         else:
             over=safe_float(r.get("Legacy Over %"),np.nan); under=safe_float(r.get("Legacy Under %"),np.nan); p50=safe_float(r.get("MC Median"),proj)
-            if returning and pd.notna(line) and pd.notna(proj): over,under=_app121_side_prob_from_normal(line,proj,safe_float(r.get("Volatility"),{"REB":2.3,"AST":2.0}.get(market,4.0)),"OVER")
+            if ast_v2_promoted and pd.notna(line) and pd.notna(proj):
+                p50=proj; over,under=_app121_side_prob_from_normal(line,proj,max(1.25,safe_float(r.get("Volatility"),2.0)),"OVER")
+            elif returning and pd.notna(line) and pd.notna(proj): over,under=_app121_side_prob_from_normal(line,proj,safe_float(r.get("Volatility"),{"REB":2.3,"AST":2.0}.get(market,4.0)),"OVER")
 
         raw_over=over; raw_under=under
         shrink=safe_float(r.get("Injury Scenario Probability Shrink"),1.)
@@ -17755,12 +18072,12 @@ def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
     x["Elite Flags"]=flags.str.strip(" |")
     ranked=_elite_rank_board_app120(x)
 
-    # App124 rank stability layer. It does not alter the projection mean. It only
+    # App125 rank stability layer. It does not alter the projection mean. It only
     # prevents volatile minute/role assumptions from sitting above more stable plays.
     penalties=[]; bonuses=[]; notes=[]
     floors={"PTS":.75,"REB":.45,"AST":.40,"PRA":1.10}
     for _,r in ranked.iterrows():
-        market=str(r.get("Market","")).upper(); mins=safe_float(r.get("Elite Projected Minutes"),safe_float(r.get("MIN Proj"),np.nan)); min_conf=safe_float(r.get("Minutes Confidence"),safe_float(r.get("Final Projection Confidence"),60)); role=safe_float(r.get("Elite Role Security"),55); spread=safe_float(r.get("Elite PTS Model Spread"),0); edge=abs(safe_float(r.get("Final Resolved Edge",r.get("Elite Edge")),0)); p=0.; b=0.; why=[]
+        market=str(r.get("Market","")).upper(); mins=safe_float(r.get("Elite Projected Minutes"),safe_float(r.get("MIN Proj"),np.nan)); min_conf=safe_float(r.get("Elite Minutes V2 Confidence"),safe_float(r.get("Minutes Confidence"),safe_float(r.get("Final Projection Confidence"),60))); role=safe_float(r.get("Elite Role Security"),55); spread=safe_float(r.get("Elite PTS Model Spread"),0); edge=abs(safe_float(r.get("Final Resolved Edge",r.get("Elite Edge")),0)); p=0.; b=0.; why=[]
         if pd.notna(mins):
             if mins<18: p+=10; why.append("<18 projected minutes -10")
             elif mins<24: p+=6; why.append("<24 projected minutes -6")
@@ -17777,17 +18094,23 @@ def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
             floor=floors.get(market,1.0)
             if pd.notna(mins) and mins<24 and edge>=2.0*floor: p+=5; why.append("large edge depends on low minutes -5")
         if market=="PRA":
-            # PRA compounds component uncertainty; penalize only when the PTS family
-            # is already unstable or protected AST/REB challengers disagree.
+            # PRA compounds PTS uncertainty; keep the direct protected REB/AST path
+            # until those challengers prove themselves independently.
             f=str(r.get("Elite Flags","")).upper()
             if spread>=4.5: p+=3; why.append("PRA component uncertainty -3")
             if "AST_CHALLENGER_DISAGREEMENT" in f: p+=2; why.append("PRA AST disagreement -2")
+        if market=="AST":
+            av2_spread=safe_float(r.get("Elite AST V2 Spread"),np.nan); av2_stable=bool(r.get("Elite AST V2 Stable",False))
+            if pd.notna(av2_spread) and av2_spread>=2.0: p+=5; why.append("AST model spread >=2 -5")
+            elif av2_stable: b+=2; why.append("AST V2 families aligned +2")
+        ww_conf=safe_float(r.get("Elite With Without Confidence"),0); ww_n=safe_float(r.get("Elite With Without Samples"),0)
+        if ww_conf>=35 and ww_n>=3: b+=1.5; why.append("empirical with/without support +1.5")
         if bool(r.get("Return From Injury Flag",False)): p+=4; why.append("return-role uncertainty -4")
         penalties.append(p); bonuses.append(b); notes.append(" | ".join(why))
-    ranked["Elite App124 Stability Penalty"]=penalties; ranked["Elite App124 Stability Bonus"]=bonuses
-    ranked["Elite Rank Score"]=(pd.to_numeric(ranked.get("Elite Rank Score"),errors="coerce").fillna(0)-ranked["Elite App124 Stability Penalty"]+ranked["Elite App124 Stability Bonus"]).clip(0,100).round(2)
+    ranked["Elite App125 Stability Penalty"]=penalties; ranked["Elite App125 Stability Bonus"]=bonuses
+    ranked["Elite Rank Score"]=(pd.to_numeric(ranked.get("Elite Rank Score"),errors="coerce").fillna(0)-ranked["Elite App125 Stability Penalty"]+ranked["Elite App125 Stability Bonus"]).clip(0,100).round(2)
     ranked["Elite Rank Stability Note"]=notes
-    ranked["Elite Stability Score"]=(100-ranked["Elite App124 Stability Penalty"]*3+ranked["Elite App124 Stability Bonus"]*2).clip(0,100).round(1)
+    ranked["Elite Stability Score"]=(100-ranked["Elite App125 Stability Penalty"]*3+ranked["Elite App125 Stability Bonus"]*2).clip(0,100).round(1)
 
     # Stronger same-player diversification after the stability score. The first
     # edge can rank normally; correlated second/third markets cannot crowd the top.
@@ -17796,8 +18119,18 @@ def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
     for nk,idxs in ranked.groupby("NameKey").groups.items():
         ids=sorted(list(idxs),key=lambda i:safe_float(ranked.at[i,"Elite Rank Score"],0),reverse=True)
         for order,i in enumerate(ids[1:],start=1): extra_corr.at[i]=min(10.,3.5+2.0*order)
-    ranked["Elite App124 Same Player Penalty"]=extra_corr
+    ranked["Elite App125 Same Player Penalty"]=extra_corr
     ranked["Elite Rank Score"]=(ranked["Elite Rank Score"]-extra_corr).clip(0,100).round(2)
+
+    # Leakage-safe rank learning: prior completed Final-Resolved grades only,
+    # minimum 12 comparable samples, maximum +/-4 score points.
+    learn_adj=[]; learn_note=[]; learn_n=[]
+    for _,r in ranked.iterrows():
+        a,note,n=_app125_rank_learning_adjustment(r); learn_adj.append(a); learn_note.append(note); learn_n.append(n)
+    ranked["Elite App125 Rank Learning Adjustment"]=learn_adj
+    ranked["Elite App125 Rank Learning Samples"]=learn_n
+    ranked["Elite App125 Rank Learning Note"]=learn_note
+    ranked["Elite Rank Score"]=(ranked["Elite Rank Score"]+pd.Series(learn_adj,index=ranked.index)).clip(0,100).round(2)
 
     # Downgrade statuses if stability knocks a play below its level; never upgrade
     # a base TRACK solely from this post-processor.
@@ -17815,7 +18148,7 @@ def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
     for mk,idxs in ranked[valid].groupby("Market").groups.items():
         ids=sorted(list(idxs),key=lambda i:safe_float(ranked.at[i,"Elite Rank Score"],0),reverse=True)
         for mr,i in enumerate(ids,start=1): ranked.at[i,"Elite Market Rank"]=mr
-    ranked["Elite Rank Authority"]="FINAL_RESOLVED_PROJECTION_APP124_STABILITY"
+    ranked["Elite Rank Authority"]="FINAL_RESOLVED_PROJECTION_APP125_STABILITY"
     return ranked.sort_values(["Elite Rank","Elite Rank Score"],ascending=[True,False],na_position="last")
 
 def _promote_final_authority(board: pd.DataFrame) -> pd.DataFrame:
@@ -17823,7 +18156,7 @@ def _promote_final_authority(board: pd.DataFrame) -> pd.DataFrame:
     out=board.copy(); out["Projection"]=pd.to_numeric(out["Final Resolved Projection"],errors="coerce"); out["Edge"]=pd.to_numeric(out.get("Final Resolved Edge"),errors="coerce"); out["Lean"]=out.get("Final Resolved Side",out.get("Lean","PASS")); out["Over %"]=pd.to_numeric(out.get("Final Resolved Over %"),errors="coerce"); out["Under %"]=pd.to_numeric(out.get("Final Resolved Under %"),errors="coerce")
     status=out.get("Elite Status",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); side=out.get("Final Resolved Side",pd.Series("PASS",index=out.index)).astype(str).str.upper(); rank=pd.to_numeric(out.get("Elite Rank"),errors="coerce"); rec=status.isin(["ELITE","STRONG","PLAYABLE","LEAN"])&side.isin(["OVER","UNDER"])&rank.notna(); rec_state=out.get("Final Recommendation State",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); readiness=out.get("Projection Readiness",pd.Series("READY",index=out.index)).astype(str).str.upper(); valid=pd.to_numeric(out.get("Line"),errors="coerce").notna()&pd.to_numeric(out.get("Projection"),errors="coerce").notna()
     fallback=np.where(~valid,"PASS",np.where(rec_state.eq("BLOCK")|readiness.eq("BLOCK"),"BLOCK",np.where(rec_state.eq("WAIT")|readiness.eq("WAIT"),"WAIT","TRACK")))
-    out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),fallback); out["Recommendation State"]=np.where(rec,status,fallback); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP124_PTS_PRA_RANK_STABILITY"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY_APP124"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
+    out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),fallback); out["Recommendation State"]=np.where(rec,status,fallback); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP125_MINUTES_ROLE_AST_CHALLENGER"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY_APP125"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
 
 
 def build_copy_paste_slate(df: pd.DataFrame, best_only: bool=False, max_rows: int=0) -> str:
@@ -17897,7 +18230,7 @@ def dataset_status_table():
     return pd.DataFrame(rows)
 
 def make_projection_board(lines, logs, base, mode: Optional[str] = None):
-    """App124 PTS/PRA stability authority; Underdog pull/parser remains unchanged."""
+    """App125 minutes/role/AST authority; Underdog pull/parser remains unchanged."""
     active_mode=mode or "Today"
     board=_build_live_projection_inputs(lines,base,active_mode); board=_strict_attach_opponent_context(board,active_mode); board=_strict_market_isolated_rebuild(board,base); board=_stable_attach_context_audit_only(board,base); board=_strong_trust_enrich_board(board,active_mode); board=_apply_full_winning_play_stack(board,base,active_mode)
     if board is not None and not board.empty:
@@ -17946,15 +18279,15 @@ try:
                 _startup_board.to_csv(_qpath,index=False)
                 _active_path=CACHE_FILES.get("projection_board")
                 if _active_path and Path(_active_path).exists(): Path(_active_path).unlink()
-                st.session_state["wnba_app124_refresh_required"]="Incompatible pre-App124 projection cache quarantined. Press Refresh Today before using Best Plays."
+                st.session_state["wnba_app125_refresh_required"]="Incompatible pre-App125 projection cache quarantined. Press Refresh Today before using Best Plays."
             except Exception as _qexc:
-                st.session_state["wnba_app124_refresh_required"]=f"Projection cache incompatible; Refresh required. Quarantine warning: {str(_qexc)[:120]}"
+                st.session_state["wnba_app125_refresh_required"]=f"Projection cache incompatible; Refresh required. Quarantine warning: {str(_qexc)[:120]}"
             _startup_board = pd.DataFrame()
 except Exception as _stable_startup_exc:
     st.session_state["wnba_stable_startup_repair_error"] = str(_stable_startup_exc)[:240]
 
-if st.session_state.get("wnba_app124_refresh_required"):
-    st.warning(st.session_state.get("wnba_app124_refresh_required"))
+if st.session_state.get("wnba_app125_refresh_required"):
+    st.warning(st.session_state.get("wnba_app125_refresh_required"))
 
 tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Moneyline", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports", "HHS / Models"])
 
