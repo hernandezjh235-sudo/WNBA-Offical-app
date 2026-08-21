@@ -13,6 +13,17 @@ Line-source build:
 """
 
 
+# APP 126 LOSS RESCUE / PROJECTION FORENSICS CHANGES
+# - Learns signed projection residuals from PRIOR completed Final-Resolved grades only.
+# - Classifies losses by minutes, role/FGA/FTA, efficiency, AST creation, rebound opportunity, return/injury, thin edge, model disagreement, or true variance.
+# - Applies Bayesian/shrunk market-specific residual correction only when historical replay shows positive net rescue and improved MAE.
+# - Side flips require stronger evidence than mean correction alone; unapproved conflicts are TRACK, not forced picks.
+# - Adds Winner Similarity / Loss Similarity, market-side reliability, and residual reliability to the Elite #1-#200 ranking.
+# - PTS/PRA confirmation gates become stricter automatically for historically cold market-side buckets; no hard-coded permanent OVER/UNDER preference.
+# - Saves actual MIN/FGA/FTA/3PA/FGM/FTM/PTS/REB/AST/PRA into graded records for postgame diagnosis.
+# - Adds Loss Rescue Lab to Model Reports with Losses Rescued, Wins Broken, Net Rescue, and MAE delta.
+# - REB production remains protected; corrections are small, capped, evidence-gated, and replay-gated.
+
 # APP 125 MINUTES/ROLE/AST CHANGES
 # - App124 PTS/PRA means remain intact as the baseline winner.
 # - Minutes/Rotation V2 uses recency, starter role, coach/team rotation bands and actual game-log volatility.
@@ -119,7 +130,7 @@ from wnba_hhs.evaluation import (
 from wnba_hhs.schema import DATASET_KEYS
 from wnba_hhs.snapshots import ProjectionSnapshotStore
 
-APP_VERSION = "WNBA v4.8.0 - App125 Minutes Role AST Challenger"
+APP_VERSION = "WNBA v4.9.0 - App126 Loss Rescue Projection Forensics"
 LINE_PARSER_VERSION = "UD_BASE_CARD_MAINLINE_V5"
 MONEYLINE_FEED_VERSION = "V367_UNDERDOG_GAME_SLATE_ELITE_INJURY_FRESHNESS"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
@@ -5069,6 +5080,13 @@ def grade_pending(logs, mode: Optional[str] = None, allowed_dates: Optional[List
         win = (actual > line and lean == "OVER") or (actual < line and lean == "UNDER")
         row["Actual"] = round(float(actual), 2)
         row["ActualMinutes"] = round(float(minutes), 2)
+        # App126 postgame forensics: persist the opportunity components that explain
+        # *why* a projection won/lost, not only the final market value.
+        for _src, _dst in [("PTS","ActualPTS"),("REB","ActualREB"),("AST","ActualAST"),("PRA","ActualPRA"),("FGA","ActualFGA"),("FGM","ActualFGM"),("FG3A","Actual3PA"),("FG3M","Actual3PM"),("FTA","ActualFTA"),("FTM","ActualFTM"),("TOV","ActualTOV"),("OREB","ActualOREB"),("DREB","ActualDREB")]:
+            _vv = safe_float(stat_row.get(_src), np.nan)
+            row[_dst] = round(float(_vv), 3) if pd.notna(_vv) else None
+        _poss_used = safe_float(stat_row.get("FGA"),0.0) + 0.44*safe_float(stat_row.get("FTA"),0.0) + safe_float(stat_row.get("TOV"),0.0)
+        row["ActualUsageProxy40"] = round(40.0*_poss_used/max(float(minutes),1e-6),3) if minutes>0 else None
         projected_value = safe_float(row.get("Projection"), np.nan)
         projected_minutes = safe_float(row.get("HHS Projected Minutes"), safe_float(row.get("MIN Proj"), np.nan))
         row["ProjectionError"] = round(projected_value - actual, 2) if pd.notna(projected_value) else None
@@ -5090,6 +5108,9 @@ def grade_pending(logs, mode: Optional[str] = None, allowed_dates: Optional[List
 
     save_json(OFFICIAL_LOG, official)
     save_json(LEARNING_LOG, learn)
+    # App126 learning caches must immediately see newly graded outcomes.
+    globals()["_APP126_HISTORY_CACHE"] = None
+    globals()["_APP126_REPLAY_CACHE"] = None
     try:
         ProjectionSnapshotStore(LOCAL_DIR / "wnba_projection_history.sqlite3").grade_from_records(official)
     except Exception as exc:
@@ -11071,7 +11092,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v4.8.0 - App125 Minutes Role AST Challenger"
+APP_VERSION = "WNBA v4.9.0 - App126 Loss Rescue Projection Forensics"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -12612,7 +12633,7 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v4.8.0 - App125 Minutes Role AST Challenger"
+APP_VERSION = "WNBA v4.9.0 - App126 Loss Rescue Projection Forensics"
 PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = "LEGACY LOCKED: season-isolated Bayesian baseline + bounded minutes/matchup. PTS V2 is a separate challenger and never overwrites legacy Projection."
 PTS_V2_ENGINE_VERSION = "PTS_V2_TEAM_CONSTRAINED_CHALLENGER_V1"
@@ -13844,7 +13865,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v4.8.0 - App125 Minutes Role AST Challenger"
+APP_VERSION = "WNBA v4.9.0 - App126 Loss Rescue Projection Forensics"
 PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = (
     "LEGACY LOCKED for A/B testing. Current-season inputs are isolated; prior seasons live only in explicit *_prior fields. "
@@ -17657,9 +17678,9 @@ def render_elite_rank_card(row: pd.Series) -> None:
 # ============================================================
 # App 122 — POST-GRADE FINAL AUTHORITY / LIVE CONTEXT / RETURN-ROLE SCENARIOS
 # ============================================================
-APP_VERSION = "WNBA v4.8.0 - App125 Minutes Role AST Challenger"
+APP_VERSION = "WNBA v4.9.0 - App126 Loss Rescue Projection Forensics"
 LEGACY_PROJECTION_ENGINE_VERSION = PROJECTION_ENGINE_VERSION
-PROJECTION_ENGINE_VERSION = "APP125_MINUTES_ROLE_AST_CHALLENGER"
+PROJECTION_ENGINE_VERSION = "APP126_LOSS_RESCUE_FORENSICS"
 PROJECTION_ENGINE_NOTE = "App125 authority: App124 PTS/PRA preserved; Minutes/Rotation V2 + empirical with/without role effects; AST V2 stable-blend production; REB V2 challenger only; rank learning from prior final-authority grades."
 ELITE_ENGINE_VERSION = "ELITE_ROLE_BUDGET_V7_APP125"
 FINAL_RESOLVER_VERSION = "FINAL_RESOLVER_V4_APP125"
@@ -17947,7 +17968,7 @@ def _app121_side_prob_from_normal(line: float, mean: float, legacy_sd: float, si
     sd=max(.65,legacy_sd); over=_normal_over_probability(line,mean,sd) if pd.notna(line) and pd.notna(mean) else np.nan; return over,(100-over if pd.notna(over) else np.nan)
 
 
-def _attach_final_resolved_projection(board: pd.DataFrame) -> pd.DataFrame:
+def _attach_final_resolved_projection_app125_control(board: pd.DataFrame) -> pd.DataFrame:
     if board is None or board.empty: return board
     out=board.copy()
     if "Legacy Projection" not in out.columns: out["Legacy Projection"]=pd.to_numeric(out.get("Projection"),errors="coerce")
@@ -18031,6 +18052,392 @@ def _attach_final_resolved_projection(board: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ============================================================
+# APP126 — LOSS RESCUE / PROJECTION FORENSICS
+# ============================================================
+APP126_LOSS_LEDGER_FILE = DATA_DIR / "wnba_app126_loss_ledger.csv"
+APP126_REPLAY_FILE = DATA_DIR / "wnba_app126_loss_rescue_replay.csv"
+_APP126_HISTORY_CACHE = None
+_APP126_REPLAY_CACHE = None
+
+
+def _app126_first_num(row: pd.Series, names: List[str], default=np.nan) -> float:
+    for c in names:
+        if c in row.index:
+            v=safe_float(row.get(c),np.nan)
+            if pd.notna(v): return float(v)
+    return default
+
+
+def _app126_first_text(row: pd.Series, names: List[str], default="") -> str:
+    for c in names:
+        if c in row.index:
+            v=str(row.get(c) or "").strip()
+            if v: return v
+    return default
+
+
+def _app126_market_floor(market: str) -> float:
+    return {"PTS":.75,"REB":.45,"AST":.40,"PRA":1.10}.get(str(market).upper(),.50)
+
+
+def _app126_market_correction_cap(market: str) -> float:
+    return {"PTS":2.0,"REB":.75,"AST":.60,"PRA":2.50}.get(str(market).upper(),1.0)
+
+
+def _app126_default_sd(market: str) -> float:
+    return {"PTS":5.0,"REB":2.5,"AST":2.15,"PRA":7.0}.get(str(market).upper(),4.0)
+
+
+def _app126_final_authority_mask(d: pd.DataFrame) -> pd.Series:
+    if d is None or d.empty: return pd.Series(dtype=bool)
+    auth=pd.Series(False,index=d.index)
+    for c in ["Saved Projection Authority","Production Projection Authority","ProjectionAuthority","Projection Engine Version","Final Resolver Version","Projection Input Path"]:
+        if c in d.columns:
+            auth |= d[c].astype(str).str.upper().str.contains("FINAL_RESOLVED|APP12[1-9]|FINAL_RESOLVER|FINAL_RESOLVED_AUTHORITY",regex=True,na=False)
+    # Older saved Final-Resolved rows can lack explicit authority columns but still
+    # contain their immutable Final Resolved values.
+    if "Final Resolved Projection" in d.columns:
+        auth |= pd.to_numeric(d["Final Resolved Projection"],errors="coerce").notna()
+    return auth
+
+
+def _app126_enrich_history_with_logs(d: pd.DataFrame) -> pd.DataFrame:
+    if d is None or d.empty: return d
+    out=d.copy()
+    logs=load_dataset("player_game_logs")
+    if logs is None or getattr(logs,"empty",True): return out
+    try: logs=standardize_player_logs(logs)
+    except Exception: return out
+    if logs is None or logs.empty: return out
+    logs=logs.copy()
+    _sd=pd.to_datetime(logs.get("SlateDate",pd.Series(pd.NaT,index=logs.index)),errors="coerce")
+    _gd=pd.to_datetime(logs.get("GameDate",pd.Series(pd.NaT,index=logs.index)),errors="coerce")
+    logs["_d"]=_sd.fillna(_gd).dt.date
+    logs["_nk"]=logs.get("NameKey",logs.get("Player",pd.Series("",index=logs.index)).map(normalize_name)).astype(str)
+    logs["_tk"]=logs.get("Team",pd.Series("",index=logs.index)).map(_grade_team_key)
+    logs["_ok"]=logs.get("Opponent",pd.Series("",index=logs.index)).map(_grade_team_key)
+    actual_cols={"MIN":"ActualMinutes","PTS":"ActualPTS","REB":"ActualREB","AST":"ActualAST","PRA":"ActualPRA","FGA":"ActualFGA","FGM":"ActualFGM","FG3A":"Actual3PA","FG3M":"Actual3PM","FTA":"ActualFTA","FTM":"ActualFTM","TOV":"ActualTOV","OREB":"ActualOREB","DREB":"ActualDREB"}
+    for c in actual_cols.values():
+        if c not in out.columns: out[c]=np.nan
+    for i,r in out.iterrows():
+        need=any(pd.isna(safe_float(r.get(c),np.nan)) for c in ["ActualMinutes","ActualFGA","ActualFTA"])
+        if not need: continue
+        dt=_grade_record_date(r.to_dict()); nk=normalize_name(r.get("Matched Player") or r.get("Player")); tk=_grade_team_key(r.get("Team"))
+        if dt is None or not nk: continue
+        cand=logs[(logs["_d"]==dt)&(logs["_nk"]==nk)].copy()
+        if cand.empty: continue
+        if tk:
+            c2=cand[cand["_tk"]==tk]
+            if not c2.empty: cand=c2
+        sr=cand.iloc[0]
+        for src,dst in actual_cols.items():
+            if pd.isna(safe_float(out.at[i,dst],np.nan)):
+                v=safe_float(sr.get(src),np.nan)
+                if pd.notna(v): out.at[i,dst]=v
+        # Team-score context explains whether a player miss came from the whole game
+        # environment being wrong or only the player's share being wrong.
+        team_rows=logs[(logs["_d"]==dt)&(logs["_tk"]==tk)] if tk else pd.DataFrame()
+        if not team_rows.empty:
+            out.at[i,"ActualTeamPoints"]=pd.to_numeric(team_rows.get("PTS"),errors="coerce").sum(min_count=1)
+            opp_key=_grade_team_key(r.get("Opponent"))
+            if opp_key:
+                opp_rows=logs[(logs["_d"]==dt)&(logs["_tk"]==opp_key)]
+                if not opp_rows.empty: out.at[i,"ActualOppPoints"]=pd.to_numeric(opp_rows.get("PTS"),errors="coerce").sum(min_count=1)
+        _am=safe_float(out.at[i,"ActualMinutes"],np.nan); _afga=safe_float(out.at[i,"ActualFGA"],0); _afta=safe_float(out.at[i,"ActualFTA"],0); _atov=safe_float(out.at[i,"ActualTOV"],0)
+        if pd.notna(_am) and _am>0: out.at[i,"ActualUsageProxy40"]=40.0*(_afga+.44*_afta+_atov)/_am
+    return out
+
+
+def _app126_grade_history(force: bool=False) -> pd.DataFrame:
+    global _APP126_HISTORY_CACHE
+    if _APP126_HISTORY_CACHE is not None and not force:
+        return _APP126_HISTORY_CACHE.copy()
+    d=_graded_result_rows()
+    if d is None or d.empty:
+        _APP126_HISTORY_CACHE=pd.DataFrame(); return pd.DataFrame()
+    d=d.copy(); d=d[_app126_final_authority_mask(d)].copy()
+    if d.empty:
+        _APP126_HISTORY_CACHE=d; return d
+    d["Market"]=d.get("Market","").astype(str).str.upper()
+    d["Side"] = d.get("Final Resolved Side",d.get("Lean",pd.Series("",index=d.index))).astype(str).str.upper().map(lambda x:"OVER" if "OVER" in x else "UNDER" if "UNDER" in x else x)
+    d["ProjectionNum"] = pd.to_numeric(d.get("Final Resolved Projection",d.get("Projection",np.nan)),errors="coerce")
+    d["LineNum"] = pd.to_numeric(d.get("Line"),errors="coerce")
+    d["ActualNum"] = pd.to_numeric(d.get("Actual"),errors="coerce")
+    d["ResultKey"] = d.get("ResultKey",d.get("Result","")).astype(str).str.upper()
+    d["WinNum"] = d["ResultKey"].str.contains("WIN",na=False).astype(int)
+    d["ProjectionErrorNum"] = d["ProjectionNum"]-d["ActualNum"]
+    d["EdgeAbs"]=(d["ProjectionNum"]-d["LineNum"]).abs()
+    d["SelectedProb"] = np.where(d["Side"].eq("OVER"),pd.to_numeric(d.get("Final Resolved Over %",d.get("Over %",np.nan)),errors="coerce"),pd.to_numeric(d.get("Final Resolved Under %",d.get("Under %",np.nan)),errors="coerce"))
+    d["ProjMinutes"] = pd.to_numeric(d.get("Elite Projected Minutes",d.get("MIN Proj",d.get("HHS Projected Minutes",np.nan))),errors="coerce")
+    d["ActualMinutes"] = pd.to_numeric(d.get("ActualMinutes",np.nan),errors="coerce")
+    d["MinutesErrorNum"] = d["ProjMinutes"]-d["ActualMinutes"]
+    d["MinutesConfidenceNum"] = pd.to_numeric(d.get("Elite Minutes V2 Confidence",d.get("Minutes Confidence",d.get("Final Projection Confidence",np.nan))),errors="coerce")
+    d["RoleSecurityNum"] = pd.to_numeric(d.get("Elite Role Security",np.nan),errors="coerce")
+    d["ModelSpreadNum"] = pd.to_numeric(d.get("Elite PTS Model Spread",d.get("Elite AST V2 Spread",np.nan)),errors="coerce")
+    d["ReturnFlagNum"] = d.get("Return From Injury Flag",False).fillna(False).astype(bool).astype(int) if isinstance(d.get("Return From Injury Flag"),pd.Series) else 0
+    d["SavedAtDT"] = pd.to_datetime(d.get("SavedAt",d.get("GradedAt",pd.NaT)),errors="coerce",utc=True)
+    d["PlayerKey"] = d.get("Player",pd.Series("",index=d.index)).map(normalize_name)
+    # Remove duplicated mirrors of the same immutable saved pick across official/learning/result logs.
+    dedup_cols=[c for c in ["SavedAt","PlayerKey","Market","LineNum"] if c in d.columns]
+    if dedup_cols: d=d.sort_values("SavedAtDT",na_position="last").drop_duplicates(dedup_cols,keep="last")
+    d=_app126_enrich_history_with_logs(d)
+    _APP126_HISTORY_CACHE=d.reset_index(drop=True)
+    return _APP126_HISTORY_CACHE.copy()
+
+
+def _app126_row_features(row: pd.Series) -> Dict[str,float]:
+    market=str(row.get("Market","")).upper(); side=str(row.get("Final Resolved Side",row.get("Elite Side",row.get("Side",row.get("Lean",""))))).upper()
+    proj=_app126_first_num(row,["Final Resolved Projection","Elite Projection","Projection","ProjectionNum"])
+    line=_app126_first_num(row,["Line","LineNum"])
+    edge=abs(proj-line) if pd.notna(proj) and pd.notna(line) else _app126_first_num(row,["Final Resolved Edge","Elite Edge","EdgeAbs","Edge"],0.0)
+    prob=_app126_first_num(row,["Elite Calibrated Probability %","SelectedProb","Final Resolved Over %" if side=="OVER" else "Final Resolved Under %","Over %" if side=="OVER" else "Under %"],55.0)
+    mins=_app126_first_num(row,["Elite Projected Minutes","MIN Proj","ProjMinutes","HHS Projected Minutes"],28.0)
+    minconf=_app126_first_num(row,["Elite Minutes V2 Confidence","Minutes Confidence","MinutesConfidenceNum","Final Projection Confidence"],60.0)
+    role=_app126_first_num(row,["Elite Role Security","RoleSecurityNum"],60.0)
+    spread=_app126_first_num(row,["Elite PTS Model Spread","Elite AST V2 Spread","ModelSpreadNum"],2.5)
+    ret=1.0 if bool(row.get("Return From Injury Flag",row.get("ReturnFlagNum",False))) else 0.0
+    return {"market":market,"side":side,"edge":float(edge if pd.notna(edge) else 0),"prob":float(prob if pd.notna(prob) else 55),"mins":float(mins if pd.notna(mins) else 28),"minconf":float(minconf if pd.notna(minconf) else 60),"role":float(role if pd.notna(role) else 60),"spread":float(spread if pd.notna(spread) else 2.5),"return":ret}
+
+
+def _app126_similarity_history(row: pd.Series, history: Optional[pd.DataFrame]=None, cutoff=None) -> pd.DataFrame:
+    h=_app126_grade_history() if history is None else history.copy()
+    if h is None or h.empty: return pd.DataFrame()
+    f=_app126_row_features(row); h=h[h["Market"].eq(f["market"])].copy()
+    if cutoff is not None and "SavedAtDT" in h.columns:
+        c=pd.to_datetime(cutoff,errors="coerce",utc=True)
+        if pd.notna(c): h=h[h["SavedAtDT"]<c]
+    if h.empty: return h
+    # Similarity is intentionally broad enough to learn, but market is exact and
+    # side mismatch is expensive. This is a historical-neighbor model, not player memorization.
+    hfeat=[]
+    edge_scale=max(_app126_market_correction_cap(f["market"])*2.5,1.0)
+    spread_scale={"PTS":6.0,"PRA":7.0,"REB":3.0,"AST":2.5}.get(f["market"],4.0)
+    for _,r in h.iterrows():
+        rf=_app126_row_features(r)
+        dist=0.0
+        dist += 0.50*(0.0 if rf["side"]==f["side"] else 1.0)
+        dist += 0.42*min(1.5,abs(rf["edge"]-f["edge"])/edge_scale)
+        dist += 0.30*min(1.5,abs(rf["prob"]-f["prob"])/22.0)
+        dist += 0.30*min(1.5,abs(rf["mins"]-f["mins"])/12.0)
+        dist += 0.22*min(1.5,abs(rf["minconf"]-f["minconf"])/30.0)
+        dist += 0.22*min(1.5,abs(rf["role"]-f["role"])/30.0)
+        dist += 0.18*min(1.5,abs(rf["spread"]-f["spread"])/spread_scale)
+        dist += 0.22*(0.0 if rf["return"]==f["return"] else 1.0)
+        hfeat.append(math.exp(-2.25*dist))
+    h["_sim"]=hfeat
+    h=h[h["_sim"]>=0.08].sort_values("_sim",ascending=False).head(50).copy()
+    return h
+
+
+def _app126_weighted_residual(row: pd.Series, history: Optional[pd.DataFrame]=None, cutoff=None) -> Dict[str,Any]:
+    market=str(row.get("Market","")).upper(); neigh=_app126_similarity_history(row,history,cutoff)
+    if neigh is None or neigh.empty:
+        return {"correction":0.0,"raw_bias":0.0,"samples":0,"effective_samples":0.0,"reliability":0.0,"note":"no comparable prior grades"}
+    err=pd.to_numeric(neigh["ProjectionErrorNum"],errors="coerce"); w=pd.to_numeric(neigh["_sim"],errors="coerce").fillna(0)
+    ok=err.notna()&(w>0); err=err[ok]; w=w[ok]
+    if len(err)<6 or w.sum()<=0:
+        return {"correction":0.0,"raw_bias":0.0,"samples":int(len(err)),"effective_samples":float(w.sum()),"reliability":0.0,"note":"insufficient comparable residual sample"}
+    # Winsorized weighted mean keeps one 35-point explosion from rewriting the model.
+    clip={"PTS":10.0,"REB":5.0,"AST":5.0,"PRA":14.0}.get(market,8.0)
+    e=np.clip(err.to_numpy(float),-clip,clip); ww=w.to_numpy(float)
+    raw=float(np.average(e,weights=ww)); eff=float(ww.sum())
+    shrink=eff/(eff+12.0); corr=float(np.clip(raw*shrink,-_app126_market_correction_cap(market),_app126_market_correction_cap(market)))
+    reliability=float(np.clip((eff/18.0)*100.0,0,100))
+    return {"correction":corr,"raw_bias":raw,"samples":int(len(err)),"effective_samples":eff,"reliability":reliability,"note":f"{len(err)} comparable prior grades; eff={eff:.1f}; raw bias={raw:+.2f}; shrink={shrink:.2f}"}
+
+
+def _app126_similarity_scores(row: pd.Series, history: Optional[pd.DataFrame]=None, cutoff=None) -> Dict[str,Any]:
+    neigh=_app126_similarity_history(row,history,cutoff)
+    if neigh is None or neigh.empty:
+        return {"winner":50.0,"loss":50.0,"samples":0,"eff":0.0,"market_side_wr":0.50,"market_side_n":0}
+    w=pd.to_numeric(neigh["_sim"],errors="coerce").fillna(0); y=pd.to_numeric(neigh["WinNum"],errors="coerce").fillna(0)
+    eff=float(w.sum()); weighted=float((w*y).sum()/max(eff,1e-9))
+    # Bayesian shrink to neutral. Similarity scores are not raw confidence claims.
+    bayes=(weighted*eff+6.0)/(eff+12.0)
+    f=_app126_row_features(row); h=_app126_grade_history() if history is None else history
+    ms=h[(h["Market"].eq(f["market"]))&(h["Side"].eq(f["side"]))].copy() if h is not None and not h.empty else pd.DataFrame()
+    if cutoff is not None and not ms.empty:
+        c=pd.to_datetime(cutoff,errors="coerce",utc=True)
+        if pd.notna(c): ms=ms[ms["SavedAtDT"]<c]
+    n=len(ms); wins=int(ms["WinNum"].sum()) if n else 0; mswr=(wins+8)/(n+16) if n else .50
+    return {"winner":float(100*bayes),"loss":float(100*(1-bayes)),"samples":len(neigh),"eff":eff,"market_side_wr":float(mswr),"market_side_n":int(n)}
+
+
+def _app126_classify_loss_reason(row: pd.Series) -> Tuple[str,str]:
+    if str(row.get("ResultKey",row.get("Result",""))).upper().find("LOSS")<0: return "WIN_OR_NONLOSS",""
+    market=str(row.get("Market","")).upper(); edge=safe_float(row.get("EdgeAbs"),abs(safe_float(row.get("ProjectionNum"),0)-safe_float(row.get("LineNum"),0)))
+    minerr=safe_float(row.get("MinutesErrorNum"),np.nan); projmin=safe_float(row.get("ProjMinutes"),np.nan); actualmin=safe_float(row.get("ActualMinutes"),np.nan)
+    flags=[]
+    if bool(row.get("Return From Injury Flag",row.get("ReturnFlagNum",False))): flags.append("INJURY_RETURN_MISS")
+    if pd.notna(minerr) and (abs(minerr)>=5.0 or (pd.notna(actualmin) and actualmin>0 and abs(minerr)/actualmin>=.20)): flags.append("MINUTES_MISS")
+    spread=safe_float(row.get("ModelSpreadNum"),np.nan)
+    if pd.notna(spread) and spread>={"PTS":4.5,"PRA":5.0,"AST":2.0,"REB":2.5}.get(market,4.0): flags.append("MODEL_DISAGREEMENT_MISS")
+    if edge < _app126_market_floor(market)*1.20: flags.append("THIN_EDGE_MISS")
+    pfga=_app126_first_num(row,["Elite Projected FGA","PTS V2 Projected FGA","Projected FGA"]); afga=safe_float(row.get("ActualFGA"),np.nan)
+    pfta=_app126_first_num(row,["Elite Projected FTA","PTS V2 Projected FTA","Projected FTA"]); afta=safe_float(row.get("ActualFTA"),np.nan)
+    if market in {"PTS","PRA"} and ((pd.notna(pfga) and pd.notna(afga) and abs(pfga-afga)>=4.0) or (pd.notna(pfta) and pd.notna(afta) and abs(pfta-afta)>=3.0)):
+        flags.append("FGA_FTA_ROLE_MISS")
+    pteam=_app126_first_num(row,["Elite Expected Team Points","Projected Team Score ML"]); ateam=safe_float(row.get("ActualTeamPoints"),np.nan)
+    if pd.notna(pteam) and pd.notna(ateam) and abs(pteam-ateam)>=10: flags.append("TEAM_ENVIRONMENT_MISS")
+    opp_factor=safe_float(row.get("Component Opportunity Factor"),1.0); perr=safe_float(row.get("ProjectionErrorNum"),0)
+    if pd.notna(opp_factor) and ((opp_factor>=1.08 and perr>=3.0) or (opp_factor<=.92 and perr<=-3.0)): flags.append("MATCHUP_ADJUSTMENT_MISS")
+    if market=="AST" and not any(x in flags for x in ["MINUTES_MISS","INJURY_RETURN_MISS"]): flags.append("AST_CREATION_MISS")
+    if market=="REB" and not any(x in flags for x in ["MINUTES_MISS","INJURY_RETURN_MISS"]): flags.append("REB_OPPORTUNITY_MISS")
+    if market in {"PTS","PRA"} and not any(x in flags for x in ["MINUTES_MISS","INJURY_RETURN_MISS","FGA_FTA_ROLE_MISS"]):
+        # If attempts/minutes were reasonably close, remaining large miss is mostly conversion/variance.
+        perr=abs(safe_float(row.get("ProjectionErrorNum"),0))
+        if perr>={"PTS":4.5,"PRA":6.0}.get(market,5.0): flags.append("EFFICIENCY_OR_EVENT_VARIANCE")
+    if not flags: flags=["TRUE_VARIANCE_OR_UNCLASSIFIED"]
+    priority=["INJURY_RETURN_MISS","MINUTES_MISS","FGA_FTA_ROLE_MISS","TEAM_ENVIRONMENT_MISS","MODEL_DISAGREEMENT_MISS","MATCHUP_ADJUSTMENT_MISS","AST_CREATION_MISS","REB_OPPORTUNITY_MISS","THIN_EDGE_MISS","EFFICIENCY_OR_EVENT_VARIANCE","TRUE_VARIANCE_OR_UNCLASSIFIED"]
+    primary=next((p for p in priority if p in flags),flags[0])
+    return primary," | ".join(dict.fromkeys(flags))
+
+
+def _app126_build_loss_ledger(force: bool=False) -> pd.DataFrame:
+    h=_app126_grade_history(force=force)
+    if h is None or h.empty: return pd.DataFrame()
+    rows=[]
+    for _,rr in h.iterrows():
+        r=rr.copy(); primary,tags=_app126_classify_loss_reason(r)
+        r["App126 Loss Primary Reason"]=primary; r["App126 Loss Reason Tags"]=tags
+        rows.append(r)
+    out=pd.DataFrame(rows)
+    try:
+        keep=[c for c in ["SavedAt","SlateDate","Player","Team","Opponent","Market","Side","LineNum","ProjectionNum","ActualNum","ResultKey","ProjectionErrorNum","ProjMinutes","ActualMinutes","MinutesErrorNum","ActualFGA","ActualFTA","Actual3PA","ActualPTS","ActualREB","ActualAST","ActualPRA","App126 Loss Primary Reason","App126 Loss Reason Tags","Final Projection Source","Projection Engine Version"] if c in out.columns]
+        out[keep].to_csv(APP126_LOSS_LEDGER_FILE,index=False)
+    except Exception: pass
+    return out
+
+
+def _app126_side_flip_gate(row: pd.Series, raw_proj: float, corrected_proj: float, resid: Dict[str,Any], sim: Dict[str,Any], replay_market: Optional[Dict[str,Any]]=None) -> Tuple[bool,str]:
+    line=safe_float(row.get("Line"),np.nan); market=str(row.get("Market","")).upper()
+    if pd.isna(line) or pd.isna(raw_proj) or pd.isna(corrected_proj): return False,"missing line/projection"
+    raw_side="OVER" if raw_proj>line else "UNDER" if raw_proj<line else "PUSH"; new_side="OVER" if corrected_proj>line else "UNDER" if corrected_proj<line else "PUSH"
+    if raw_side==new_side: return True,"no side flip required"
+    minconf=_app126_first_num(row,["Elite Minutes V2 Confidence","Minutes Confidence","Final Projection Confidence"],0); role=_app126_first_num(row,["Elite Role Security"],0); agreement=_app126_first_num(row,["Elite Agreement Score","Model Agreement"],0)
+    p50=_app126_first_num(row,["Final Resolved P50","Elite P50","MC Median"],raw_proj); corrected_p50=p50+(corrected_proj-raw_proj) if pd.notna(p50) else corrected_proj
+    p50_side="OVER" if corrected_p50>line else "UNDER" if corrected_p50<line else "PUSH"
+    new_edge=abs(corrected_proj-line); floor=_app126_market_floor(market)
+    replay_ok=True
+    if replay_market:
+        replay_ok=safe_float(replay_market.get("Net Rescue Score"),0)>0 and safe_float(replay_market.get("MAE Improvement"),0)>=0
+    checks={
+        "residual sample":safe_float(resid.get("effective_samples"),0)>=12,
+        "residual reliability":safe_float(resid.get("reliability"),0)>=55,
+        "new edge":new_edge>=floor,
+        "P50 agrees":p50_side==new_side,
+        "minutes":minconf>=62,
+        "role":role>=60,
+        "agreement":agreement>=55,
+        "not return":not bool(row.get("Return From Injury Flag",False)),
+        "winner similarity":safe_float(sim.get("winner"),50)>=safe_float(sim.get("loss"),50)+5,
+        "replay positive":replay_ok,
+    }
+    passed=sum(checks.values()); required=9 if market in {"PTS","PRA"} else 8
+    ok=passed>=required
+    return ok,f"side flip {raw_side}->{new_side}: {passed}/{len(checks)} checks; "+", ".join(k for k,v in checks.items() if not v)
+
+
+def _app126_replay_loss_rescue(force: bool=False) -> pd.DataFrame:
+    global _APP126_REPLAY_CACHE
+    if _APP126_REPLAY_CACHE is not None and not force: return _APP126_REPLAY_CACHE.copy()
+    h=_app126_grade_history(force=force)
+    if h is None or h.empty:
+        _APP126_REPLAY_CACHE=pd.DataFrame(); return pd.DataFrame()
+    h=h.sort_values("SavedAtDT",na_position="last").reset_index(drop=True)
+    rows=[]
+    for i,r in h.iterrows():
+        prior=h.iloc[:i].copy()
+        raw=safe_float(r.get("ProjectionNum"),np.nan); line=safe_float(r.get("LineNum"),np.nan); actual=safe_float(r.get("ActualNum"),np.nan); base_side=str(r.get("Side","")).upper()
+        if pd.isna(raw) or pd.isna(line) or pd.isna(actual) or base_side not in {"OVER","UNDER"}: continue
+        resid=_app126_weighted_residual(r,prior); sim=_app126_similarity_scores(r,prior)
+        cand=raw-safe_float(resid.get("correction"),0)
+        cand_side="OVER" if cand>line else "UNDER" if cand<line else base_side
+        # Chronological replay intentionally uses a slightly simpler flip gate so it
+        # does not call the aggregate replay recursively.
+        p50=_app126_first_num(r,["Final Resolved P50","MC Median"],raw); cp50=p50+(cand-raw); p50_side="OVER" if cp50>line else "UNDER" if cp50<line else base_side
+        minconf=_app126_first_num(r,["MinutesConfidenceNum","Elite Minutes V2 Confidence","Minutes Confidence"],60); role=_app126_first_num(r,["RoleSecurityNum","Elite Role Security"],60)
+        flip_ok=(cand_side==base_side) or (safe_float(resid.get("effective_samples"),0)>=12 and safe_float(resid.get("reliability"),0)>=55 and abs(cand-line)>=_app126_market_floor(r.get("Market")) and p50_side==cand_side and minconf>=60 and role>=58 and safe_float(sim.get("winner"),50)>=safe_float(sim.get("loss"),50))
+        final_side=cand_side if flip_ok else base_side
+        base_win=(actual>line and base_side=="OVER") or (actual<line and base_side=="UNDER")
+        cand_win=(actual>line and final_side=="OVER") or (actual<line and final_side=="UNDER")
+        rows.append({"SavedAt":r.get("SavedAt"),"Player":r.get("Player"),"Market":r.get("Market"),"Baseline Side":base_side,"Candidate Side":final_side,"Raw Projection":raw,"Candidate Projection":cand,"Line":line,"Actual":actual,"Baseline Win":bool(base_win),"Candidate Win":bool(cand_win),"Loss Rescued":bool((not base_win) and cand_win),"Win Broken":bool(base_win and (not cand_win)),"Win Preserved":bool(base_win and cand_win),"Correction":safe_float(resid.get("correction"),0),"Residual Samples":safe_float(resid.get("effective_samples"),0),"Raw Abs Error":abs(raw-actual),"Candidate Abs Error":abs(cand-actual)})
+    out=pd.DataFrame(rows)
+    try: out.to_csv(APP126_REPLAY_FILE,index=False)
+    except Exception: pass
+    _APP126_REPLAY_CACHE=out
+    return out.copy()
+
+
+def _app126_replay_summary(force: bool=False) -> pd.DataFrame:
+    r=_app126_replay_loss_rescue(force=force)
+    if r is None or r.empty: return pd.DataFrame()
+    rows=[]
+    for label,g in [("ALL",r)]+[(str(k),v) for k,v in r.groupby("Market")]:
+        n=len(g); rescued=int(g["Loss Rescued"].sum()); broken=int(g["Win Broken"].sum()); preserved=int(g["Win Preserved"].sum()); raw_mae=float(g["Raw Abs Error"].mean()); cand_mae=float(g["Candidate Abs Error"].mean()); net=rescued-1.25*broken
+        rows.append({"Market":label,"Replay N":n,"Losses Rescued":rescued,"Wins Broken":broken,"Wins Preserved":preserved,"Net Rescue Score":round(net,2),"Raw MAE":round(raw_mae,3),"Candidate MAE":round(cand_mae,3),"MAE Improvement":round(raw_mae-cand_mae,3)})
+    return pd.DataFrame(rows)
+
+
+def _app126_replay_market_meta(market: str) -> Dict[str,Any]:
+    s=_app126_replay_summary()
+    if s is None or s.empty: return {}
+    m=s[s["Market"].astype(str).str.upper().eq(str(market).upper())]
+    return m.iloc[0].to_dict() if not m.empty else {}
+
+
+def _app126_correction_promotion_gate(market: str, resid: Dict[str,Any], replay_meta: Dict[str,Any]) -> Tuple[bool,str]:
+    eff=safe_float(resid.get("effective_samples"),0); rel=safe_float(resid.get("reliability"),0)
+    n=safe_float(replay_meta.get("Replay N"),0); net=safe_float(replay_meta.get("Net Rescue Score"),0); mae=safe_float(replay_meta.get("MAE Improvement"),0)
+    if eff<8 or rel<42: return False,"residual sample/reliability too small"
+    if n>=20:
+        ok=net>0 and mae>=0
+        return ok,f"market replay n={int(n)}, net={net:+.2f}, MAE gain={mae:+.3f}"
+    # Before a market has enough replay rows, corrections can run only as a small
+    # shadow/stabilizer and may not flip sides.
+    return False,f"market replay waiting ({int(n)}/20)"
+
+
+# Preserve App125 resolver as an immutable control.
+def _attach_final_resolved_projection(board: pd.DataFrame) -> pd.DataFrame:
+    base=_attach_final_resolved_projection_app125_control(board)
+    if base is None or base.empty: return base
+    history=_app126_grade_history(); rows=[]
+    for _,rr in base.iterrows():
+        r=rr.copy(); market=str(r.get("Market","")).upper(); raw=safe_float(r.get("Final Resolved Projection"),np.nan); line=safe_float(r.get("Line"),np.nan); raw_side=str(r.get("Final Resolved Side","PASS")).upper(); raw_p50=safe_float(r.get("Final Resolved P50"),raw)
+        resid=_app126_weighted_residual(r,history); sim=_app126_similarity_scores(r,history); replay_meta=_app126_replay_market_meta(market); promote,promote_note=_app126_correction_promotion_gate(market,resid,replay_meta)
+        correction=safe_float(resid.get("correction"),0.0); shadow=raw-correction if pd.notna(raw) else raw; corrected=raw; applied=False; flip_approved=False; flip_note=""
+        if promote and pd.notna(raw) and abs(correction)>=0.05:
+            raw_mean_side="OVER" if raw>line else "UNDER" if raw<line else "PUSH" if pd.notna(line) else "PASS"; shadow_side="OVER" if shadow>line else "UNDER" if shadow<line else "PUSH" if pd.notna(line) else "PASS"
+            if shadow_side!=raw_mean_side and shadow_side in {"OVER","UNDER"}:
+                flip_approved,flip_note=_app126_side_flip_gate(r,raw,shadow,resid,sim,replay_meta)
+                if flip_approved: corrected=shadow; applied=True
+            else:
+                corrected=shadow; applied=True; flip_note="same-side residual stabilization"
+        else:
+            flip_note=promote_note
+        # If the shadow crosses the line but the flip is not approved, preserve the
+        # raw authority and quarantine the play as TRACK rather than forcing either side.
+        side_conflict=False
+        if pd.notna(line) and pd.notna(shadow) and raw_side in {"OVER","UNDER"}:
+            shadow_side="OVER" if shadow>line else "UNDER" if shadow<line else "PUSH"
+            side_conflict=shadow_side in {"OVER","UNDER"} and shadow_side!=raw_side and not flip_approved
+        proj=corrected
+        if applied and pd.notna(line):
+            sd=_app126_default_sd(market)
+            # Prefer observed distribution width when available.
+            p25=_app126_first_num(r,["MC P25","Elite P25"]); p75=_app126_first_num(r,["MC P75","Elite P75"])
+            if pd.notna(p25) and pd.notna(p75) and p75>p25: sd=max(.65,(p75-p25)/1.349)
+            over=_normal_over_probability(line,proj,sd); under=100-over; p50=raw_p50+(proj-raw) if pd.notna(raw_p50) else proj
+            side="OVER" if proj>line else "UNDER" if proj<line else "PASS"; edge=proj-line
+            r["Final Resolved Projection"]=round(proj,2); r["Final Resolved Edge"]=round(edge,2); r["Final Resolved Side"]=side; r["Final Resolved Mean Side"]=side; r["Final Resolved P50"]=round(p50,2); r["Final Resolved Median Side"]="OVER" if p50>line else "UNDER" if p50<line else "PUSH"; r["Final Mean P50 Agreement"]=bool(r["Final Resolved Median Side"]==side); r["Final Resolved Over %"]=round(float(np.clip(over,12,88)),1); r["Final Resolved Under %"]=round(100-r["Final Resolved Over %"],1); r["Final Projection Source"]=str(r.get("Final Projection Source","FINAL"))+"+APP126_RESIDUAL_CORRECTED"; r["Final Resolver Version"]="APP126_LOSS_RESCUE_RESIDUAL_V1"
+        if side_conflict:
+            r["Final Recommendation State"]="TRACK"
+        r["App126 Raw App125 Projection"]=round(raw,3) if pd.notna(raw) else np.nan; r["App126 Shadow Corrected Projection"]=round(shadow,3) if pd.notna(shadow) else np.nan; r["App126 Residual Correction"]=round(correction,3); r["App126 Residual Raw Bias"]=round(safe_float(resid.get("raw_bias"),0),3); r["App126 Residual Samples"]=int(resid.get("samples",0)); r["App126 Residual Effective Samples"]=round(safe_float(resid.get("effective_samples"),0),2); r["App126 Residual Reliability"]=round(safe_float(resid.get("reliability"),0),1); r["App126 Residual Note"]=str(resid.get("note","")); r["App126 Correction Promotion Gate"]=bool(promote); r["App126 Correction Promotion Note"]=promote_note; r["App126 Correction Applied"]=bool(applied); r["App126 Side Flip Approved"]=bool(flip_approved); r["App126 Side Flip Note"]=flip_note; r["App126 Side Conflict Shadow"]=bool(side_conflict); r["App126 Winner Similarity"]=round(safe_float(sim.get("winner"),50),1); r["App126 Loss Similarity"]=round(safe_float(sim.get("loss"),50),1); r["App126 Similarity Samples"]=int(sim.get("samples",0)); r["App126 Market Side Reliability %"]=round(100*safe_float(sim.get("market_side_wr"),.50),1); r["App126 Market Side Samples"]=int(sim.get("market_side_n",0)); r["App126 Replay Net Rescue"]=safe_float(replay_meta.get("Net Rescue Score"),np.nan); r["App126 Replay MAE Improvement"]=safe_float(replay_meta.get("MAE Improvement"),np.nan); rows.append(r)
+    return pd.DataFrame(rows)
+
+
 def _attach_final_calibration_context(board: pd.DataFrame) -> pd.DataFrame:
     if board is None or board.empty: return board
     out=board.copy(); grades=_graded_result_rows(); final_grades=pd.DataFrame()
@@ -18056,7 +18463,7 @@ def _attach_final_calibration_context(board: pd.DataFrame) -> pd.DataFrame:
 
 _elite_rank_board_app120 = _app120_elite_rank_board
 _elite_rank_board_app120 = _app120_elite_rank_board
-def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
+def _elite_rank_board_app125_control(board: pd.DataFrame) -> pd.DataFrame:
     if board is None or board.empty:
         return board
     x=board.copy()
@@ -18148,15 +18555,92 @@ def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
     for mk,idxs in ranked[valid].groupby("Market").groups.items():
         ids=sorted(list(idxs),key=lambda i:safe_float(ranked.at[i,"Elite Rank Score"],0),reverse=True)
         for mr,i in enumerate(ids,start=1): ranked.at[i,"Elite Market Rank"]=mr
-    ranked["Elite Rank Authority"]="FINAL_RESOLVED_PROJECTION_APP125_STABILITY"
+    ranked["Elite Rank Authority"]="APP126_LOSS_RESCUE_RELIABILITY"
     return ranked.sort_values(["Elite Rank","Elite Rank Score"],ascending=[True,False],na_position="last")
+
+# Preserve App125 ranking as a control and apply App126 loss-aware authority after it.
+def _app126_confirmation_support(row: pd.Series) -> Tuple[int,int,str]:
+    market=str(row.get("Market","")).upper(); side=str(row.get("Final Resolved Side",row.get("Elite Side",""))).upper(); line=safe_float(row.get("Line"),np.nan); proj=safe_float(row.get("Final Resolved Projection"),np.nan)
+    p50=safe_float(row.get("Final Resolved P50"),proj); agreement=safe_float(row.get("Elite Agreement Score"),55); minconf=_app126_first_num(row,["Elite Minutes V2 Confidence","Minutes Confidence","Final Projection Confidence"],60); role=safe_float(row.get("Elite Role Security"),60); spread=_app126_first_num(row,["Elite PTS Model Spread","Elite AST V2 Spread"],2.5); loss=safe_float(row.get("App126 Loss Similarity"),50); winner=safe_float(row.get("App126 Winner Similarity"),50); mswr=safe_float(row.get("App126 Market Side Reliability %"),50); msn=int(safe_float(row.get("App126 Market Side Samples"),0)); flags=str(row.get("Elite Flags","")).upper()
+    supports=[]
+    supports.append(("mean",side in {"OVER","UNDER"} and pd.notna(proj) and pd.notna(line) and ((proj>line)==(side=="OVER"))))
+    supports.append(("P50",pd.notna(p50) and pd.notna(line) and ((p50>line)==(side=="OVER"))))
+    supports.append(("agreement",agreement>=58))
+    supports.append(("minutes",minconf>=63))
+    supports.append(("role",role>=62))
+    supports.append(("model spread",spread<={"PTS":4.0,"PRA":4.5,"AST":1.8,"REB":2.5}.get(market,4.0)))
+    supports.append(("historical similarity",winner>=loss))
+    supports.append(("team/data",not any(x in flags for x in ["TEAM_TOTAL_CONFLICT","CRITICAL_STALE_DATA","FALLBACK_TEAM_DATA","ROLE_UNCERTAINTY"])))
+    count=sum(1 for _,v in supports if v)
+    required=5 if market in {"PTS","PRA"} else 4
+    # Cold historical market-side buckets automatically demand one more independent
+    # confirmation. This is learned, not a permanent OVER/UNDER rule.
+    if msn>=12 and mswr<50: required+=1
+    # Historically hot buckets never reduce below the base safety requirement.
+    return count,required,", ".join(k for k,v in supports if not v)
+
+
+def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
+    ranked=_elite_rank_board_app125_control(board)
+    if ranked is None or ranked.empty: return ranked
+    rows=[]
+    floors={"PTS":.75,"REB":.45,"AST":.40,"PRA":1.10}
+    for _,rr in ranked.iterrows():
+        r=rr.copy(); market=str(r.get("Market","")).upper(); side=str(r.get("Final Resolved Side",r.get("Elite Side",""))).upper(); prob=safe_float(r.get("Elite Calibrated Probability %"),safe_float(r.get("Final Resolved Over %") if side=="OVER" else r.get("Final Resolved Under %"),50)); agreement=safe_float(r.get("Elite Agreement Score"),55); quality=str(r.get("Elite Data Quality","LOW")).upper(); data_score={"HIGH":96,"MEDIUM":78,"LOW":52}.get(quality,60); minconf=_app126_first_num(r,["Elite Minutes V2 Confidence","Minutes Confidence","Final Projection Confidence"],60); role=safe_float(r.get("Elite Role Security"),60); rolefit=safe_float(r.get("Elite Market Role Fit"),60); edge=abs(safe_float(r.get("Final Resolved Edge",r.get("Elite Edge")),0)); loss=safe_float(r.get("App126 Loss Similarity"),50); winner=safe_float(r.get("App126 Winner Similarity"),50); residual_rel=safe_float(r.get("App126 Residual Reliability"),0); msn=int(safe_float(r.get("App126 Market Side Samples"),0)); mswr=safe_float(r.get("App126 Market Side Reliability %"),50)
+        prob_score=float(np.clip((prob-50)/20*100,0,100)); hist_score=mswr if msn>=8 else 55.; edge_ratio=edge/max(floors.get(market,.5),.05); edge_score=float(np.clip(35+35*(1-math.exp(-max(0.,edge_ratio-.65)/1.2)),0,78)) if edge>0 else 0.; residual_score=float(np.clip(.55*(100-loss)+.45*winner,0,100)) if residual_rel>=30 else 55.
+        base_score=.23*prob_score+.13*agreement+.12*data_score+.11*minconf+.10*hist_score+.08*edge_score+.08*role+.08*rolefit+.07*residual_score
+        # Preserve real risk penalties from prior layers; they are more informative
+        # than raw score, but avoid counting the entire App125 score twice.
+        penalty=.55*safe_float(r.get("Elite Risk Penalty"),0)+.55*safe_float(r.get("Elite App125 Stability Penalty"),0)+safe_float(r.get("Elite App125 Same Player Penalty"),0)+safe_float(r.get("Elite Team Stack Penalty"),0)
+        reasons=[]
+        if loss>=62 and loss>=winner+8: penalty+=8; reasons.append("historical loss similarity -8")
+        elif winner>=62 and winner>=loss+8: base_score+=2.5; reasons.append("winner similarity +2.5")
+        if bool(r.get("App126 Side Conflict Shadow",False)): penalty+=18; reasons.append("residual side conflict -18")
+        support_n,support_req,support_missing=_app126_confirmation_support(r)
+        if market in {"PTS","PRA"} and support_n<support_req:
+            penalty+=10+2*(support_req-support_n); reasons.append(f"{market} confirmation {support_n}/{support_req} -{10+2*(support_req-support_n)}")
+        # A cold market-side bucket adds caution to the ranking, not a forced side flip.
+        if msn>=12 and mswr<48: penalty+=5; reasons.append(f"cold {market}/{side} history -5")
+        if safe_float(r.get("App126 Replay Net Rescue"),0)<0: penalty+=4; reasons.append("market loss-rescue replay negative -4")
+        final=float(np.clip(base_score-penalty,0,100))
+        r["Elite App126 Base Reliability Score"]=round(base_score,2); r["Elite App126 Loss Aware Penalty"]=round(penalty,2); r["Elite App126 Confirmation Count"]=support_n; r["Elite App126 Confirmation Required"]=support_req; r["Elite App126 Confirmation Missing"]=support_missing; r["Elite Rank Score"]=round(final,2); r["Elite Rank Note"]=str(r.get("Elite Rank Note","")+" | APP126 "+" | ".join(reasons)).strip(" |"); rows.append(r)
+    out=pd.DataFrame(rows)
+    # Strong one-primary-prop-per-player diversification. Second/third markets can
+    # still rank, but must be materially better to overcome the exposure penalty.
+    if "NameKey" not in out.columns: out["NameKey"]=out.get("Player",pd.Series("",index=out.index)).map(normalize_name)
+    extra=pd.Series(0.0,index=out.index)
+    for nk,idxs in out.groupby("NameKey").groups.items():
+        ids=sorted(list(idxs),key=lambda i:safe_float(out.at[i,"Elite Rank Score"],0),reverse=True)
+        for order,i in enumerate(ids[1:],start=1): extra.at[i]=min(20.,6.+6.*order)
+    out["Elite App126 Same Player Exposure Penalty"]=extra
+    out["Elite Rank Score"]=(pd.to_numeric(out["Elite Rank Score"],errors="coerce").fillna(0)-extra).clip(0,100).round(2)
+    # Status is rebuilt from App126 score and confirmation rather than inheriting a
+    # rank that may have been valid before the loss-aware correction.
+    def status(r):
+        side=str(r.get("Final Resolved Side","")).upper(); sc=safe_float(r.get("Elite Rank Score"),0); p=safe_float(r.get("Elite Calibrated Probability %"),0); ready=str(r.get("Projection Readiness","READY")).upper(); rec=str(r.get("Final Recommendation State","TRACK")).upper(); count=int(safe_float(r.get("Elite App126 Confirmation Count"),0)); req=int(safe_float(r.get("Elite App126 Confirmation Required"),0)); edge=abs(safe_float(r.get("Final Resolved Edge"),0)); floor=floors.get(str(r.get("Market","")).upper(),.5)
+        if side not in {"OVER","UNDER"} or ready in {"BLOCK","WAIT"} or rec in {"BLOCK","WAIT"} or bool(r.get("App126 Side Conflict Shadow",False)): return "TRACK"
+        if count<req: return "TRACK" if sc<64 else "LEAN"
+        if sc>=84 and p>=61 and edge>=1.35*floor: return "ELITE"
+        if sc>=76 and p>=59 and edge>=floor: return "STRONG"
+        if sc>=68 and p>=57: return "PLAYABLE"
+        if sc>=59 and p>=54.5 and edge>=.80*floor: return "LEAN"
+        return "TRACK"
+    out["Elite Status"]=out.apply(status,axis=1)
+    line_s=pd.to_numeric(out.get("Line"),errors="coerce"); proj_s=pd.to_numeric(out.get("Final Resolved Projection"),errors="coerce"); valid=line_s.notna()&proj_s.notna(); valid&=out.get("Final Resolved Side",pd.Series("",index=out.index)).astype(str).str.upper().isin(["OVER","UNDER"]); valid&=out["Elite Status"].isin(["ELITE","STRONG","PLAYABLE","LEAN"]); valid&=~out.get("Projection Readiness",pd.Series("READY",index=out.index)).astype(str).str.upper().isin(["BLOCK","WAIT"]); valid&=~out.get("Final Recommendation State",pd.Series("TRACK",index=out.index)).astype(str).str.upper().isin(["BLOCK","WAIT"])
+    order=out[valid].sort_values(["Elite Rank Score","Elite Calibrated Probability %","App126 Winner Similarity" if "App126 Winner Similarity" in out.columns else "Elite Stability Score"],ascending=[False,False,False]).index.tolist(); rank_map={idx:rank for rank,idx in enumerate(order[:ELITE_MAX_RANK],start=1)}; out["Elite Rank"]=[rank_map.get(i,np.nan) for i in out.index]; out["Elite Best Play"]=[f"#{int(rank_map[i])} {out.at[i,'Final Resolved Side']}" if i in rank_map else "UNRANKED" for i in out.index]; out["Elite Market Rank"]=np.nan
+    for mk,idxs in out[valid].groupby("Market").groups.items():
+        ids=sorted(list(idxs),key=lambda i:safe_float(out.at[i,"Elite Rank Score"],0),reverse=True)
+        for mr,i in enumerate(ids,start=1): out.at[i,"Elite Market Rank"]=mr
+    out["Elite Rank Authority"]="APP126_LOSS_RESCUE_RELIABILITY"
+    return out.sort_values(["Elite Rank","Elite Rank Score"],ascending=[True,False],na_position="last")
+
 
 def _promote_final_authority(board: pd.DataFrame) -> pd.DataFrame:
     if board is None or board.empty or "Final Resolved Projection" not in board.columns: return board
     out=board.copy(); out["Projection"]=pd.to_numeric(out["Final Resolved Projection"],errors="coerce"); out["Edge"]=pd.to_numeric(out.get("Final Resolved Edge"),errors="coerce"); out["Lean"]=out.get("Final Resolved Side",out.get("Lean","PASS")); out["Over %"]=pd.to_numeric(out.get("Final Resolved Over %"),errors="coerce"); out["Under %"]=pd.to_numeric(out.get("Final Resolved Under %"),errors="coerce")
     status=out.get("Elite Status",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); side=out.get("Final Resolved Side",pd.Series("PASS",index=out.index)).astype(str).str.upper(); rank=pd.to_numeric(out.get("Elite Rank"),errors="coerce"); rec=status.isin(["ELITE","STRONG","PLAYABLE","LEAN"])&side.isin(["OVER","UNDER"])&rank.notna(); rec_state=out.get("Final Recommendation State",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); readiness=out.get("Projection Readiness",pd.Series("READY",index=out.index)).astype(str).str.upper(); valid=pd.to_numeric(out.get("Line"),errors="coerce").notna()&pd.to_numeric(out.get("Projection"),errors="coerce").notna()
     fallback=np.where(~valid,"PASS",np.where(rec_state.eq("BLOCK")|readiness.eq("BLOCK"),"BLOCK",np.where(rec_state.eq("WAIT")|readiness.eq("WAIT"),"WAIT","TRACK")))
-    out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),fallback); out["Recommendation State"]=np.where(rec,status,fallback); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP125_MINUTES_ROLE_AST_CHALLENGER"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY_APP125"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
+    out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),fallback); out["Recommendation State"]=np.where(rec,status,fallback); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP126_LOSS_RESCUE_FORENSICS"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY_APP126"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
 
 
 def build_copy_paste_slate(df: pd.DataFrame, best_only: bool=False, max_rows: int=0) -> str:
@@ -18230,7 +18714,7 @@ def dataset_status_table():
     return pd.DataFrame(rows)
 
 def make_projection_board(lines, logs, base, mode: Optional[str] = None):
-    """App125 minutes/role/AST authority; Underdog pull/parser remains unchanged."""
+    """App126 loss-rescue authority; Underdog pull/parser remains unchanged."""
     active_mode=mode or "Today"
     board=_build_live_projection_inputs(lines,base,active_mode); board=_strict_attach_opponent_context(board,active_mode); board=_strict_market_isolated_rebuild(board,base); board=_stable_attach_context_audit_only(board,base); board=_strong_trust_enrich_board(board,active_mode); board=_apply_full_winning_play_stack(board,base,active_mode)
     if board is not None and not board.empty:
@@ -18613,7 +19097,30 @@ with tabs[7]:
         with st.expander("Raw graded learning data", expanded=False):
             st.dataframe(learn_raw.tail(500), use_container_width=True)
 
-    st.markdown("### 4) Automated Historical Backtest")
+    st.markdown("### 4) App126 Loss Rescue / Projection Forensics")
+    st.caption("Uses only completed prior Final-Resolved grades. Shows which losses were predictable, whether residual corrections rescue more losses than wins they break, and why losses happened. Projection corrections remain replay-gated and sample-shrunk.")
+    try:
+        _lr_summary=_app126_replay_summary()
+        _lr_ledger=_app126_build_loss_ledger()
+        if _lr_summary is None or _lr_summary.empty:
+            st.info("Loss Rescue is waiting for enough completed Final-Resolved grades.")
+        else:
+            st.dataframe(_lr_summary,use_container_width=True,hide_index=True)
+            st.download_button("Download App126 loss-rescue replay CSV",_app126_replay_loss_rescue().to_csv(index=False),"wnba_app126_loss_rescue_replay.csv","text/csv")
+        if _lr_ledger is not None and not _lr_ledger.empty:
+            _losses=_lr_ledger[_lr_ledger.get("ResultKey",pd.Series("",index=_lr_ledger.index)).astype(str).str.contains("LOSS",na=False)].copy()
+            if not _losses.empty:
+                _reason=_losses.groupby("App126 Loss Primary Reason",dropna=False).size().reset_index(name="Losses").sort_values("Losses",ascending=False)
+                st.markdown("#### Loss reason distribution")
+                st.dataframe(_reason,use_container_width=True,hide_index=True)
+                _cols=[c for c in ["SavedAt","Player","Market","Side","LineNum","ProjectionNum","ActualNum","ProjectionErrorNum","ProjMinutes","ActualMinutes","MinutesErrorNum","ActualFGA","ActualFTA","App126 Loss Primary Reason","App126 Loss Reason Tags"] if c in _losses.columns]
+                with st.expander("Exact App126 loss ledger",expanded=False):
+                    st.dataframe(_losses[_cols].tail(400),use_container_width=True,hide_index=True)
+                    st.download_button("Download App126 loss ledger CSV",_lr_ledger.to_csv(index=False),"wnba_app126_loss_ledger.csv","text/csv")
+    except Exception as _app126_ui_exc:
+        st.warning(f"App126 Loss Rescue report unavailable: {_app126_ui_exc}")
+
+    st.markdown("### 5) Automated Historical Backtest")
     st.caption("Backtests the projection formula on historical logs using a prior-games-only line proxy. This validates model direction/calibration without claiming it had real sportsbook historical lines.")
     min_prior = st.slider("Minimum prior games before testing", 3, 15, 5)
     if st.button("Run historical backtest", use_container_width=True):
