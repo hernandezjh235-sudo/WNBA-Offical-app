@@ -19,6 +19,13 @@ Line-source build:
 # - Applies Bayesian/shrunk market-specific residual correction only when historical replay shows positive net rescue and improved MAE.
 # - Side flips require stronger evidence than mean correction alone; unapproved conflicts are TRACK, not forced picks.
 # - Adds Winner Similarity / Loss Similarity, market-side reliability, and residual reliability to the Elite #1-#200 ranking.
+# APP127 RANK SELECTION STABILITY
+# - Preserves App126 projection/residual authority; changes Best Slate selection/ranking only.
+# - Adds recent player-market volatility, edge-to-volatility strength, prior-line hit support, and independent-family breadth.
+# - Penalizes fragile UNDERs on high-minute/high-role accumulators and ceiling-dependent AST/PTS OVERs.
+# - Adds AST team-creation-share concentration checks so one inflated creator assumption cannot dominate Best Slate.
+# - Adds historical rank-band reliability only with sufficient prior Final-Resolved samples.
+# - Best Slate ranks only candidates passing the App127 pregame selection gate; rejected candidates remain on the full board.
 # - PTS/PRA confirmation gates become stricter automatically for historically cold market-side buckets; no hard-coded permanent OVER/UNDER preference.
 # - Saves actual MIN/FGA/FTA/3PA/FGM/FTM/PTS/REB/AST/PRA into graded records for postgame diagnosis.
 # - Adds Loss Rescue Lab to Model Reports with Losses Rescued, Wins Broken, Net Rescue, and MAE delta.
@@ -130,7 +137,7 @@ from wnba_hhs.evaluation import (
 from wnba_hhs.schema import DATASET_KEYS
 from wnba_hhs.snapshots import ProjectionSnapshotStore
 
-APP_VERSION = "WNBA v4.9.0 - App126 Loss Rescue Projection Forensics"
+APP_VERSION = "WNBA v5.0.0 - App127 Best Slate Selection Stability"
 LINE_PARSER_VERSION = "UD_BASE_CARD_MAINLINE_V5"
 MONEYLINE_FEED_VERSION = "V367_UNDERDOG_GAME_SLATE_ELITE_INJURY_FRESHNESS"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
@@ -11092,7 +11099,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v4.9.0 - App126 Loss Rescue Projection Forensics"
+APP_VERSION = "WNBA v5.0.0 - App127 Best Slate Selection Stability"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -12633,7 +12640,7 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v4.9.0 - App126 Loss Rescue Projection Forensics"
+APP_VERSION = "WNBA v5.0.0 - App127 Best Slate Selection Stability"
 PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = "LEGACY LOCKED: season-isolated Bayesian baseline + bounded minutes/matchup. PTS V2 is a separate challenger and never overwrites legacy Projection."
 PTS_V2_ENGINE_VERSION = "PTS_V2_TEAM_CONSTRAINED_CHALLENGER_V1"
@@ -13865,7 +13872,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v4.9.0 - App126 Loss Rescue Projection Forensics"
+APP_VERSION = "WNBA v5.0.0 - App127 Best Slate Selection Stability"
 PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = (
     "LEGACY LOCKED for A/B testing. Current-season inputs are isolated; prior seasons live only in explicit *_prior fields. "
@@ -17662,7 +17669,15 @@ def render_elite_rank_card(row: pd.Series) -> None:
     if pd.notna(reb_share): share_bits.append(f"REB share {reb_share:.1f}%")
     if pd.notna(ast_share): share_bits.append(f"AST share {ast_share:.1f}%")
     shares = html.escape(" | ".join(share_bits))
-    flags = html.escape(str(row.get("Elite Flags", "") or "None"))
+    raw_flags=row.get("Elite Flags","")
+    flags_txt="None" if pd.isna(raw_flags) or str(raw_flags).strip().lower() in {"","nan","none"} else str(raw_flags)
+    flags = html.escape(flags_txt)
+    q=bool(row.get("App127 Best Slate Qualified",False)); ev=safe_float(row.get("App127 Edge To Volatility"),np.nan); hit=safe_float(row.get("App127 Prior Line Hit Shrunk %"),np.nan); fa=int(safe_float(row.get("App127 Independent Family Agree"),0)); fn=int(safe_float(row.get("App127 Independent Family N"),0)); gate=html.escape(str(row.get("App127 Best Slate Gate Reason","") or ""))
+    app127_bits=["BEST SLATE PASS" if q else "BEST SLATE FILTERED"]
+    if pd.notna(ev): app127_bits.append(f"edge/SD {ev:.2f}")
+    if pd.notna(hit): app127_bits.append(f"prior-line {hit:.0f}%")
+    if fn: app127_bits.append(f"families {fa}/{fn}")
+    app127_diag=html.escape(" | ".join(app127_bits))
     st.markdown(
         f"""<div style='border:1px solid rgba(168,85,247,.42);border-radius:16px;padding:12px 14px;margin:9px 0;background:rgba(15,10,30,.88)'>
         <div style='display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap'><b style='font-size:1.05rem;color:#f8fafc'>{rank_txt} {player} | {market}</b><b style='color:#facc15'>{status} | {score:.1f}</b></div>
@@ -17670,6 +17685,8 @@ def render_elite_rank_card(row: pd.Series) -> None:
         <div style='margin-top:5px;color:#94a3b8;font-size:.78rem'>{html.escape(roles)}</div>
         <div style='margin-top:4px;color:#a78bfa;font-size:.74rem'>{role_summary}</div>
         <div style='margin-top:4px;color:#67e8f9;font-size:.72rem'>{shares}</div>
+        <div style='margin-top:5px;color:#86efac;font-size:.72rem'>{app127_diag}</div>
+        <div style='margin-top:4px;color:#fbbf24;font-size:.70rem'>{gate if not q else ''}</div>
         <div style='margin-top:5px;color:#fca5a5;font-size:.72rem'>{flags}</div></div>""",
         unsafe_allow_html=True,
     )
@@ -17678,12 +17695,12 @@ def render_elite_rank_card(row: pd.Series) -> None:
 # ============================================================
 # App 122 — POST-GRADE FINAL AUTHORITY / LIVE CONTEXT / RETURN-ROLE SCENARIOS
 # ============================================================
-APP_VERSION = "WNBA v4.9.0 - App126 Loss Rescue Projection Forensics"
+APP_VERSION = "WNBA v5.0.0 - App127 Best Slate Selection Stability"
 LEGACY_PROJECTION_ENGINE_VERSION = PROJECTION_ENGINE_VERSION
-PROJECTION_ENGINE_VERSION = "APP126_LOSS_RESCUE_FORENSICS"
+PROJECTION_ENGINE_VERSION = "APP127_APP126_PROJECTION_RANK_SELECTION"
 PROJECTION_ENGINE_NOTE = "App125 authority: App124 PTS/PRA preserved; Minutes/Rotation V2 + empirical with/without role effects; AST V2 stable-blend production; REB V2 challenger only; rank learning from prior final-authority grades."
-ELITE_ENGINE_VERSION = "ELITE_ROLE_BUDGET_V7_APP125"
-FINAL_RESOLVER_VERSION = "FINAL_RESOLVER_V4_APP125"
+ELITE_ENGINE_VERSION = "ELITE_BEST_SLATE_V8_APP127"
+FINAL_RESOLVER_VERSION = "FINAL_RESOLVER_V5_APP126_PRESERVED"
 INJURY_SCENARIO_VERSION = "CANONICAL_RETURN_ROLE_SCENARIO_V4_APP125"
 LIVE_TEAM_CONTEXT_VERSION = "LIVE_TEAM_CONTEXT_FROM_PLAYER_LOGS_V4_APP125"
 
@@ -18580,7 +18597,7 @@ def _app126_confirmation_support(row: pd.Series) -> Tuple[int,int,str]:
     return count,required,", ".join(k for k,v in supports if not v)
 
 
-def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
+def _elite_rank_board_app126_control(board: pd.DataFrame) -> pd.DataFrame:
     ranked=_elite_rank_board_app125_control(board)
     if ranked is None or ranked.empty: return ranked
     rows=[]
@@ -18635,12 +18652,207 @@ def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["Elite Rank","Elite Rank Score"],ascending=[True,False],na_position="last")
 
 
+# ============================================================
+# APP127 — BEST SLATE SELECTION STABILITY
+# Projection means/sides remain App126 authority. This layer only decides which
+# projections deserve scarce Top-1/Top-20 Best Slate placement.
+# ============================================================
+_APP127_PROFILE_CACHE: Dict[Tuple[str,str,float,str], Dict[str,Any]] = {}
+_APP127_RANK_HISTORY_CACHE = None
+
+
+def _app127_recent_market_profile(row: pd.Series) -> Dict[str,Any]:
+    """Pregame-only recent outcome profile for the player's current market/line.
+
+    Uses already-completed current-season player logs. The current sportsbook line
+    is used only as a threshold against PRIOR games; no current-game outcome enters.
+    """
+    player=normalize_name(row.get("NameKey") or row.get("Player")); market=str(row.get("Market","")).upper(); line=safe_float(row.get("Line"),np.nan); side=str(row.get("Final Resolved Side",row.get("Elite Side",""))).upper()
+    key=(player,market,round(float(line),2) if pd.notna(line) else -999.0,side)
+    if key in _APP127_PROFILE_CACHE: return dict(_APP127_PROFILE_CACHE[key])
+    neutral={"n":0,"mean":np.nan,"median":np.nan,"sd":np.nan,"robust_sd":np.nan,"q25":np.nan,"q75":np.nan,"q90":np.nan,"side_hit_rate":np.nan,"side_hit_shrunk":.50,"minutes_mean":np.nan,"minutes_sd":np.nan,"note":"no recent player-market sample"}
+    logs=_app125_latest_player_logs()
+    if logs is None or logs.empty or not player or market not in {"PTS","REB","AST","PRA"}:
+        _APP127_PROFILE_CACHE[key]=neutral; return dict(neutral)
+    d=logs[logs["NameKey"].eq(player)].sort_values("GameDate").tail(12).copy()
+    if d.empty:
+        _APP127_PROFILE_CACHE[key]=neutral; return dict(neutral)
+    if market=="PRA":
+        vals=pd.to_numeric(d.get("PTS",pd.Series(np.nan,index=d.index)),errors="coerce")+pd.to_numeric(d.get("REB",pd.Series(np.nan,index=d.index)),errors="coerce")+pd.to_numeric(d.get("AST",pd.Series(np.nan,index=d.index)),errors="coerce")
+    else:
+        vals=pd.to_numeric(d.get(market,pd.Series(np.nan,index=d.index)),errors="coerce")
+    vals=vals.dropna().astype(float)
+    if vals.empty:
+        _APP127_PROFILE_CACHE[key]=neutral; return dict(neutral)
+    n=len(vals); mean=float(vals.mean()); med=float(vals.median()); sd=float(vals.std(ddof=0)) if n>=3 else _app126_default_sd(market)
+    q25=float(vals.quantile(.25)); q75=float(vals.quantile(.75)); q90=float(vals.quantile(.90)); iqr=max(0.0,q75-q25)
+    robust=max(.35,sd,iqr/1.349 if iqr>0 else 0.0,{"PTS":2.5,"REB":1.25,"AST":1.0,"PRA":3.25}.get(market,1.5))
+    if pd.notna(line) and side in {"OVER","UNDER"}:
+        wins=int((vals>line).sum()) if side=="OVER" else int((vals<line).sum())
+        hit=wins/n
+        # Beta(3,3) shrinkage keeps five-game streaks from overpowering the model.
+        shr=(wins+3.0)/(n+6.0)
+    else:
+        hit=np.nan; shr=.50
+    mins=pd.to_numeric(d.get("MIN"),errors="coerce").dropna() if "MIN" in d.columns else pd.Series(dtype=float)
+    out={"n":int(n),"mean":mean,"median":med,"sd":sd,"robust_sd":robust,"q25":q25,"q75":q75,"q90":q90,"side_hit_rate":float(hit) if pd.notna(hit) else np.nan,"side_hit_shrunk":float(shr),"minutes_mean":float(mins.mean()) if len(mins) else np.nan,"minutes_sd":float(mins.std(ddof=0)) if len(mins)>=3 else np.nan,"note":f"last {n} completed current-season games"}
+    _APP127_PROFILE_CACHE[key]=out
+    return dict(out)
+
+
+def _app127_independent_family_support(row: pd.Series) -> Dict[str,Any]:
+    """Count genuinely different directional families that support the final side."""
+    side=str(row.get("Final Resolved Side",row.get("Elite Side",""))).upper(); market=str(row.get("Market","")).upper(); line=safe_float(row.get("Line"),np.nan)
+    votes=[]
+    for name,col in [("LEGACY","Lean"),("HHS","HHS Direction"),("MC","MC Side")]:
+        txt=str(row.get(col,"") or "").upper()
+        v="OVER" if "OVER" in txt else "UNDER" if "UNDER" in txt else ""
+        if v: votes.append((name,v))
+    if market in {"PTS","PRA"}:
+        txt=str(row.get("PTS V2 Side","") or "").upper(); v="OVER" if "OVER" in txt else "UNDER" if "UNDER" in txt else ""
+        if v: votes.append(("PTS_V2",v))
+    if market=="AST" and bool(row.get("Elite AST V2 Stable",False)) and pd.notna(line):
+        vproj=safe_float(row.get("Elite AST V2 Projection"),np.nan)
+        if pd.notna(vproj) and vproj!=line: votes.append(("AST_V2","OVER" if vproj>line else "UNDER"))
+    if market=="REB" and bool(row.get("Elite REB V2 Stable",False)) and pd.notna(line):
+        vproj=safe_float(row.get("Elite REB V2 Challenger"),np.nan)
+        if pd.notna(vproj) and vproj!=line: votes.append(("REB_V2","OVER" if vproj>line else "UNDER"))
+    n=len(votes); agree=sum(1 for _,v in votes if v==side); disagree=n-agree
+    score=100.0*agree/max(1,n) if n else 50.0
+    return {"n":n,"agree":agree,"disagree":disagree,"score":score,"votes":" | ".join(f"{k}:{v}" for k,v in votes) or "no independent family votes"}
+
+
+def _app127_rank_history_meta(row: pd.Series) -> Dict[str,Any]:
+    """Leakage-safe prior Best-Slate/rank-band reliability with Bayesian shrinkage."""
+    global _APP127_RANK_HISTORY_CACHE
+    if _APP127_RANK_HISTORY_CACHE is None:
+        h=_app126_grade_history()
+        if h is None or h.empty:
+            _APP127_RANK_HISTORY_CACHE=pd.DataFrame()
+        else:
+            z=h.copy()
+            rank_col=next((c for c in ["Saved Elite Rank","Elite Rank","SavedEliteRank"] if c in z.columns),None)
+            if rank_col:
+                z["_rank127"]=pd.to_numeric(z[rank_col],errors="coerce")
+                z=z[z["_rank127"].notna()&z["_rank127"].between(1,200)].copy()
+            else:
+                z=pd.DataFrame()
+            _APP127_RANK_HISTORY_CACHE=z
+    h=_APP127_RANK_HISTORY_CACHE
+    if h is None or h.empty: return {"n":0,"raw_wr":np.nan,"shrunk_wr":.50,"bucket":"NO_HISTORY"}
+    current_rank=safe_float(row.get("Elite Rank"),np.nan); market=str(row.get("Market","")).upper(); side=str(row.get("Final Resolved Side","")).upper()
+    if pd.isna(current_rank): lo,hi=1,20
+    else: lo,hi=(1,5) if current_rank<=5 else (6,10) if current_rank<=10 else (11,20) if current_rank<=20 else (21,50) if current_rank<=50 else (51,100) if current_rank<=100 else (101,200)
+    sub=h[(h["_rank127"]>=lo)&(h["_rank127"]<=hi)].copy()
+    # Prefer exact market+side once it has enough sample; otherwise fall back to rank band.
+    exact=sub[sub["Market"].eq(market)&sub["Side"].eq(side)] if "Side" in sub.columns else pd.DataFrame()
+    if len(exact)>=10: sub=exact
+    elif len(sub[sub["Market"].eq(market)])>=12: sub=sub[sub["Market"].eq(market)]
+    n=len(sub)
+    if n==0: return {"n":0,"raw_wr":np.nan,"shrunk_wr":.50,"bucket":f"{lo}-{hi}"}
+    wins=float(pd.to_numeric(sub.get("WinNum"),errors="coerce").fillna(0).sum()); raw=wins/n; shr=(wins+8.0)/(n+16.0)
+    return {"n":int(n),"raw_wr":float(raw),"shrunk_wr":float(shr),"bucket":f"{lo}-{hi}"}
+
+
+def _app127_selection_diagnostics(row: pd.Series) -> Dict[str,Any]:
+    market=str(row.get("Market","")).upper(); side=str(row.get("Final Resolved Side","")).upper(); line=safe_float(row.get("Line"),np.nan); proj=safe_float(row.get("Final Resolved Projection"),np.nan); edge=abs(safe_float(row.get("Final Resolved Edge"),proj-line if pd.notna(proj) and pd.notna(line) else 0)); prob=safe_float(row.get("Elite Calibrated Probability %"),50); mins=_app126_first_num(row,["Elite Projected Minutes","MIN Proj"],28); rolefit=safe_float(row.get("Elite Market Role Fit"),60); role=safe_float(row.get("Elite Role Security"),60)
+    prof=_app127_recent_market_profile(row); fam=_app127_independent_family_support(row); rh=_app127_rank_history_meta(row)
+    rsd=safe_float(prof.get("robust_sd"),_app126_default_sd(market)); edge_vol=edge/max(rsd,.25)
+    recent=safe_float(prof.get("side_hit_shrunk"),.50); n=int(prof.get("n",0)); med=safe_float(prof.get("median"),np.nan); q75=safe_float(prof.get("q75"),np.nan); q90=safe_float(prof.get("q90"),np.nan)
+    delta=0.0; penalties=[]; bonuses=[]; hard=[]
+    # Edge must be meaningful relative to the player's own game-to-game variance.
+    if n>=5:
+        if edge_vol<.18: delta-=10; penalties.append("edge <0.18 SD -10")
+        elif edge_vol<.28: delta-=6; penalties.append("edge <0.28 SD -6")
+        elif edge_vol<.40: delta-=3; penalties.append("edge <0.40 SD -3")
+        elif edge_vol>=.70: delta+=2; bonuses.append("edge >=0.70 SD +2")
+        if recent<.44: delta-=7; penalties.append(f"prior-line support {recent:.0%} -7")
+        elif recent<.50: delta-=3; penalties.append(f"prior-line support {recent:.0%} -3")
+        elif recent>=.64: delta+=2; bonuses.append(f"prior-line support {recent:.0%} +2")
+        # Projection far beyond the recent center is allowed only with broad model confirmation.
+        if pd.notna(med) and side=="OVER" and proj>med+.80*rsd and fam["agree"]<2:
+            delta-=6; penalties.append("OVER projection jump lacks 2-family support -6")
+        if pd.notna(med) and side=="UNDER" and proj<med-.80*rsd and fam["agree"]<2:
+            delta-=6; penalties.append("UNDER projection drop lacks 2-family support -6")
+    # Independent breadth matters more for scarce Best-Slate slots than on the full board.
+    if fam["n"]==0: delta-=6; penalties.append("no independent family vote -6")
+    elif fam["n"]==1: delta-=4; penalties.append("one-family signal -4")
+    elif fam["agree"]==fam["n"] and fam["n"]>=3: delta+=2; bonuses.append("3+ families unanimous +2")
+    elif fam["agree"]/max(1,fam["n"])<.60: delta-=6; penalties.append("independent-family split -6")
+    # Fragile UNDERs on high-minute/high-role accumulators need a real buffer because
+    # one normal ceiling game can erase a one-stat edge.
+    accumulator_under=False
+    if side=="UNDER" and market in {"PTS","REB","AST","PRA"} and mins>=29 and max(rolefit,role)>=72 and n>=5 and pd.notna(q75):
+        if q75>=line and edge_vol<.55:
+            accumulator_under=True; delta-=8; penalties.append("fragile high-role accumulator UNDER -8")
+            if pd.notna(q90) and q90>=line+rsd*.35: delta-=3; penalties.append("recent ceiling well above UNDER line -3")
+    # AST share concentration: an outsized creator-share assumption can create a
+    # numerically large edge from a single fragile team-assist allocation.
+    ast_share=safe_float(row.get("Elite Team AST Share %"),np.nan); ast_concentration=False
+    if market=="AST" and pd.notna(ast_share):
+        if ast_share>=45:
+            ast_concentration=True; delta-=7; penalties.append("AST share >=45% concentration -7")
+            if fam["agree"]<2: hard.append("AST concentration lacks 2-family confirmation")
+        elif ast_share>=38 and edge_vol<.60:
+            ast_concentration=True; delta-=4; penalties.append("AST share >=38% with fragile edge -4")
+    # Historical rank bucket is deliberately light and sample-gated.
+    if rh["n"]>=12:
+        rw=safe_float(rh.get("shrunk_wr"),.50)
+        if rw<.49: delta-=4; penalties.append(f"prior rank bucket {rw:.0%} -4")
+        elif rw>=.60: delta+=2; bonuses.append(f"prior rank bucket {rw:.0%} +2")
+    # Hard Best-Slate gate: full-board projection still survives; only scarce ranked
+    # placement is denied when the setup is structurally fragile.
+    floor={"PTS":.75,"REB":.45,"AST":.40,"PRA":1.10}.get(market,.5)
+    if edge<.80*floor: hard.append("edge below Best-Slate floor")
+    if prob<54.5: hard.append("calibrated probability <54.5")
+    if n>=5 and edge_vol<.20: hard.append("edge too small versus player volatility")
+    if fam["n"]>=2 and fam["agree"]<max(1,int(math.ceil(.50*fam["n"]))): hard.append("majority of independent families disagree")
+    if accumulator_under and edge_vol<.35: hard.append("fragile accumulator UNDER")
+    # Low recent support alone does not rewrite a side, but it should not be Top-20.
+    if n>=8 and recent<.40: hard.append("very weak prior-line support")
+    gate=len(hard)==0
+    return {"delta":delta,"profile":prof,"families":fam,"rank_history":rh,"edge_vol":edge_vol,"gate":gate,"gate_reasons":" | ".join(hard) if hard else "PASS","penalties":" | ".join(penalties),"bonuses":" | ".join(bonuses),"accumulator_under":accumulator_under,"ast_concentration":ast_concentration}
+
+
+def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
+    """App127 Best-Slate rank authority; App126 projections remain untouched."""
+    out=_elite_rank_board_app126_control(board)
+    if out is None or out.empty: return out
+    rows=[]
+    for _,rr in out.iterrows():
+        r=rr.copy(); diag=_app127_selection_diagnostics(r); old=safe_float(r.get("Elite Rank Score"),0); new=float(np.clip(old+safe_float(diag.get("delta"),0),0,100)); prof=diag["profile"]; fam=diag["families"]; rh=diag["rank_history"]
+        r["App127 App126 Rank Score"]=round(old,2); r["App127 Selection Adjustment"]=round(safe_float(diag.get("delta"),0),2); r["App127 Selection Score"]=round(new,2); r["App127 Edge To Volatility"]=round(safe_float(diag.get("edge_vol"),np.nan),3); r["App127 Recent Sample"]=int(prof.get("n",0)); r["App127 Recent Mean"]=round(safe_float(prof.get("mean"),np.nan),3) if pd.notna(safe_float(prof.get("mean"),np.nan)) else np.nan; r["App127 Recent Median"]=round(safe_float(prof.get("median"),np.nan),3) if pd.notna(safe_float(prof.get("median"),np.nan)) else np.nan; r["App127 Recent Robust SD"]=round(safe_float(prof.get("robust_sd"),np.nan),3) if pd.notna(safe_float(prof.get("robust_sd"),np.nan)) else np.nan; r["App127 Prior Line Hit Rate %"]=round(100*safe_float(prof.get("side_hit_rate"),np.nan),1) if pd.notna(safe_float(prof.get("side_hit_rate"),np.nan)) else np.nan; r["App127 Prior Line Hit Shrunk %"]=round(100*safe_float(prof.get("side_hit_shrunk"),.50),1); r["App127 Independent Family N"]=int(fam.get("n",0)); r["App127 Independent Family Agree"]=int(fam.get("agree",0)); r["App127 Independent Family Score %"]=round(safe_float(fam.get("score"),50),1); r["App127 Independent Family Votes"]=str(fam.get("votes","")); r["App127 Prior Rank Samples"]=int(rh.get("n",0)); r["App127 Prior Rank Win Rate %"]=round(100*safe_float(rh.get("raw_wr"),np.nan),1) if pd.notna(safe_float(rh.get("raw_wr"),np.nan)) else np.nan; r["App127 Prior Rank Shrunk Win Rate %"]=round(100*safe_float(rh.get("shrunk_wr"),.50),1); r["App127 Fragile Accumulator Under"]=bool(diag.get("accumulator_under",False)); r["App127 AST Share Concentration"]=bool(diag.get("ast_concentration",False)); r["App127 Best Slate Qualified"]=bool(diag.get("gate",False)); r["App127 Best Slate Gate Reason"]=str(diag.get("gate_reasons","")); r["App127 Selection Penalties"]=str(diag.get("penalties","")); r["App127 Selection Bonuses"]=str(diag.get("bonuses","")); r["Elite Rank Score"]=round(new,2); r["Elite Rank Note"]=(str(r.get("Elite Rank Note","") or "")+" | APP127 "+str(diag.get("penalties","") or "")+" | "+str(diag.get("bonuses","") or "")).strip(" |")
+        rows.append(r)
+    out=pd.DataFrame(rows)
+    # App127 only downgrades App126 recommendation states. Projection and raw side
+    # remain visible on Player Cards even when Best Slate qualification fails.
+    order_level={"TRACK":0,"LEAN":1,"PLAYABLE":2,"STRONG":3,"ELITE":4}
+    def _status127(r):
+        old=str(r.get("Elite Status","TRACK")).upper(); sc=safe_float(r.get("Elite Rank Score"),0); prob=safe_float(r.get("Elite Calibrated Probability %"),0)
+        if not bool(r.get("App127 Best Slate Qualified",False)): return "TRACK"
+        desired="STRONG" if sc>=78 and prob>=59 else "PLAYABLE" if sc>=68 and prob>=56.5 else "LEAN" if sc>=59 and prob>=54.5 else "TRACK"
+        # ELITE is preserved only when App126 already earned it and App127 still scores 84+.
+        if old=="ELITE" and sc>=84 and prob>=61: desired="ELITE"
+        return desired if order_level.get(desired,0)<=order_level.get(old,0) else old
+    out["Elite Status"]=out.apply(_status127,axis=1)
+    line_s=pd.to_numeric(out.get("Line"),errors="coerce"); proj_s=pd.to_numeric(out.get("Final Resolved Projection"),errors="coerce"); side=out.get("Final Resolved Side",pd.Series("",index=out.index)).astype(str).str.upper(); ready=out.get("Projection Readiness",pd.Series("READY",index=out.index)).astype(str).str.upper(); rec=out.get("Final Recommendation State",pd.Series("TRACK",index=out.index)).astype(str).str.upper()
+    valid=line_s.notna()&proj_s.notna()&side.isin(["OVER","UNDER"])&out["App127 Best Slate Qualified"].fillna(False).astype(bool)&out["Elite Status"].isin(["ELITE","STRONG","PLAYABLE","LEAN"])&~ready.isin(["BLOCK","WAIT"])&~rec.isin(["BLOCK","WAIT"])
+    sort_cols=["Elite Rank Score","Elite Calibrated Probability %","App127 Independent Family Score %","App127 Edge To Volatility"]
+    order=out[valid].sort_values(sort_cols,ascending=[False,False,False,False],na_position="last").index.tolist(); rank_map={idx:rank for rank,idx in enumerate(order[:ELITE_MAX_RANK],start=1)}
+    out["Elite Rank"]=[rank_map.get(i,np.nan) for i in out.index]; out["Elite Best Play"]=[f"#{int(rank_map[i])} {out.at[i,'Final Resolved Side']}" if i in rank_map else "UNRANKED" for i in out.index]; out["Elite Market Rank"]=np.nan
+    for mk,idxs in out[valid].groupby("Market").groups.items():
+        ids=sorted(list(idxs),key=lambda i:safe_float(out.at[i,"Elite Rank Score"],0),reverse=True)
+        for mr,i in enumerate(ids,start=1): out.at[i,"Elite Market Rank"]=mr
+    out["Elite Rank Authority"]="APP127_BEST_SLATE_SELECTION_STABILITY"
+    return out.sort_values(["Elite Rank","Elite Rank Score"],ascending=[True,False],na_position="last")
+
+
 def _promote_final_authority(board: pd.DataFrame) -> pd.DataFrame:
     if board is None or board.empty or "Final Resolved Projection" not in board.columns: return board
     out=board.copy(); out["Projection"]=pd.to_numeric(out["Final Resolved Projection"],errors="coerce"); out["Edge"]=pd.to_numeric(out.get("Final Resolved Edge"),errors="coerce"); out["Lean"]=out.get("Final Resolved Side",out.get("Lean","PASS")); out["Over %"]=pd.to_numeric(out.get("Final Resolved Over %"),errors="coerce"); out["Under %"]=pd.to_numeric(out.get("Final Resolved Under %"),errors="coerce")
     status=out.get("Elite Status",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); side=out.get("Final Resolved Side",pd.Series("PASS",index=out.index)).astype(str).str.upper(); rank=pd.to_numeric(out.get("Elite Rank"),errors="coerce"); rec=status.isin(["ELITE","STRONG","PLAYABLE","LEAN"])&side.isin(["OVER","UNDER"])&rank.notna(); rec_state=out.get("Final Recommendation State",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); readiness=out.get("Projection Readiness",pd.Series("READY",index=out.index)).astype(str).str.upper(); valid=pd.to_numeric(out.get("Line"),errors="coerce").notna()&pd.to_numeric(out.get("Projection"),errors="coerce").notna()
     fallback=np.where(~valid,"PASS",np.where(rec_state.eq("BLOCK")|readiness.eq("BLOCK"),"BLOCK",np.where(rec_state.eq("WAIT")|readiness.eq("WAIT"),"WAIT","TRACK")))
-    out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),fallback); out["Recommendation State"]=np.where(rec,status,fallback); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP126_LOSS_RESCUE_FORENSICS"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY_APP126"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
+    out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),fallback); out["Recommendation State"]=np.where(rec,status,fallback); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP127_APP126_PROJECTION_RANK_SELECTION"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY_APP126_PLUS_APP127_RANK"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
 
 
 def build_copy_paste_slate(df: pd.DataFrame, best_only: bool=False, max_rows: int=0) -> str:
@@ -18788,7 +19000,7 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Elite Best Plays / Rank 1–200")
-    st.caption("Only projection-ready OVER/UNDER candidates receive #1-#200 ranks. Ranking uses game environment, finite team opportunity budgets, hierarchy-aware player roles, distributions, calibration, independent-model agreement, freshness, and correlation/risk penalties. PASS/TRACK rows stay unranked. Final Resolved is the production ranking authority; Legacy and raw Elite/HHS remain visible only for audit and untouched model comparison.")
+    st.caption("App127 Best Slate: App126 remains projection authority, while rank 1-200 now requires volatility-adjusted edge, recent prior-line support, independent-family breadth, role/minutes stability, calibration, and loss-rescue reliability. Fragile high-role UNDERs and concentrated creator assumptions can stay on Player Cards but are denied Best-Slate rank until they clear the stronger selection gate.")
     board_path = CACHE_FILES["projection_board"]
     if board_path.exists():
         try:
@@ -18841,7 +19053,7 @@ with tabs[1]:
         if card_view:
             for _, rr in show.head(50).iterrows():
                 render_elite_rank_card(rr)
-        display_cols = [c for c in ["Elite Rank", "Elite Market Rank", "Elite Status", "Elite Rank Score", "Elite Best Play", "Elite Side", "Elite Projection", "Elite Edge", "Elite Calibrated Probability %", "Elite P50", "Elite Scoring Role", "Elite Rebound Role", "Elite Creation Role", "Elite Role Security", "Elite Market Role Fit", "Elite Role Summary", "Elite Scoring Hierarchy Rank", "Elite Rebound Hierarchy Rank", "Elite Creation Hierarchy Rank", "Elite Team FGA Share %", "Elite Team PTS Share %", "Elite Team REB Share %", "Elite Team AST Share %", "Elite Expected Team Points", "Elite Expected Opp Points", "Elite Expected Game Total", "Elite Projected FGA", "Elite Projected FTA", "Elite Vacancy Minutes", "Elite Vacancy FGA", "Elite Vacancy REB", "Elite Vacancy AST", "Elite Team Player PTS Sum", "Elite Projected PTS", "Elite Projected REB", "Elite Projected AST", "Elite Flags", "Elite Agreement Score", "Elite Data Quality", "Elite Risk Penalty", "Projection Readiness", "Projection Missing Inputs", "Projection Data Through", "Projection Data Age Days", "Player Games Available", "Player Last Game", "Full Live Board Rows", "Projected Live Rows", "Unprojected Live Rows", "Tier", "Official", "Clean Risk", "Playable Gate", "Winning Play Score", "Projection Engine Version", "LineParserVersion", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided", "Slate Player Prop Coverage", "Slate Missing From Player Props", "Opening Line", "CLV", "Projection", "Legacy Projection", "Challenger Projection", "PTS V2 Projection", "PTS V2 Side", "PTS V2 Edge", "PTS V2 Over %", "PTS V2 Under %", "PTS V2 P50", "PTS V2 Projected FGA", "PTS V2 Projected 3PA", "PTS V2 Projected FTA", "PTS V2 Usage %", "PTS V2 Team FGA Share %", "PTS V2 Team Total Scale", "PTS V2 Flags", "PTS V2 Data Quality", "PRA V2 Projection", "V2 Market Policy", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+        display_cols = [c for c in ["Elite Rank", "Elite Market Rank", "Elite Status", "Elite Rank Score", "Elite Best Play", "Elite Side", "Elite Projection", "Elite Edge", "Elite Calibrated Probability %", "Elite P50", "Elite Scoring Role", "Elite Rebound Role", "Elite Creation Role", "Elite Role Security", "Elite Market Role Fit", "Elite Role Summary", "Elite Scoring Hierarchy Rank", "Elite Rebound Hierarchy Rank", "Elite Creation Hierarchy Rank", "Elite Team FGA Share %", "Elite Team PTS Share %", "Elite Team REB Share %", "Elite Team AST Share %", "Elite Expected Team Points", "Elite Expected Opp Points", "Elite Expected Game Total", "Elite Projected FGA", "Elite Projected FTA", "Elite Vacancy Minutes", "Elite Vacancy FGA", "Elite Vacancy REB", "Elite Vacancy AST", "Elite Team Player PTS Sum", "Elite Projected PTS", "Elite Projected REB", "Elite Projected AST", "App127 Best Slate Qualified", "App127 Best Slate Gate Reason", "App127 Edge To Volatility", "App127 Prior Line Hit Shrunk %", "App127 Independent Family N", "App127 Independent Family Agree", "App127 Independent Family Score %", "App127 Independent Family Votes", "App127 Recent Robust SD", "App127 Fragile Accumulator Under", "App127 AST Share Concentration", "App127 Selection Adjustment", "App127 Selection Penalties", "App127 Selection Bonuses", "Elite Flags", "Elite Agreement Score", "Elite Data Quality", "Elite Risk Penalty", "Projection Readiness", "Projection Missing Inputs", "Projection Data Through", "Projection Data Age Days", "Player Games Available", "Player Last Game", "Full Live Board Rows", "Projected Live Rows", "Unprojected Live Rows", "Tier", "Official", "Clean Risk", "Playable Gate", "Winning Play Score", "Projection Engine Version", "LineParserVersion", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided", "Slate Player Prop Coverage", "Slate Missing From Player Props", "Opening Line", "CLV", "Projection", "Legacy Projection", "Challenger Projection", "PTS V2 Projection", "PTS V2 Side", "PTS V2 Edge", "PTS V2 Over %", "PTS V2 Under %", "PTS V2 P50", "PTS V2 Projected FGA", "PTS V2 Projected 3PA", "PTS V2 Projected FTA", "PTS V2 Usage %", "PTS V2 Team FGA Share %", "PTS V2 Team Total Scale", "PTS V2 Flags", "PTS V2 Data Quality", "PRA V2 Projection", "V2 Market Policy", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
         st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
@@ -19120,7 +19332,33 @@ with tabs[7]:
     except Exception as _app126_ui_exc:
         st.warning(f"App126 Loss Rescue report unavailable: {_app126_ui_exc}")
 
-    st.markdown("### 5) Automated Historical Backtest")
+    st.markdown("### 5) App127 Best Slate Selection Audit")
+    st.caption("App126 projections are unchanged. This audit shows which rows App127 admits to Best Slate after volatility-adjusted edge, prior-line support, independent-family breadth, accumulator-under risk, creator-share concentration, and prior rank reliability are applied.")
+    try:
+        _a127_path=CACHE_FILES["projection_board"]
+        _a127=pd.read_csv(_a127_path) if _a127_path.exists() else pd.DataFrame()
+        if _a127 is None or _a127.empty or "App127 Best Slate Qualified" not in _a127.columns:
+            st.info("Refresh Today with App127 to populate Best Slate selection diagnostics.")
+        else:
+            _q=_a127["App127 Best Slate Qualified"].fillna(False).astype(bool)
+            _c1,_c2,_c3,_c4=st.columns(4)
+            _c1.metric("Best Slate qualified",int(_q.sum()))
+            _c2.metric("Filtered from rank",int((~_q).sum()))
+            _ev=pd.to_numeric(_a127.get("App127 Edge To Volatility"),errors="coerce")
+            _c3.metric("Median edge / SD",f"{_ev[_q].median():.2f}" if _q.any() and _ev[_q].notna().any() else "N/A")
+            _frag=_a127.get("App127 Fragile Accumulator Under",pd.Series(False,index=_a127.index)).fillna(False).astype(bool)
+            _c4.metric("Fragile accumulator UNDERs",int(_frag.sum()))
+            _cols=[c for c in ["Elite Rank","Player","Team","Opponent","Market","Line","Final Resolved Projection","Final Resolved Side","Elite Calibrated Probability %","Elite Rank Score","Elite Status","App127 Best Slate Qualified","App127 Best Slate Gate Reason","App127 Edge To Volatility","App127 Prior Line Hit Shrunk %","App127 Independent Family Agree","App127 Independent Family N","App127 Independent Family Votes","App127 Fragile Accumulator Under","App127 AST Share Concentration","App127 Selection Adjustment","App127 Selection Penalties","App127 Selection Bonuses"] if c in _a127.columns]
+            _ranked=_a127[pd.to_numeric(_a127.get("Elite Rank"),errors="coerce").notna()].sort_values("Elite Rank") if "Elite Rank" in _a127.columns else pd.DataFrame()
+            if not _ranked.empty:
+                st.markdown("#### Current App127 Best Slate")
+                st.dataframe(_ranked[_cols].head(50),use_container_width=True,hide_index=True)
+            with st.expander("Rows filtered from Best Slate",expanded=False):
+                st.dataframe(_a127.loc[~_q,_cols].sort_values("Elite Rank Score",ascending=False).head(100),use_container_width=True,hide_index=True)
+    except Exception as _app127_ui_exc:
+        st.warning(f"App127 Best Slate audit unavailable: {_app127_ui_exc}")
+
+    st.markdown("### 6) Automated Historical Backtest")
     st.caption("Backtests the projection formula on historical logs using a prior-games-only line proxy. This validates model direction/calibration without claiming it had real sportsbook historical lines.")
     min_prior = st.slider("Minimum prior games before testing", 3, 15, 5)
     if st.button("Run historical backtest", use_container_width=True):
