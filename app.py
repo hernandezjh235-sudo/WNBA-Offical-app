@@ -13,6 +13,14 @@ Line-source build:
 """
 
 
+# APP128 ROLE / AVAILABILITY CHALLENGER (SHADOW ONLY)
+# - Preserves App126 Final-Resolved projection/side authority and App127 Best-Slate ranks.
+# - Adds current-role sanity guard from the latest completed player games.
+# - Adds roster-depletion / injury-vacancy stress and stronger recent-role weighting when the active roster changes.
+# - Adds challenger minutes P25/P50/P75, FGA/FTA/3PA scoring opportunity, rebound-pool context and assist-budget context.
+# - Adds production-vs-challenger comparison and postgame challenger MAE / rescue-vs-break logging.
+# - No App128 field is allowed to mutate Final Resolved Projection, Final Resolved Side, Final Recommendation State, Elite Rank or Elite Rank Score.
+
 # APP 126 LOSS RESCUE / PROJECTION FORENSICS CHANGES
 # - Learns signed projection residuals from PRIOR completed Final-Resolved grades only.
 # - Classifies losses by minutes, role/FGA/FTA, efficiency, AST creation, rebound opportunity, return/injury, thin edge, model disagreement, or true variance.
@@ -137,7 +145,7 @@ from wnba_hhs.evaluation import (
 from wnba_hhs.schema import DATASET_KEYS
 from wnba_hhs.snapshots import ProjectionSnapshotStore
 
-APP_VERSION = "WNBA v5.0.0 - App127 Best Slate Selection Stability"
+APP_VERSION = "WNBA v5.1.0 - App128 Role Availability Challenger"
 LINE_PARSER_VERSION = "UD_BASE_CARD_MAINLINE_V5"
 MONEYLINE_FEED_VERSION = "V367_UNDERDOG_GAME_SLATE_ELITE_INJURY_FRESHNESS"
 WORKING_PULL_LOCK = "V348_EXACT_PULL_LOCKED_PLAYER_CARDS_SYNC_V1"
@@ -5099,6 +5107,22 @@ def grade_pending(logs, mode: Optional[str] = None, allowed_dates: Optional[List
         row["ProjectionError"] = round(projected_value - actual, 2) if pd.notna(projected_value) else None
         row["LineError"] = round(actual - line, 2)
         row["MinutesError"] = round(projected_minutes - minutes, 2) if pd.notna(projected_minutes) else None
+        # App128 shadow grading: compare the saved challenger to the same final boxscore.
+        _a128_proj=safe_float(row.get("App128 Challenger Projection"),np.nan)
+        _a128_side=str(row.get("App128 Challenger Side","") or "").upper()
+        _prod_final=safe_float(row.get("Final Resolved Projection"),projected_value)
+        _prod_side=str(row.get("Final Resolved Side",lean) or lean).upper()
+        if pd.notna(_a128_proj):
+            row["App128 Challenger Error"]=round(_a128_proj-actual,3)
+            row["App128 Challenger Abs Error"]=round(abs(_a128_proj-actual),3)
+            row["App128 Production Final Abs Error"]=round(abs(_prod_final-actual),3) if pd.notna(_prod_final) else None
+            row["App128 MAE Improvement vs Production"]=round(abs(_prod_final-actual)-abs(_a128_proj-actual),3) if pd.notna(_prod_final) else None
+            _a128_push=abs(actual-line)<1e-9
+            _a128_win=(actual>line and _a128_side=="OVER") or (actual<line and _a128_side=="UNDER")
+            row["App128 Challenger Result"]="PUSH" if _a128_push else "WIN" if _a128_win else "LOSS" if _a128_side in {"OVER","UNDER"} else "PASS"
+            _prod_win=(actual>line and _prod_side=="OVER") or (actual<line and _prod_side=="UNDER")
+            row["App128 Rescued Production Loss"]=bool((not _prod_win) and _a128_win and not _a128_push)
+            row["App128 Broke Production Win"]=bool(_prod_win and (not _a128_win) and not _a128_push and _a128_side in {"OVER","UNDER"})
         row["ModelAtSave"] = row.get("Active Model", "LEGACY")
         row["ActualGameDate"] = str(target_date or stat_row.get("GameDate"))
         row["Result"] = "PUSH" if push else "WIN" if win else "LOSS"
@@ -11099,7 +11123,7 @@ def automatic_live_bootstrap(mode: str = "Today", use_ud_flag: bool = True) -> D
 # requested for betting use: opponent matchup visibility, projection sanity,
 # opportunity breakdown, data-integrity gating, and stricter official plays.
 
-APP_VERSION = "WNBA v5.0.0 - App127 Best Slate Selection Stability"
+APP_VERSION = "WNBA v5.1.0 - App128 Role Availability Challenger"
 
 
 def _first_numeric_value(row: Any, candidates: List[str], default: float = np.nan) -> float:
@@ -12640,7 +12664,7 @@ def _v345_post_context_finalizer(board: pd.DataFrame, base: Optional[pd.DataFram
 # projection inflation by making the calibrated v3.4.8 rebuild the only function
 # allowed to change Projection. Context fields below are audit/display fields only.
 
-APP_VERSION = "WNBA v5.0.0 - App127 Best Slate Selection Stability"
+APP_VERSION = "WNBA v5.1.0 - App128 Role Availability Challenger"
 PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = "LEGACY LOCKED: season-isolated Bayesian baseline + bounded minutes/matchup. PTS V2 is a separate challenger and never overwrites legacy Projection."
 PTS_V2_ENGINE_VERSION = "PTS_V2_TEAM_CONSTRAINED_CHALLENGER_V1"
@@ -13872,7 +13896,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
 #   1) generic PTS-row averages bleeding into REB/AST component projections;
 #   2) opponent team context being attached after, instead of before, projection.
 
-APP_VERSION = "WNBA v5.0.0 - App127 Best Slate Selection Stability"
+APP_VERSION = "WNBA v5.1.0 - App128 Role Availability Challenger"
 PROJECTION_ENGINE_VERSION = "V365_LEGACY_LOCKED_APP117"
 PROJECTION_ENGINE_NOTE = (
     "LEGACY LOCKED for A/B testing. Current-season inputs are isolated; prior seasons live only in explicit *_prior fields. "
@@ -17678,6 +17702,14 @@ def render_elite_rank_card(row: pd.Series) -> None:
     if pd.notna(hit): app127_bits.append(f"prior-line {hit:.0f}%")
     if fn: app127_bits.append(f"families {fa}/{fn}")
     app127_diag=html.escape(" | ".join(app127_bits))
+    a128_proj=safe_float(row.get("App128 Challenger Projection"),np.nan); a128_side=html.escape(str(row.get("App128 Challenger Side","") or "")); a128_status=html.escape(str(row.get("App128 Role Sanity Status","") or "")); a128_delta=safe_float(row.get("App128 Projection Delta"),np.nan); a128_min=safe_float(row.get("App128 Minutes P50"),np.nan); a128_stress=safe_float(row.get("App128 Availability Stress Score"),np.nan)
+    a128_bits=[]
+    if pd.notna(a128_proj): a128_bits.append(f"SHADOW {a128_side} {a128_proj:.2f}")
+    if pd.notna(a128_delta): a128_bits.append(f"Δ {a128_delta:+.2f}")
+    if pd.notna(a128_min): a128_bits.append(f"MIN50 {a128_min:.1f}")
+    if pd.notna(a128_stress): a128_bits.append(f"avail stress {a128_stress:.0f}")
+    if a128_status: a128_bits.append(a128_status)
+    app128_diag=html.escape("APP128 SHADOW ONLY | "+" | ".join(a128_bits)) if a128_bits else ""
     st.markdown(
         f"""<div style='border:1px solid rgba(168,85,247,.42);border-radius:16px;padding:12px 14px;margin:9px 0;background:rgba(15,10,30,.88)'>
         <div style='display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap'><b style='font-size:1.05rem;color:#f8fafc'>{rank_txt} {player} | {market}</b><b style='color:#facc15'>{status} | {score:.1f}</b></div>
@@ -17686,6 +17718,7 @@ def render_elite_rank_card(row: pd.Series) -> None:
         <div style='margin-top:4px;color:#a78bfa;font-size:.74rem'>{role_summary}</div>
         <div style='margin-top:4px;color:#67e8f9;font-size:.72rem'>{shares}</div>
         <div style='margin-top:5px;color:#86efac;font-size:.72rem'>{app127_diag}</div>
+        <div style='margin-top:4px;color:#22d3ee;font-size:.70rem'>{app128_diag}</div>
         <div style='margin-top:4px;color:#fbbf24;font-size:.70rem'>{gate if not q else ''}</div>
         <div style='margin-top:5px;color:#fca5a5;font-size:.72rem'>{flags}</div></div>""",
         unsafe_allow_html=True,
@@ -17695,10 +17728,10 @@ def render_elite_rank_card(row: pd.Series) -> None:
 # ============================================================
 # App 122 — POST-GRADE FINAL AUTHORITY / LIVE CONTEXT / RETURN-ROLE SCENARIOS
 # ============================================================
-APP_VERSION = "WNBA v5.0.0 - App127 Best Slate Selection Stability"
+APP_VERSION = "WNBA v5.1.0 - App128 Role Availability Challenger"
 LEGACY_PROJECTION_ENGINE_VERSION = PROJECTION_ENGINE_VERSION
-PROJECTION_ENGINE_VERSION = "APP127_APP126_PROJECTION_RANK_SELECTION"
-PROJECTION_ENGINE_NOTE = "App125 authority: App124 PTS/PRA preserved; Minutes/Rotation V2 + empirical with/without role effects; AST V2 stable-blend production; REB V2 challenger only; rank learning from prior final-authority grades."
+PROJECTION_ENGINE_VERSION = "APP128_ROLE_AVAIL_CHALLENGER_SHADOW"
+PROJECTION_ENGINE_NOTE = "App128 wrapper: App126 Final-Resolved + App127 Best-Slate remain production authority; App128 current-role/availability/minutes/FGA-FTA/rebound-chance logic is shadow-only until forward grades prove a positive rescue-vs-break result."
 ELITE_ENGINE_VERSION = "ELITE_BEST_SLATE_V8_APP127"
 FINAL_RESOLVER_VERSION = "FINAL_RESOLVER_V5_APP126_PRESERVED"
 INJURY_SCENARIO_VERSION = "CANONICAL_RETURN_ROLE_SCENARIO_V4_APP125"
@@ -18847,12 +18880,368 @@ def _elite_rank_board(board: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["Elite Rank","Elite Rank Score"],ascending=[True,False],na_position="last")
 
 
+# ============================================================
+# APP128 — CURRENT ROLE / AVAILABILITY CHALLENGER (SHADOW ONLY)
+# ============================================================
+APP128_ROLE_AUDIT_FILE = DATA_DIR / "wnba_app128_role_availability_audit.csv"
+_APP128_TEAM_RECENT_CACHE: Dict[str,Dict[str,Any]] = {}
+_APP128_LEAGUE_EFF_CACHE: Optional[Dict[str,float]] = None
+
+
+def _app128_num(row: pd.Series, names: List[str], default=np.nan) -> float:
+    for c in names:
+        if c in row.index:
+            v=safe_float(row.get(c),np.nan)
+            if pd.notna(v): return float(v)
+    return default
+
+
+def _app128_player_logs(row: pd.Series, logs: Optional[pd.DataFrame]=None) -> pd.DataFrame:
+    d=_app125_latest_player_logs() if logs is None else logs
+    if d is None or d.empty: return pd.DataFrame()
+    nk=normalize_name(row.get("Matched Player") or row.get("Player") or row.get("NameKey")); tk=_team_key_for_matchup(row.get("Team"))
+    if not nk: return pd.DataFrame()
+    x=d[d["NameKey"].eq(nk)].copy()
+    if tk and "TeamKey" in x.columns:
+        xt=x[x["TeamKey"].eq(tk)]
+        if not xt.empty: x=xt
+    if x.empty: return x
+    for c in ["MIN","PTS","REB","AST","FGA","FGM","FG3A","FG3M","FTA","FTM","TOV","OREB","DREB"]:
+        if c in x.columns: x[c]=pd.to_numeric(x[c],errors="coerce")
+    return x.sort_values("GameDate").tail(12).copy()
+
+
+def _app128_rate(frame: pd.DataFrame, col: str, minutes: float) -> float:
+    if frame is None or frame.empty or col not in frame.columns or "MIN" not in frame.columns: return np.nan
+    vals=pd.to_numeric(frame[col],errors="coerce"); mins=pd.to_numeric(frame["MIN"],errors="coerce")
+    good=vals.notna()&mins.notna()&(mins>0)
+    if not good.any(): return np.nan
+    return float(vals[good].sum()/max(mins[good].sum(),1e-9)*max(float(minutes),0.0))
+
+
+def _app128_recent_blend(frame: pd.DataFrame, col: str, minutes: float) -> float:
+    if frame is None or frame.empty: return np.nan
+    pieces=[]
+    for n,w in [(3,.50),(5,.30),(10,.20)]:
+        v=_app128_rate(frame.tail(n),col,minutes)
+        if pd.notna(v): pieces.append((v,w))
+    if not pieces: return np.nan
+    return float(sum(v*w for v,w in pieces)/sum(w for _,w in pieces))
+
+
+def _app128_team_recent_context(team: str, logs: Optional[pd.DataFrame]=None) -> Dict[str,Any]:
+    tk=_team_key_for_matchup(team)
+    if tk in _APP128_TEAM_RECENT_CACHE: return dict(_APP128_TEAM_RECENT_CACHE[tk])
+    neutral={"games":0,"pts":np.nan,"reb":np.nan,"ast":np.nan,"fga":np.nan,"fta":np.nan,"fg3a":np.nan,"missed_fg":np.nan,"latest":pd.NaT,"rotation_players":np.nan}
+    d=_app125_latest_player_logs() if logs is None else logs
+    if d is None or d.empty or not tk or "TeamKey" not in d.columns:
+        _APP128_TEAM_RECENT_CACHE[tk]=neutral; return dict(neutral)
+    td=d[d["TeamKey"].eq(tk)].copy()
+    if td.empty:
+        _APP128_TEAM_RECENT_CACHE[tk]=neutral; return dict(neutral)
+    for c in ["MIN","PTS","REB","AST","FGA","FGM","FTA","FG3A"]:
+        if c in td.columns: td[c]=pd.to_numeric(td[c],errors="coerce")
+    keys=td.groupby("_GameKey")["GameDate"].max().sort_values().tail(8).index.tolist()
+    rows=[]
+    for g in keys:
+        gg=td[td["_GameKey"].eq(g)].copy()
+        if gg.empty: continue
+        row={"GameKey":g,"GameDate":pd.to_datetime(gg["GameDate"],errors="coerce").max()}
+        for c in ["PTS","REB","AST","FGA","FGM","FTA","FG3A"]:
+            row[c]=float(pd.to_numeric(gg.get(c),errors="coerce").sum(min_count=1)) if c in gg.columns else np.nan
+        row["rotation_players"]=int((pd.to_numeric(gg.get("MIN"),errors="coerce")>=10).sum()) if "MIN" in gg.columns else np.nan
+        row["missed_fg"]=row["FGA"]-row["FGM"] if pd.notna(row.get("FGA")) and pd.notna(row.get("FGM")) else np.nan
+        rows.append(row)
+    gf=pd.DataFrame(rows)
+    if gf.empty:
+        _APP128_TEAM_RECENT_CACHE[tk]=neutral; return dict(neutral)
+    tail=gf.tail(5)
+    out={"games":len(gf),"latest":pd.to_datetime(gf["GameDate"],errors="coerce").max()}
+    for src,dst in [("PTS","pts"),("REB","reb"),("AST","ast"),("FGA","fga"),("FTA","fta"),("FG3A","fg3a"),("missed_fg","missed_fg"),("rotation_players","rotation_players")]:
+        out[dst]=float(pd.to_numeric(tail.get(src),errors="coerce").mean()) if src in tail.columns else np.nan
+    _APP128_TEAM_RECENT_CACHE[tk]=out; return dict(out)
+
+
+def _app128_league_efficiency_priors(logs: Optional[pd.DataFrame]=None) -> Dict[str,float]:
+    global _APP128_LEAGUE_EFF_CACHE
+    if isinstance(_APP128_LEAGUE_EFF_CACHE,dict): return dict(_APP128_LEAGUE_EFF_CACHE)
+    d=_app125_latest_player_logs() if logs is None else logs
+    pri={"two_pct":.50,"three_pct":.34,"ft_pct":.78}
+    if d is None or d.empty:
+        _APP128_LEAGUE_EFF_CACHE=pri; return dict(pri)
+    x=d.copy()
+    for c in ["FGA","FGM","FG3A","FG3M","FTA","FTM"]:
+        if c not in x.columns: x[c]=0.0
+        x[c]=pd.to_numeric(x[c],errors="coerce").fillna(0)
+    try:
+        two_a=(x["FGA"]-x["FG3A"]).clip(lower=0); two_m=(x["FGM"]-x["FG3M"]).clip(lower=0)
+        if two_a.sum()>50: pri["two_pct"]=float(two_m.sum()/two_a.sum())
+        if x["FG3A"].sum()>50: pri["three_pct"]=float(x["FG3M"].sum()/x["FG3A"].sum())
+        if x["FTA"].sum()>50: pri["ft_pct"]=float(x["FTM"].sum()/x["FTA"].sum())
+    except Exception: pass
+    pri={k:float(np.clip(v,{"two_pct":.42,"three_pct":.27,"ft_pct":.66}[k],{"two_pct":.62,"three_pct":.45,"ft_pct":.92}[k])) for k,v in pri.items()}
+    _APP128_LEAGUE_EFF_CACHE=pri; return dict(pri)
+
+
+def _app128_player_efficiency(frame: pd.DataFrame, priors: Dict[str,float]) -> Dict[str,float]:
+    if frame is None or frame.empty: return dict(priors)
+    x=frame.tail(12).copy()
+    for c in ["FGA","FGM","FG3A","FG3M","FTA","FTM"]:
+        if c not in x.columns: x[c]=0.0
+        x[c]=pd.to_numeric(x[c],errors="coerce").fillna(0)
+    two_a=float((x["FGA"]-x["FG3A"]).clip(lower=0).sum()); two_m=float((x["FGM"]-x["FG3M"]).clip(lower=0).sum())
+    a3=float(x["FG3A"].sum()); m3=float(x["FG3M"].sum()); fta=float(x["FTA"].sum()); ftm=float(x["FTM"].sum())
+    # Dynamic league priors + pseudo-attempts keep recent hot/cold shooting from
+    # becoming the role model itself.
+    two=(two_m+30*priors["two_pct"])/max(two_a+30,1e-9)
+    three=(m3+25*priors["three_pct"])/max(a3+25,1e-9)
+    ft=(ftm+20*priors["ft_pct"])/max(fta+20,1e-9)
+    return {"two_pct":float(np.clip(two,.38,.68)),"three_pct":float(np.clip(three,.22,.50)),"ft_pct":float(np.clip(ft,.55,.95))}
+
+
+def _app128_explicit_role_restriction(row: pd.Series) -> bool:
+    txt=" | ".join(str(row.get(c,"") or "") for c in ["Injury Status","Injury Context Note","Injury Scenario Note","Final Decision Reason","Elite Flags","PASS Reason"]).upper()
+    if bool(row.get("Return From Injury Flag",False)) or bool(row.get("Elite Return Scenario Applied",False)): return True
+    return any(tag in txt for tag in ["MINUTES LIMIT","LIMITED MINUTES","RETURNING","RAMP UP","RAMP-UP","RESTRICTION","GTD","GAME TIME DECISION","QUESTIONABLE"])
+
+
+def _app128_market_threshold(market: str) -> float:
+    return {"PTS":3.0,"REB":1.35,"AST":1.10,"PRA":4.0}.get(str(market).upper(),2.0)
+
+
+def _app128_component_challenger(row: pd.Series, market_rows: Dict[str,pd.Series], logs: pd.DataFrame, inactive: Dict[str,set], questionable: Dict[str,set], mode: str) -> Dict[str,Any]:
+    nk=normalize_name(row.get("Matched Player") or row.get("Player")); team=_team_key_for_matchup(row.get("Team"))
+    hist=_app128_player_logs(row,logs); n=len(hist)
+    recent3=hist.tail(3); recent5=hist.tail(5); recent10=hist.tail(10)
+    prod_min=_app128_num(row,["Elite Projected Minutes","MIN Proj","Minutes Median"],np.nan)
+    if pd.isna(prod_min): prod_min=float(pd.to_numeric(recent5.get("MIN"),errors="coerce").mean()) if n and "MIN" in recent5.columns else 24.0
+    min3=float(pd.to_numeric(recent3.get("MIN"),errors="coerce").mean()) if n and "MIN" in recent3.columns else np.nan
+    min5=float(pd.to_numeric(recent5.get("MIN"),errors="coerce").mean()) if n and "MIN" in recent5.columns else np.nan
+    mins10=pd.to_numeric(recent10.get("MIN"),errors="coerce").dropna() if n and "MIN" in recent10.columns else pd.Series(dtype=float)
+    min10=float(mins10.mean()) if len(mins10) else np.nan
+    min_sd=float(mins10.std(ddof=0)) if len(mins10)>=3 else 5.0
+    explicit=_app128_explicit_role_restriction(row)
+    out_count=len(inactive.get(team,set())); q_count=len(questionable.get(team,set()))
+    vac_min=max(0.0,_app128_num(row,["Elite Vacancy Minutes"],0)); vac_fga=max(0.0,_app128_num(row,["Elite Vacancy FGA"],0)); vac_reb=max(0.0,_app128_num(row,["Elite Vacancy REB"],0)); vac_ast=max(0.0,_app128_num(row,["Elite Vacancy AST"],0))
+    stress=float(np.clip(12*out_count+4*q_count+.55*vac_min+1.7*vac_fga+.45*vac_reb+1.2*vac_ast,0,100))
+    vals=[(prod_min,.50)]
+    if pd.notna(min3): vals.append((min3,.30 if stress<35 else .38))
+    if pd.notna(min5): vals.append((min5,.20 if stress<35 else .27))
+    chall_min=sum(v*w for v,w in vals)/sum(w for _,w in vals)
+    minute_conflict=False
+    if pd.notna(min3) and min3>=18 and prod_min<.64*min3 and not explicit:
+        chall_min=max(chall_min,.78*min3); minute_conflict=True
+        # If the team is simultaneously depleted, the recent healthy role becomes
+        # the more relevant scenario for the shadow challenger. Production stays
+        # untouched; only the audit P50 is allowed to move toward that role.
+        if stress>=30:
+            chall_min=max(chall_min,.90*min3)
+    if pd.notna(min5) and min5>=18 and prod_min>1.42*min5 and not explicit:
+        chall_min=min(chall_min,1.18*min5); minute_conflict=True
+    chall_min=float(np.clip(chall_min,4,39))
+    if len(mins10)>=3:
+        h25=float(mins10.quantile(.25)); h75=float(mins10.quantile(.75)); hmed=float(mins10.median())
+        shift=chall_min-hmed
+        min_p25=float(np.clip(.60*(h25+shift)+.40*(chall_min-.75*min_sd),0,39))
+        min_p75=float(np.clip(.60*(h75+shift)+.40*(chall_min+.75*min_sd),4,40))
+    else:
+        min_p25=max(0,chall_min-5); min_p75=min(40,chall_min+5)
+    min_p50=chall_min
+
+    # Current role / usage trend from prior completed games only.
+    fga3=_app128_rate(recent3,"FGA",36); fga10=_app128_rate(recent10,"FGA",36)
+    usage_surge=pd.notna(fga3) and pd.notna(fga10) and fga10>0 and fga3/fga10>=1.18 and (pd.isna(min3) or pd.isna(min10) or min3>=.85*min10)
+    minute_surge=pd.notna(min3) and pd.notna(min10) and min10>0 and min3/min10>=1.18
+    role_surge=bool(usage_surge or minute_surge)
+    scoring_role=float(np.clip(_app128_num(row,["Elite Scoring Role Score"],55),0,100))/100
+    reb_role=float(np.clip(_app128_num(row,["Elite Rebound Role Score"],55),0,100))/100
+    ast_role=float(np.clip(_app128_num(row,["Elite Creation Role Score"],55),0,100))/100
+    avail_usage_mult=1.0+min(.16,.12*stress/100.0)*scoring_role if stress>0 else 1.0
+    avail_reb_mult=1.0+min(.10,.07*stress/100.0)*reb_role if stress>0 else 1.0
+    avail_ast_mult=1.0+min(.14,.10*stress/100.0)*ast_role if stress>0 else 1.0
+
+    team_ctx=_app128_team_recent_context(team,logs)
+    pri=_app128_league_efficiency_priors(logs); eff=_app128_player_efficiency(hist,pri)
+    prod_fga=_app128_num(row,["Elite Projected FGA","PTS V2 Projected FGA","Projected FGA 2.0","Projected FGA"],np.nan)
+    prod_fta=_app128_num(row,["Elite Projected FTA","PTS V2 Projected FTA","Projected FTA 2.0"],np.nan)
+    recent_fga=_app128_recent_blend(hist,"FGA",chall_min); recent_fta=_app128_recent_blend(hist,"FTA",chall_min); recent_3pa=_app128_recent_blend(hist,"FG3A",chall_min)
+    if pd.notna(recent_fga): recent_fga*=avail_usage_mult
+    if pd.notna(recent_fta): recent_fta*=avail_usage_mult
+    stress_role=stress>=30 or role_surge or minute_conflict
+    wfga=.38 if stress_role else .55
+    if pd.notna(prod_fga) and pd.notna(recent_fga): chall_fga=wfga*prod_fga+(1-wfga)*recent_fga
+    else: chall_fga=prod_fga if pd.notna(prod_fga) else recent_fga
+    if pd.notna(prod_fta) and pd.notna(recent_fta): chall_fta=wfga*prod_fta+(1-wfga)*recent_fta
+    else: chall_fta=prod_fta if pd.notna(prod_fta) else recent_fta
+    chall_fga=float(np.clip(chall_fga if pd.notna(chall_fga) else 0,0,28)); chall_fta=float(np.clip(chall_fta if pd.notna(chall_fta) else 0,0,16))
+    three_rate=(recent_3pa/max(recent_fga,1e-9)) if pd.notna(recent_3pa) and pd.notna(recent_fga) and recent_fga>0 else _app128_num(row,["PTS V2 Projected 3PA"],np.nan)/max(prod_fga,1e-9) if pd.notna(prod_fga) and prod_fga>0 else .30
+    three_rate=float(np.clip(three_rate,.03,.80)); chall_3pa=chall_fga*three_rate; chall_2pa=max(0.0,chall_fga-chall_3pa)
+    attempt_pts=2*chall_2pa*eff["two_pct"]+3*chall_3pa*eff["three_pct"]+chall_fta*eff["ft_pct"]
+    recent_pts=_app128_recent_blend(hist,"PTS",chall_min)
+
+    def exact_prod(market: str, fallbacks: List[str]) -> float:
+        mr=market_rows.get(market)
+        if mr is not None:
+            v=safe_float(mr.get("Final Resolved Projection"),np.nan)
+            if pd.notna(v): return float(v)
+        return _app128_num(row,fallbacks,np.nan)
+    prod_pts=exact_prod("PTS",["Elite Projected PTS","Elite PTS Budget Projection"])
+    prod_reb=exact_prod("REB",["Elite PRA Protected REB Component","Elite Projected REB"])
+    prod_ast=exact_prod("AST",["Elite PRA Protected AST Component","Elite Projected AST"])
+    if pd.isna(prod_pts): prod_pts=recent_pts
+    severe_pts_conflict=pd.notna(prod_pts) and pd.notna(recent_pts) and recent_pts>=6 and (prod_pts<.55*recent_pts or prod_pts>1.70*recent_pts) and not explicit
+    if severe_pts_conflict and minute_conflict and stress>=30: wprod=.08
+    elif severe_pts_conflict or minute_conflict: wprod=.20
+    elif stress_role: wprod=.42
+    else: wprod=.55
+    pts_parts=[(prod_pts,wprod),(attempt_pts,.38 if wprod<=.30 else .32 if wprod<=.42 else .25),(recent_pts,1-wprod-(.38 if wprod<=.30 else .32 if wprod<=.42 else .25))]
+    pts_parts=[(v,w) for v,w in pts_parts if pd.notna(v) and w>0]
+    chall_pts=sum(v*w for v,w in pts_parts)/sum(w for _,w in pts_parts) if pts_parts else np.nan
+    if severe_pts_conflict and minute_conflict and stress>=30 and pd.notna(recent_pts) and not explicit:
+        chall_pts=max(chall_pts,.98*recent_pts)
+    chall_pts=float(np.clip(chall_pts,0,44)) if pd.notna(chall_pts) else np.nan
+
+    # Rebound chance environment: current expected team rebound pool relative to
+    # the team's recent actual rebound pool, then player recent REB/minute share.
+    recent_reb=_app128_recent_blend(hist,"REB",chall_min)
+    expected_reb_pool=_app128_num(row,["Elite OREB Pool"],np.nan)+_app128_num(row,["Elite DREB Pool"],np.nan)
+    recent_team_reb=safe_float(team_ctx.get("reb"),np.nan)
+    reb_env=float(np.clip(expected_reb_pool/max(recent_team_reb,1e-9),.86,1.16)) if pd.notna(expected_reb_pool) and pd.notna(recent_team_reb) and recent_team_reb>0 else 1.0
+    reb_anchor=recent_reb*reb_env*avail_reb_mult if pd.notna(recent_reb) else np.nan
+    reb_w=.20 if minute_conflict and stress>=30 and not explicit else .48 if stress_role or minute_conflict else .60
+    chall_reb=reb_w*prod_reb+(1-reb_w)*reb_anchor if pd.notna(prod_reb) and pd.notna(reb_anchor) else prod_reb if pd.notna(prod_reb) else reb_anchor
+    chall_reb=float(np.clip(chall_reb,0,22)) if pd.notna(chall_reb) else np.nan
+
+    recent_ast=_app128_recent_blend(hist,"AST",chall_min)
+    recent_team_ast=safe_float(team_ctx.get("ast"),np.nan); expected_ast=_app128_num(row,["Elite AST Budget"],np.nan)
+    ast_env=float(np.clip(expected_ast/max(recent_team_ast,1e-9),.86,1.16)) if pd.notna(expected_ast) and pd.notna(recent_team_ast) and recent_team_ast>0 else 1.0
+    ast_anchor=recent_ast*ast_env*avail_ast_mult if pd.notna(recent_ast) else np.nan
+    ast_w=.20 if minute_conflict and stress>=30 and not explicit else .48 if stress_role or minute_conflict else .60
+    chall_ast=ast_w*prod_ast+(1-ast_w)*ast_anchor if pd.notna(prod_ast) and pd.notna(ast_anchor) else prod_ast if pd.notna(prod_ast) else ast_anchor
+    chall_ast=float(np.clip(chall_ast,0,15)) if pd.notna(chall_ast) else np.nan
+    chall_pra=sum(v for v in [chall_pts,chall_reb,chall_ast] if pd.notna(v)) if all(pd.notna(v) for v in [chall_pts,chall_reb,chall_ast]) else np.nan
+    prod_pra=exact_prod("PRA",["Final Resolved Projection"])
+
+    # Role sanity compares production to an independent recent-role anchor. It
+    # never writes to the production fields.
+    role_anchor_pts=recent_pts; role_anchor_reb=reb_anchor; role_anchor_ast=ast_anchor
+    role_conflict=bool(minute_conflict or severe_pts_conflict)
+    conflict_bits=[]
+    if minute_conflict: conflict_bits.append("MINUTES_ROLE_CONFLICT")
+    if severe_pts_conflict: conflict_bits.append("PTS_RECENT_ROLE_CONFLICT")
+    if role_surge: conflict_bits.append("RECENT_ROLE_SURGE")
+    if stress>=30: conflict_bits.append("AVAILABILITY_STRESS")
+    if out_count>=2: conflict_bits.append("DEPLETED_ROTATION")
+    latest=pd.to_datetime(hist.get("GameDate"),errors="coerce").max() if n and "GameDate" in hist.columns else pd.NaT
+    target_date=pd.to_datetime(str(row.get("SlateDate") or row.get("GameDate") or ""),errors="coerce")
+    data_age=(target_date.normalize()-latest.normalize()).days if pd.notna(target_date) and pd.notna(latest) else np.nan
+    stale=bool(pd.notna(data_age) and data_age>4)
+    if stale: conflict_bits.append("ROLE_LOGS_STALE")
+    conf=float(np.clip(35+4*min(n,10)+.35*_app128_num(row,["Elite Minutes V2 Confidence"],60)-.30*stress-18*stale-12*explicit,20,92))
+    return {
+        "player_n":n,"latest":latest,"data_age":data_age,"prod_min":prod_min,"min_p25":min_p25,"min_p50":min_p50,"min_p75":min_p75,"min_sd":min_sd,
+        "out_count":out_count,"questionable_count":q_count,"stress":stress,"vac_min":vac_min,"vac_fga":vac_fga,"vac_reb":vac_reb,"vac_ast":vac_ast,
+        "role_surge":role_surge,"minute_conflict":minute_conflict,"explicit_restriction":explicit,"role_conflict":role_conflict,"conflict_bits":conflict_bits,"confidence":conf,
+        "chall_fga":chall_fga,"chall_fta":chall_fta,"chall_3pa":chall_3pa,"attempt_pts":attempt_pts,"recent_pts_anchor":role_anchor_pts,"recent_reb_anchor":role_anchor_reb,"recent_ast_anchor":role_anchor_ast,"reb_env":reb_env,"ast_env":ast_env,
+        "prod_pts":prod_pts,"prod_reb":prod_reb,"prod_ast":prod_ast,"prod_pra":prod_pra,"chall_pts":chall_pts,"chall_reb":chall_reb,"chall_ast":chall_ast,"chall_pra":chall_pra,
+        "eff_two":eff["two_pct"],"eff_three":eff["three_pct"],"eff_ft":eff["ft_pct"],"team_ctx":team_ctx,
+    }
+
+
+def _attach_app128_role_availability_challenger(board: pd.DataFrame, mode: str="Today") -> pd.DataFrame:
+    """Attach App128 shadow projections without changing production authority."""
+    if board is None or board.empty: return board
+    out=board.copy(); logs=_app125_latest_player_logs()
+    try: inactive,questionable,injury_note=_elite_inactive_by_team(mode)
+    except Exception as exc: inactive,questionable,injury_note={}, {}, f"injury context unavailable: {exc}"
+    # Exact production market projections for each player/team are captured before
+    # challenger calculations so PRA can reconcile to the same saved production board.
+    market_maps={}
+    for _,r in out.iterrows():
+        key=(normalize_name(r.get("Matched Player") or r.get("Player")),_team_key_for_matchup(r.get("Team")))
+        market_maps.setdefault(key,{})[str(r.get("Market","")).upper()]=r.copy()
+    protected_cols=[c for c in ["Projection","Lean","Over %","Under %","Final Resolved Projection","Final Resolved Side","Final Recommendation State","Final Resolved Over %","Final Resolved Under %","Elite Rank","Elite Rank Score","Elite Status"] if c in out.columns]
+    protected={c:out[c].copy() for c in protected_cols}
+    rows=[]
+    for _,rr in out.iterrows():
+        r=rr.copy(); nk=normalize_name(r.get("Matched Player") or r.get("Player")); tk=_team_key_for_matchup(r.get("Team")); market=str(r.get("Market","")).upper(); line=safe_float(r.get("Line"),np.nan); prod=safe_float(r.get("Final Resolved Projection"),np.nan); prod_side=str(r.get("Final Resolved Side","") or "").upper()
+        ctx=_app128_component_challenger(r,market_maps.get((nk,tk),{}),logs,inactive,questionable,mode)
+        challenger={"PTS":ctx.get("chall_pts"),"REB":ctx.get("chall_reb"),"AST":ctx.get("chall_ast"),"PRA":ctx.get("chall_pra")}.get(market,np.nan)
+        cside="OVER" if pd.notna(challenger) and pd.notna(line) and challenger>line else "UNDER" if pd.notna(challenger) and pd.notna(line) and challenger<line else "PASS"
+        cedge=challenger-line if pd.notna(challenger) and pd.notna(line) else np.nan
+        delta=challenger-prod if pd.notna(challenger) and pd.notna(prod) else np.nan
+        side_agree=bool(cside==prod_side and cside in {"OVER","UNDER"})
+        threshold=_app128_market_threshold(market); material=bool(pd.notna(delta) and abs(delta)>=threshold)
+        side_disagree=bool(cside in {"OVER","UNDER"} and prod_side in {"OVER","UNDER"} and cside!=prod_side)
+        conflict_bits=list(ctx.get("conflict_bits",[]))
+        if material: conflict_bits.append("MATERIAL_PROJECTION_DELTA")
+        if side_disagree: conflict_bits.append("SIDE_DISAGREEMENT")
+        if side_disagree or bool(ctx.get("role_conflict")):
+            status="CONFLICT"
+        elif material or safe_float(ctx.get("stress"),0)>=30 or bool(ctx.get("role_surge")):
+            status="CAUTION"
+        else: status="CLEAR"
+        action="SHADOW_SIDE_DISAGREEMENT" if side_disagree else "AUDIT_ROLE_CONFLICT" if status=="CONFLICT" else "SHADOW_CAUTION" if status=="CAUTION" else "SHADOW_AGREE"
+        # Shadow probability for audit only; never a betting-confidence replacement.
+        sd=_app126_default_sd(market)
+        over=_normal_over_probability(line,challenger,sd) if pd.notna(line) and pd.notna(challenger) else np.nan
+        under=100-over if pd.notna(over) else np.nan
+        r["App128 Production Projection"]=round(prod,3) if pd.notna(prod) else np.nan
+        r["App128 Production Side"]=prod_side
+        r["App128 Challenger Projection"]=round(challenger,3) if pd.notna(challenger) else np.nan
+        r["App128 Challenger Side"]=cside
+        r["App128 Challenger Edge"]=round(cedge,3) if pd.notna(cedge) else np.nan
+        r["App128 Challenger Over %"]=round(float(np.clip(over,12,88)),1) if pd.notna(over) else np.nan
+        r["App128 Challenger Under %"]=round(float(np.clip(under,12,88)),1) if pd.notna(under) else np.nan
+        r["App128 Projection Delta"]=round(delta,3) if pd.notna(delta) else np.nan
+        r["App128 Side Agreement"]=side_agree
+        r["App128 Side Disagreement"]=side_disagree
+        r["App128 Role Sanity Status"]=status
+        r["App128 Recommended Action"]=action
+        r["App128 Challenger Confidence"]=round(safe_float(ctx.get("confidence"),0),1)
+        r["App128 Challenger Policy"]="SHADOW_ONLY_DO_NOT_CHANGE_FINAL_AUTHORITY"
+        r["App128 Challenger Version"]="APP128_ROLE_AVAILABILITY_V1"
+        r["App128 Role Conflict Flags"]=" | ".join(dict.fromkeys(conflict_bits)) if conflict_bits else "CLEAR"
+        r["App128 Recent Games"]=int(safe_float(ctx.get("player_n"),0)); r["App128 Role Data Through"]=str(ctx.get("latest") or "")[:10] if pd.notna(pd.to_datetime(ctx.get("latest"),errors="coerce")) else ""
+        r["App128 Role Data Age Days"]=safe_float(ctx.get("data_age"),np.nan)
+        r["App128 Availability Stress Score"]=round(safe_float(ctx.get("stress"),0),1); r["App128 Team Outs"]=int(safe_float(ctx.get("out_count"),0)); r["App128 Team Questionable"]=int(safe_float(ctx.get("questionable_count"),0))
+        r["App128 Vacancy Minutes"]=round(safe_float(ctx.get("vac_min"),0),2); r["App128 Vacancy FGA"]=round(safe_float(ctx.get("vac_fga"),0),2); r["App128 Vacancy REB"]=round(safe_float(ctx.get("vac_reb"),0),2); r["App128 Vacancy AST"]=round(safe_float(ctx.get("vac_ast"),0),2)
+        r["App128 Recent Role Surge"]=bool(ctx.get("role_surge")); r["App128 Minutes Role Conflict"]=bool(ctx.get("minute_conflict")); r["App128 Explicit Role Restriction"]=bool(ctx.get("explicit_restriction"))
+        r["App128 Minutes Production"]=round(safe_float(ctx.get("prod_min"),np.nan),2) if pd.notna(safe_float(ctx.get("prod_min"),np.nan)) else np.nan
+        r["App128 Minutes P25"]=round(safe_float(ctx.get("min_p25"),np.nan),2) if pd.notna(safe_float(ctx.get("min_p25"),np.nan)) else np.nan
+        r["App128 Minutes P50"]=round(safe_float(ctx.get("min_p50"),np.nan),2) if pd.notna(safe_float(ctx.get("min_p50"),np.nan)) else np.nan
+        r["App128 Minutes P75"]=round(safe_float(ctx.get("min_p75"),np.nan),2) if pd.notna(safe_float(ctx.get("min_p75"),np.nan)) else np.nan
+        r["App128 Projected FGA"]=round(safe_float(ctx.get("chall_fga"),np.nan),2) if pd.notna(safe_float(ctx.get("chall_fga"),np.nan)) else np.nan; r["App128 Projected FTA"]=round(safe_float(ctx.get("chall_fta"),np.nan),2) if pd.notna(safe_float(ctx.get("chall_fta"),np.nan)) else np.nan; r["App128 Projected 3PA"]=round(safe_float(ctx.get("chall_3pa"),np.nan),2) if pd.notna(safe_float(ctx.get("chall_3pa"),np.nan)) else np.nan
+        r["App128 Attempt Model PTS"]=round(safe_float(ctx.get("attempt_pts"),np.nan),2) if pd.notna(safe_float(ctx.get("attempt_pts"),np.nan)) else np.nan
+        r["App128 Recent Role PTS Anchor"]=round(safe_float(ctx.get("recent_pts_anchor"),np.nan),2) if pd.notna(safe_float(ctx.get("recent_pts_anchor"),np.nan)) else np.nan; r["App128 Recent Role REB Anchor"]=round(safe_float(ctx.get("recent_reb_anchor"),np.nan),2) if pd.notna(safe_float(ctx.get("recent_reb_anchor"),np.nan)) else np.nan; r["App128 Recent Role AST Anchor"]=round(safe_float(ctx.get("recent_ast_anchor"),np.nan),2) if pd.notna(safe_float(ctx.get("recent_ast_anchor"),np.nan)) else np.nan
+        r["App128 Rebound Environment Factor"]=round(safe_float(ctx.get("reb_env"),1),3); r["App128 Assist Environment Factor"]=round(safe_float(ctx.get("ast_env"),1),3)
+        r["App128 Expected 2P%"] = round(100*safe_float(ctx.get("eff_two"),np.nan),1) if pd.notna(safe_float(ctx.get("eff_two"),np.nan)) else np.nan; r["App128 Expected 3P%"] = round(100*safe_float(ctx.get("eff_three"),np.nan),1) if pd.notna(safe_float(ctx.get("eff_three"),np.nan)) else np.nan; r["App128 Expected FT%"] = round(100*safe_float(ctx.get("eff_ft"),np.nan),1) if pd.notna(safe_float(ctx.get("eff_ft"),np.nan)) else np.nan
+        r["App128 Challenger PTS"]=round(safe_float(ctx.get("chall_pts"),np.nan),2) if pd.notna(safe_float(ctx.get("chall_pts"),np.nan)) else np.nan; r["App128 Challenger REB"]=round(safe_float(ctx.get("chall_reb"),np.nan),2) if pd.notna(safe_float(ctx.get("chall_reb"),np.nan)) else np.nan; r["App128 Challenger AST"]=round(safe_float(ctx.get("chall_ast"),np.nan),2) if pd.notna(safe_float(ctx.get("chall_ast"),np.nan)) else np.nan; r["App128 Challenger PRA"]=round(safe_float(ctx.get("chall_pra"),np.nan),2) if pd.notna(safe_float(ctx.get("chall_pra"),np.nan)) else np.nan
+        r["App128 Injury Feed Note"]=str(injury_note)
+        rows.append(r)
+    result=pd.DataFrame(rows,index=out.index)
+    # Hard protection: App128 is forbidden to modify production authority/rank.
+    _numeric_protected={"Projection","Over %","Under %","Final Resolved Projection","Final Resolved Over %","Final Resolved Under %","Elite Rank","Elite Rank Score"}
+    for c,old in protected.items():
+        if c not in result.columns: raise RuntimeError(f"App128 removed protected column {c}")
+        if c in _numeric_protected:
+            a=pd.to_numeric(old,errors="coerce"); b=pd.to_numeric(result[c],errors="coerce")
+            if not np.allclose(a,b,equal_nan=True): raise RuntimeError(f"App128 changed protected numeric field {c}")
+        else:
+            if not old.fillna("").astype(str).equals(result[c].fillna("").astype(str)): raise RuntimeError(f"App128 changed protected field {c}")
+    try:
+        audit_cols=[c for c in ["SlateDate","Player","Team","Opponent","Market","Line","Final Resolved Projection","Final Resolved Side","Elite Rank","Elite Rank Score","App128 Challenger Projection","App128 Challenger Side","App128 Projection Delta","App128 Side Disagreement","App128 Role Sanity Status","App128 Role Conflict Flags","App128 Availability Stress Score","App128 Team Outs","App128 Team Questionable","App128 Minutes Production","App128 Minutes P25","App128 Minutes P50","App128 Minutes P75","App128 Projected FGA","App128 Projected FTA","App128 Recent Role PTS Anchor","App128 Recent Role REB Anchor","App128 Recent Role AST Anchor","App128 Challenger PTS","App128 Challenger REB","App128 Challenger AST","App128 Challenger PRA","App128 Recommended Action"] if c in result.columns]
+        result[audit_cols].to_csv(APP128_ROLE_AUDIT_FILE,index=False)
+    except Exception: pass
+    return result
+
+
 def _promote_final_authority(board: pd.DataFrame) -> pd.DataFrame:
     if board is None or board.empty or "Final Resolved Projection" not in board.columns: return board
     out=board.copy(); out["Projection"]=pd.to_numeric(out["Final Resolved Projection"],errors="coerce"); out["Edge"]=pd.to_numeric(out.get("Final Resolved Edge"),errors="coerce"); out["Lean"]=out.get("Final Resolved Side",out.get("Lean","PASS")); out["Over %"]=pd.to_numeric(out.get("Final Resolved Over %"),errors="coerce"); out["Under %"]=pd.to_numeric(out.get("Final Resolved Under %"),errors="coerce")
     status=out.get("Elite Status",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); side=out.get("Final Resolved Side",pd.Series("PASS",index=out.index)).astype(str).str.upper(); rank=pd.to_numeric(out.get("Elite Rank"),errors="coerce"); rec=status.isin(["ELITE","STRONG","PLAYABLE","LEAN"])&side.isin(["OVER","UNDER"])&rank.notna(); rec_state=out.get("Final Recommendation State",pd.Series("TRACK",index=out.index)).astype(str).str.upper(); readiness=out.get("Projection Readiness",pd.Series("READY",index=out.index)).astype(str).str.upper(); valid=pd.to_numeric(out.get("Line"),errors="coerce").notna()&pd.to_numeric(out.get("Projection"),errors="coerce").notna()
     fallback=np.where(~valid,"PASS",np.where(rec_state.eq("BLOCK")|readiness.eq("BLOCK"),"BLOCK",np.where(rec_state.eq("WAIT")|readiness.eq("WAIT"),"WAIT","TRACK")))
-    out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),fallback); out["Recommendation State"]=np.where(rec,status,fallback); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP127_APP126_PROJECTION_RANK_SELECTION"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY_APP126_PLUS_APP127_RANK"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
+    out["Official"]=np.where(rec,np.where(side.eq("OVER"),"🔥 OVER","⚠️ UNDER"),fallback); out["Recommendation State"]=np.where(rec,status,fallback); out["Tier"]=np.select([status.eq("ELITE"),status.eq("STRONG"),status.eq("PLAYABLE"),status.eq("LEAN")],["S","A","B","C"],default="TRACK"); out["Official Play Score"]=pd.to_numeric(out.get("Elite Rank Score"),errors="coerce").fillna(pd.to_numeric(out.get("Official Play Score"),errors="coerce")); out["Production Projection Authority"]="FINAL_RESOLVED_PROJECTION"; out["Active Model"]="FINAL_RESOLVED"; out["Projection Engine Version"]="APP128_ROLE_AVAIL_CHALLENGER_SHADOW"; out["Projection Input Path"]="FINAL_RESOLVED_AUTHORITY_APP126_PLUS_APP127_RANK_PLUS_APP128_SHADOW"; out["Resolved Market Policy"]=out.get("Final Projection Source",pd.Series("FINAL_RESOLVED",index=out.index)); return out
 
 
 def build_copy_paste_slate(df: pd.DataFrame, best_only: bool=False, max_rows: int=0) -> str:
@@ -18935,7 +19324,7 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
     if board is not None and not board.empty:
         legacy_projection=pd.to_numeric(board["Projection"],errors="coerce").copy(); board=attach_model_comparison(board,repository=HHSRepository(),simulations=10_000)
         if not np.allclose(pd.to_numeric(board["Projection"],errors="coerce"),legacy_projection,equal_nan=True): raise RuntimeError("HHS challenger changed the pre-resolver legacy Projection column")
-        board=_attach_canonical_injury_state(board,active_mode,logs); board=_attach_final_resolved_projection(board); board=_attach_final_calibration_context(board); board=_elite_rank_board(board); board=_promote_final_authority(board); board["LineParserVersion"]=LINE_PARSER_VERSION; board["Injury Scenario Version"]=INJURY_SCENARIO_VERSION; save_dataset("projection_board",board)
+        board=_attach_canonical_injury_state(board,active_mode,logs); board=_attach_final_resolved_projection(board); board=_attach_final_calibration_context(board); board=_elite_rank_board(board); board=_promote_final_authority(board); board=_attach_app128_role_availability_challenger(board,active_mode); board["Projection Engine Version"]=PROJECTION_ENGINE_VERSION; board["LineParserVersion"]=LINE_PARSER_VERSION; board["Injury Scenario Version"]=INJURY_SCENARIO_VERSION; save_dataset("projection_board",board)
     return board
 
 
@@ -19053,7 +19442,7 @@ with tabs[1]:
         if card_view:
             for _, rr in show.head(50).iterrows():
                 render_elite_rank_card(rr)
-        display_cols = [c for c in ["Elite Rank", "Elite Market Rank", "Elite Status", "Elite Rank Score", "Elite Best Play", "Elite Side", "Elite Projection", "Elite Edge", "Elite Calibrated Probability %", "Elite P50", "Elite Scoring Role", "Elite Rebound Role", "Elite Creation Role", "Elite Role Security", "Elite Market Role Fit", "Elite Role Summary", "Elite Scoring Hierarchy Rank", "Elite Rebound Hierarchy Rank", "Elite Creation Hierarchy Rank", "Elite Team FGA Share %", "Elite Team PTS Share %", "Elite Team REB Share %", "Elite Team AST Share %", "Elite Expected Team Points", "Elite Expected Opp Points", "Elite Expected Game Total", "Elite Projected FGA", "Elite Projected FTA", "Elite Vacancy Minutes", "Elite Vacancy FGA", "Elite Vacancy REB", "Elite Vacancy AST", "Elite Team Player PTS Sum", "Elite Projected PTS", "Elite Projected REB", "Elite Projected AST", "App127 Best Slate Qualified", "App127 Best Slate Gate Reason", "App127 Edge To Volatility", "App127 Prior Line Hit Shrunk %", "App127 Independent Family N", "App127 Independent Family Agree", "App127 Independent Family Score %", "App127 Independent Family Votes", "App127 Recent Robust SD", "App127 Fragile Accumulator Under", "App127 AST Share Concentration", "App127 Selection Adjustment", "App127 Selection Penalties", "App127 Selection Bonuses", "Elite Flags", "Elite Agreement Score", "Elite Data Quality", "Elite Risk Penalty", "Projection Readiness", "Projection Missing Inputs", "Projection Data Through", "Projection Data Age Days", "Player Games Available", "Player Last Game", "Full Live Board Rows", "Projected Live Rows", "Unprojected Live Rows", "Tier", "Official", "Clean Risk", "Playable Gate", "Winning Play Score", "Projection Engine Version", "LineParserVersion", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided", "Slate Player Prop Coverage", "Slate Missing From Player Props", "Opening Line", "CLV", "Projection", "Legacy Projection", "Challenger Projection", "PTS V2 Projection", "PTS V2 Side", "PTS V2 Edge", "PTS V2 Over %", "PTS V2 Under %", "PTS V2 P50", "PTS V2 Projected FGA", "PTS V2 Projected 3PA", "PTS V2 Projected FTA", "PTS V2 Usage %", "PTS V2 Team FGA Share %", "PTS V2 Team Total Scale", "PTS V2 Flags", "PTS V2 Data Quality", "PRA V2 Projection", "V2 Market Policy", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
+        display_cols = [c for c in ["Elite Rank", "Elite Market Rank", "Elite Status", "Elite Rank Score", "Elite Best Play", "Elite Side", "Elite Projection", "Elite Edge", "Elite Calibrated Probability %", "Elite P50", "Elite Scoring Role", "Elite Rebound Role", "Elite Creation Role", "Elite Role Security", "Elite Market Role Fit", "Elite Role Summary", "Elite Scoring Hierarchy Rank", "Elite Rebound Hierarchy Rank", "Elite Creation Hierarchy Rank", "Elite Team FGA Share %", "Elite Team PTS Share %", "Elite Team REB Share %", "Elite Team AST Share %", "Elite Expected Team Points", "Elite Expected Opp Points", "Elite Expected Game Total", "Elite Projected FGA", "Elite Projected FTA", "Elite Vacancy Minutes", "Elite Vacancy FGA", "Elite Vacancy REB", "Elite Vacancy AST", "Elite Team Player PTS Sum", "Elite Projected PTS", "Elite Projected REB", "Elite Projected AST", "App127 Best Slate Qualified", "App127 Best Slate Gate Reason", "App127 Edge To Volatility", "App127 Prior Line Hit Shrunk %", "App127 Independent Family N", "App127 Independent Family Agree", "App127 Independent Family Score %", "App127 Independent Family Votes", "App127 Recent Robust SD", "App127 Fragile Accumulator Under", "App127 AST Share Concentration", "App127 Selection Adjustment", "App127 Selection Penalties", "App127 Selection Bonuses", "App128 Role Sanity Status", "App128 Recommended Action", "App128 Production Projection", "App128 Production Side", "App128 Challenger Projection", "App128 Challenger Side", "App128 Challenger Edge", "App128 Projection Delta", "App128 Side Agreement", "App128 Side Disagreement", "App128 Challenger Confidence", "App128 Role Conflict Flags", "App128 Availability Stress Score", "App128 Team Outs", "App128 Team Questionable", "App128 Recent Role Surge", "App128 Minutes Role Conflict", "App128 Minutes Production", "App128 Minutes P25", "App128 Minutes P50", "App128 Minutes P75", "App128 Projected FGA", "App128 Projected FTA", "App128 Projected 3PA", "App128 Attempt Model PTS", "App128 Recent Role PTS Anchor", "App128 Recent Role REB Anchor", "App128 Recent Role AST Anchor", "App128 Rebound Environment Factor", "App128 Assist Environment Factor", "App128 Challenger PTS", "App128 Challenger REB", "App128 Challenger AST", "App128 Challenger PRA", "Elite Flags", "Elite Agreement Score", "Elite Data Quality", "Elite Risk Penalty", "Projection Readiness", "Projection Missing Inputs", "Projection Data Through", "Projection Data Age Days", "Player Games Available", "Player Last Game", "Full Live Board Rows", "Projected Live Rows", "Unprojected Live Rows", "Tier", "Official", "Clean Risk", "Playable Gate", "Winning Play Score", "Projection Engine Version", "LineParserVersion", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided", "Slate Player Prop Coverage", "Slate Missing From Player Props", "Opening Line", "CLV", "Projection", "Legacy Projection", "Challenger Projection", "PTS V2 Projection", "PTS V2 Side", "PTS V2 Edge", "PTS V2 Over %", "PTS V2 Under %", "PTS V2 P50", "PTS V2 Projected FGA", "PTS V2 Projected 3PA", "PTS V2 Projected FTA", "PTS V2 Usage %", "PTS V2 Team FGA Share %", "PTS V2 Team Total Scale", "PTS V2 Flags", "PTS V2 Data Quality", "PRA V2 Projection", "V2 Market Policy", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
         st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
@@ -19358,7 +19747,33 @@ with tabs[7]:
     except Exception as _app127_ui_exc:
         st.warning(f"App127 Best Slate audit unavailable: {_app127_ui_exc}")
 
-    st.markdown("### 6) Automated Historical Backtest")
+    st.markdown("### 6) App128 Role / Availability Challenger Audit")
+    st.caption("Shadow-only. Production Final Resolved projections and App127 ranks are untouched. This section shows current role conflicts and, after grading, whether the challenger actually reduced MAE / rescued losses without breaking production winners.")
+    try:
+        _a128_path=CACHE_FILES["projection_board"]
+        _a128=pd.read_csv(_a128_path) if _a128_path.exists() else pd.DataFrame()
+        if _a128 is None or _a128.empty or "App128 Challenger Projection" not in _a128.columns:
+            st.info("Refresh Today with App128 to populate role/availability challenger diagnostics.")
+        else:
+            _d128=_a128.copy(); _conf=_d128.get("App128 Role Sanity Status",pd.Series("",index=_d128.index)).astype(str).str.upper().eq("CONFLICT"); _dis=_d128.get("App128 Side Disagreement",pd.Series(False,index=_d128.index)).fillna(False).astype(bool); _surge=_d128.get("App128 Recent Role Surge",pd.Series(False,index=_d128.index)).fillna(False).astype(bool)
+            _m1,_m2,_m3,_m4=st.columns(4); _m1.metric("Role conflicts",int(_conf.sum())); _m2.metric("Side disagreements",int(_dis.sum())); _m3.metric("Recent role surges",int(_surge.sum())); _m4.metric("High availability stress",int((pd.to_numeric(_d128.get("App128 Availability Stress Score"),errors="coerce")>=30).sum()))
+            _cols=[c for c in ["Elite Rank","Player","Team","Opponent","Market","Line","Final Resolved Projection","Final Resolved Side","App128 Challenger Projection","App128 Challenger Side","App128 Projection Delta","App128 Role Sanity Status","App128 Role Conflict Flags","App128 Challenger Confidence","App128 Availability Stress Score","App128 Team Outs","App128 Team Questionable","App128 Recent Role Surge","App128 Minutes Production","App128 Minutes P25","App128 Minutes P50","App128 Minutes P75","App128 Projected FGA","App128 Projected FTA","App128 Attempt Model PTS","App128 Recent Role PTS Anchor","App128 Recent Role REB Anchor","App128 Recent Role AST Anchor","App128 Challenger PTS","App128 Challenger REB","App128 Challenger AST","App128 Challenger PRA","App128 Recommended Action"] if c in _d128.columns]
+            st.dataframe(_d128[_cols].sort_values(["App128 Role Sanity Status","App128 Availability Stress Score"],ascending=[True,False]).head(150),use_container_width=True,hide_index=True)
+            st.download_button("Download App128 role/availability audit CSV",_d128[_cols].to_csv(index=False),"wnba_app128_role_availability_audit.csv","text/csv")
+        _g128=pd.DataFrame(load_json(LEARNING_LOG,[]))
+        if _g128 is not None and not _g128.empty and "App128 Challenger Result" in _g128.columns:
+            _valid=_g128[_g128["App128 Challenger Result"].astype(str).str.upper().isin(["WIN","LOSS","PUSH"])].copy()
+            if not _valid.empty:
+                _valid["App128 Challenger Abs Error"]=pd.to_numeric(_valid.get("App128 Challenger Abs Error"),errors="coerce"); _valid["App128 Production Final Abs Error"]=pd.to_numeric(_valid.get("App128 Production Final Abs Error"),errors="coerce")
+                _rescue=int(_valid.get("App128 Rescued Production Loss",pd.Series(False,index=_valid.index)).fillna(False).astype(bool).sum()); _break=int(_valid.get("App128 Broke Production Win",pd.Series(False,index=_valid.index)).fillna(False).astype(bool).sum()); _net=_rescue-1.25*_break
+                _g1,_g2,_g3,_g4=st.columns(4); _g1.metric("Challenger graded",len(_valid)); _g2.metric("Losses rescued",_rescue); _g3.metric("Wins broken",_break); _g4.metric("Net rescue score",f"{_net:+.2f}")
+                _cmp=_valid.groupby("Market",dropna=False).agg(Plays=("App128 Challenger Result","count"),ChallengerWins=("App128 Challenger Result",lambda x:(x.astype(str).str.upper()=="WIN").sum()),ChallengerMAE=("App128 Challenger Abs Error","mean"),ProductionMAE=("App128 Production Final Abs Error","mean"),Rescued=("App128 Rescued Production Loss",lambda x:pd.Series(x).fillna(False).astype(bool).sum()),Broken=("App128 Broke Production Win",lambda x:pd.Series(x).fillna(False).astype(bool).sum())).reset_index(); _cmp["ChallengerWinRate %"]=100*_cmp["ChallengerWins"]/_cmp["Plays"].clip(lower=1); _cmp["MAE Improvement"]= _cmp["ProductionMAE"]-_cmp["ChallengerMAE"]; _cmp["Net Rescue Score"]=_cmp["Rescued"]-1.25*_cmp["Broken"]
+                st.markdown("#### Graded App128 shadow vs production")
+                st.dataframe(_cmp,use_container_width=True,hide_index=True)
+    except Exception as _a128_ui_exc:
+        st.warning(f"App128 challenger audit unavailable: {_a128_ui_exc}")
+
+    st.markdown("### 7) Automated Historical Backtest")
     st.caption("Backtests the projection formula on historical logs using a prior-games-only line proxy. This validates model direction/calibration without claiming it had real sportsbook historical lines.")
     min_prior = st.slider("Minimum prior games before testing", 3, 15, 5)
     if st.button("Run historical backtest", use_container_width=True):
