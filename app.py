@@ -13,6 +13,15 @@ Line-source build:
 """
 
 
+# APP131 PROSPECTIVE TRACKING + GRADER RECOVERY + FORWARD AUDIT
+# - NO production projection, side, probability, App128 shadow, or App130 profitability-gate math changes.
+# - Automatically freezes/updates one PRE-GAME tracking row per player/market/slate so grading no longer depends on the
+#   "Official Plays" count or a manual Save click.
+# - Final grader prefers ESPN/official FINAL rows, can recover a verified pregame saved-board snapshot, and reports
+#   unresolved grading reasons instead of silently returning a green "graded 0" state.
+# - Adds an opt-in FULL WNBA FORWARD AUDIT ZIP for prospective A/B review (diagnostic only).
+# - App128 remains SHADOW ONLY. App130 remains the ranking/profit gate.
+#
 # APP130 CAUSAL PROFITABILITY GATE
 # - Preserves App129 projection/side authority and all App128 shadow fields.
 # - Adds role-specific opponent defense, possession/minute environment, empirical short-handed role splits,
@@ -197,6 +206,10 @@ LINE_HISTORY_FILE = LOCAL_DIR / "wnba_line_history.json"
 MANUAL_LINES_FILE = LOCAL_DIR / "wnba_manual_lines.json"
 INJURY_BUMPS_FILE = LOCAL_DIR / "wnba_injury_usage_bumps.json"
 NO_LINE_FILE = LOCAL_DIR / "wnba_no_line_tracking.json"
+APP131_GRADE_AUDIT_DIR = LOCAL_DIR / "grade_audits"
+APP131_GRADE_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+APP131_TRACKING_VERSION = "APP131_PROSPECTIVE_TRACKING_V1"
+APP131_AUDIT_VERSION = "APP131_FORWARD_AUDIT_V1"
 
 CACHE_FILES = {
     "player_game_logs": DATA_DIR / "wnba_player_game_logs.csv",
@@ -536,7 +549,8 @@ def save_board_snapshot(board_df: pd.DataFrame, lines_df: Optional[pd.DataFrame]
             return 0
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         out = board_df.copy()
-        out["SavedBoardAt"] = now_iso()
+        out["SavedBoardAt"] = now_iso()  # legacy/server timestamp retained for compatibility
+        out["SavedBoardAtLocal"] = datetime.now(app_timezone()).isoformat(timespec="seconds")
         out["SavedBoardMode"] = mode
         out["LineParserVersion"] = LINE_PARSER_VERSION
         out.to_csv(SAVED_BOARD_FILE, index=False)
@@ -548,6 +562,7 @@ def save_board_snapshot(board_df: pd.DataFrame, lines_df: Optional[pd.DataFrame]
         if lines_df is not None and not lines_df.empty:
             ldf = lines_df.copy()
             ldf["SavedBoardAt"] = out["SavedBoardAt"].iloc[0]
+            ldf["SavedBoardAtLocal"] = out["SavedBoardAtLocal"].iloc[0]
             ldf["SavedBoardMode"] = mode
             ldf["LineParserVersion"] = LINE_PARSER_VERSION
             ldf.to_csv(SAVED_LINES_FILE, index=False)
@@ -5076,7 +5091,15 @@ def grade_pending(logs, mode: Optional[str] = None, allowed_dates: Optional[List
             if not opp_match.empty:
                 d = opp_match
 
-        d = d.sort_values(["_GradeDate", "GameDate"], na_position="last")
+        # Prefer a freshly pulled FINAL source over an older/cached duplicate for the same player/date.
+        # This is grading-only and cannot change any pregame projection.
+        _src_text = d.get("Source", pd.Series("", index=d.index)).astype(str).str.lower()
+        d["_FinalSourcePriority"] = np.select(
+            [_src_text.str.contains("espn final", na=False), _src_text.str.contains("wnba official", na=False)],
+            [3, 2],
+            default=1,
+        )
+        d = d.sort_values(["_FinalSourcePriority", "_GradeDate", "GameDate"], ascending=[False, False, False], na_position="last")
         stat_row = d.iloc[0]
         source = str(stat_row.get("Source", ""))
         minutes = safe_float(stat_row.get("MIN"), 0)
@@ -5525,17 +5548,305 @@ def _pending_grade_dates(mode: Optional[str]) -> List[date]:
     return dates[-10:]
 
 
-def pull_final_results_and_grade(mode: Optional[str] = "Today") -> Tuple[int, pd.DataFrame]:
-    """MLB-style one-click grading: pull final boxscores, merge logs, then grade.
 
-    ESPN is primary. The official WNBA live boxscore is a safe fallback. All pending
-    dates are supported, and the newly pulled rows are passed directly to the grader.
+# ============================================================
+# APP131 — prospective tracking / grade recovery (grading only)
+# ============================================================
+def _app131_naive_local_ts(value: Any) -> pd.Timestamp:
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.isna(dt):
+        return pd.NaT
+    try:
+        if getattr(dt, "tzinfo", None) is not None:
+            dt = dt.tz_convert(app_timezone()).tz_localize(None)
+    except Exception:
+        try:
+            dt = dt.tz_localize(None)
+        except Exception:
+            pass
+    return pd.Timestamp(dt)
+
+
+def _app131_record_slate_date(row: Any, mode: Optional[str] = None) -> Optional[date]:
+    for key in ["SlateDate", "GameDate"]:
+        try:
+            dt = pd.to_datetime(row.get(key), errors="coerce")
+            if pd.notna(dt): return dt.date()
+        except Exception:
+            pass
+    try:
+        if mode in ["Today", "Tomorrow"]:
+            return slate_target_date(mode)
+    except Exception:
+        pass
+    return None
+
+
+def _app131_pending_count(targets: Optional[List[date]] = None) -> int:
+    rows = load_json(OFFICIAL_LOG, [])
+    if not isinstance(rows, list): return 0
+    allowed = {d for d in (targets or []) if d is not None}
+    n = 0
+    for r in rows:
+        if str(r.get("Result", "PENDING")).upper() != "PENDING": continue
+        d = _grade_record_date(r)
+        if allowed and d not in allowed: continue
+        n += 1
+    return n
+
+
+def _app131_upsert_tracking_rows(
+    board_df: Optional[pd.DataFrame],
+    mode: str = "Today",
+    snapshot_type: str = "AUTO_PROSPECTIVE_TRACK",
+    require_verified_pregame: bool = True,
+) -> Dict[str, Any]:
+    """Freeze/update one latest PRE-GAME row per player+market+slate.
+
+    This makes grading independent of the Best-Slate/Official gate. It never writes
+    Actual/Result for a completed play and never changes the projection board itself.
     """
+    stats = {"seen": 0, "eligible": 0, "inserted": 0, "updated": 0, "skipped_poststart": 0, "skipped_unverified": 0}
+    if board_df is None or getattr(board_df, "empty", True): return stats
+    work = board_df.copy()
+    stats["seen"] = int(len(work))
+    if "Market" not in work.columns or "Line" not in work.columns: return stats
+    work["Market"] = work["Market"].astype(str).str.upper().str.strip()
+    work["Line"] = pd.to_numeric(work["Line"], errors="coerce")
+    proj_col = "Final Resolved Projection" if "Final Resolved Projection" in work.columns else "Projection"
+    if proj_col not in work.columns: return stats
+    work[proj_col] = pd.to_numeric(work[proj_col], errors="coerce")
+    work = work[work["Market"].isin(["PTS","REB","AST","PRA"]) & work["Line"].notna() & work[proj_col].notna()].copy()
+    if "Source" in work.columns:
+        work = work[~work["Source"].astype(str).str.upper().str.contains("NO LINE|MISSING", na=False)].copy()
+    if work.empty: return stats
+
+    log = load_json(OFFICIAL_LOG, [])
+    if not isinstance(log, list): log = []
+    index = {}
+    for i, r in enumerate(log):
+        d = _grade_record_date(r)
+        key = (str(d or ""), normalize_name(r.get("Matched Player") or r.get("Player")), str(r.get("Market", "")).upper())
+        index.setdefault(key, []).append(i)
+
+    now_local = pd.Timestamp(datetime.now(app_timezone()).replace(tzinfo=None))
+    touched = False
+    for _, r in work.iterrows():
+        slate_d = _app131_record_slate_date(r, mode)
+        if slate_d is None: continue
+        player = str(r.get("Matched Player") or r.get("Player") or "").strip()
+        market = str(r.get("Market") or "").upper().strip()
+        if not player or market not in {"PTS","REB","AST","PRA"}: continue
+
+        snap_raw = None
+        for _snap_key in ["SavedBoardAtLocal", "SavedAtLocal", "SavedBoardAt", "SavedAt"]:
+            _candidate = r.get(_snap_key)
+            try:
+                _missing = _candidate is None or pd.isna(_candidate) or str(_candidate).strip() == ""
+            except Exception:
+                _missing = _candidate is None or str(_candidate).strip() == ""
+            if not _missing:
+                snap_raw = _candidate
+                break
+        snap_ts = _app131_naive_local_ts(snap_raw if snap_raw is not None else now_local)
+        if pd.isna(snap_ts): snap_ts = now_local
+        start_ts = _app131_naive_local_ts(r.get("Start"))
+        verified = pd.notna(start_ts) and snap_ts < start_ts
+        if pd.notna(start_ts) and snap_ts >= start_ts:
+            stats["skipped_poststart"] += 1
+            continue
+        if require_verified_pregame and not verified:
+            stats["skipped_unverified"] += 1
+            continue
+
+        final_proj = safe_float(r.get("Final Resolved Projection"), safe_float(r.get("Projection"), np.nan))
+        line = safe_float(r.get("Line"), np.nan)
+        if pd.isna(final_proj) or pd.isna(line): continue
+        side = str(r.get("Final Resolved Side") or r.get("Lean") or "").upper().strip()
+        if side not in {"OVER","UNDER"}:
+            side = "OVER" if final_proj > line else "UNDER" if final_proj < line else "PASS"
+        if side not in {"OVER","UNDER"}: continue
+        stats["eligible"] += 1
+
+        row = {k: (_json_safe(v) if not isinstance(v, (dict, list)) else v) for k, v in r.to_dict().items()}
+        row["Projection"] = float(final_proj)
+        row["Lean"] = side
+        row["Final Resolved Projection"] = float(final_proj)
+        row["Final Resolved Side"] = side
+        row["SlateDate"] = str(slate_d)
+        row["SavedAt"] = snap_ts.isoformat()
+        row["LastTrackedAt"] = snap_ts.isoformat()
+        row["TrackingVersion"] = APP131_TRACKING_VERSION
+        row["SnapshotType"] = snapshot_type
+        row["PregameSnapshotVerified"] = bool(verified)
+        row["Result"] = "PENDING"
+        row["Actual"] = None
+        row["WasOfficialAtSave"] = bool(pd.notna(r.get("Elite Rank"))) and side in {"OVER","UNDER"}
+        row["Saved Elite Rank"] = _json_safe(r.get("Elite Rank"))
+        row["Saved Elite Status"] = _json_safe(r.get("Elite Status"))
+        row["Saved Projection Authority"] = "FINAL_RESOLVED_PROJECTION"
+
+        key = (str(slate_d), normalize_name(player), market)
+        candidates = index.get(key, [])
+        pending_idx = next((i for i in reversed(candidates) if str(log[i].get("Result", "PENDING")).upper() == "PENDING"), None)
+        if pending_idx is not None:
+            first = log[pending_idx].get("FirstTrackedAt") or log[pending_idx].get("SavedAt") or snap_ts.isoformat()
+            row["FirstTrackedAt"] = first
+            log[pending_idx] = row
+            stats["updated"] += 1
+        else:
+            # Never overwrite a completed grade. New row is only created when no grade/pending record exists for this slate-market.
+            if candidates and any(str(log[i].get("Result", "")).upper() in {"WIN","LOSS","PUSH","VOID"} for i in candidates):
+                continue
+            row["FirstTrackedAt"] = snap_ts.isoformat()
+            log.append(row)
+            index.setdefault(key, []).append(len(log)-1)
+            stats["inserted"] += 1
+        touched = True
+
+    if touched:
+        save_json(OFFICIAL_LOG, log)
+    return stats
+
+
+def _app131_recover_verified_saved_board(targets: List[date]) -> Dict[str, Any]:
+    out = {"status":"not_needed", "rows":0, "inserted":0, "updated":0, "reason":""}
+    allowed = {d for d in (targets or []) if d is not None}
+    if not allowed or _app131_pending_count(list(allowed)) > 0:
+        return out
+    if not SAVED_BOARD_FILE.exists():
+        out.update(status="no_saved_board", reason="No saved board snapshot exists.")
+        return out
+    try:
+        board = pd.read_csv(SAVED_BOARD_FILE, low_memory=False)
+    except Exception as exc:
+        out.update(status="saved_board_read_error", reason=str(exc)[:180]); return out
+    if board.empty:
+        out.update(status="saved_board_empty", reason="Saved board is empty."); return out
+    if "SlateDate" in board.columns:
+        sd = pd.to_datetime(board["SlateDate"], errors="coerce").dt.date
+        board = board[sd.isin(allowed)].copy()
+    if board.empty:
+        out.update(status="saved_board_wrong_date", reason="Saved board has no rows for selected pending date."); return out
+    # The upsert helper verifies SavedBoardAt < Start row-by-row. Postgame snapshots are rejected.
+    stx = _app131_upsert_tracking_rows(board, mode="Today", snapshot_type="RECOVERED_VERIFIED_PREGAME_BOARD", require_verified_pregame=True)
+    out.update(status="recovered" if stx.get("inserted",0)+stx.get("updated",0)>0 else "no_verified_pregame_rows",
+               rows=int(len(board)), inserted=int(stx.get("inserted",0)), updated=int(stx.get("updated",0)))
+    if out["status"] != "recovered":
+        out["reason"] = "Saved rows existed, but none could be proven to have been captured before game start. They were not used for learning."
+    return out
+
+
+def _app131_grade_state_rows(targets: Optional[List[date]] = None) -> pd.DataFrame:
+    rows = load_json(OFFICIAL_LOG, [])
+    if not isinstance(rows, list) or not rows: return pd.DataFrame()
+    allowed = {d for d in (targets or []) if d is not None}
+    out=[]
+    for r in rows:
+        d=_grade_record_date(r)
+        if allowed and d not in allowed: continue
+        out.append({
+            "SlateDate": str(d or r.get("SlateDate") or ""), "Player": r.get("Player"), "Team": r.get("Team"),
+            "Opponent": r.get("Opponent"), "Market": r.get("Market"), "Line": r.get("Line"),
+            "Projection": r.get("Final Resolved Projection", r.get("Projection")), "Side": r.get("Final Resolved Side",r.get("Lean")),
+            "Result": r.get("Result","PENDING"), "Actual": r.get("Actual"), "ActualMinutes": r.get("ActualMinutes"),
+            "SnapshotType": r.get("SnapshotType"), "PregameVerified": r.get("PregameSnapshotVerified"),
+            "SavedAt": r.get("SavedAt"), "GradeNote": r.get("GradeNote",""),
+        })
+    return pd.DataFrame(out)
+
+
+def _app131_postgame_margin_table() -> pd.DataFrame:
+    rows = load_json(OFFICIAL_LOG, [])
+    if not isinstance(rows,list) or not rows: return pd.DataFrame()
+    d=pd.DataFrame(rows)
+    if d.empty or "Actual" not in d.columns or "Line" not in d.columns: return pd.DataFrame()
+    d["ActualNum"]=pd.to_numeric(d["Actual"],errors="coerce"); d["LineNum"]=pd.to_numeric(d["Line"],errors="coerce")
+    d=d[d["ActualNum"].notna()&d["LineNum"].notna()].copy()
+    if d.empty: return d
+    d["Actual Clearance From Line"]=(d["ActualNum"]-d["LineNum"]).round(3)
+    d["Absolute Clearance"]=(d["Actual Clearance From Line"].abs()).round(3)
+    d["Clearance Band"]=pd.cut(d["Absolute Clearance"],[-1e-9,.5,1.5,3.0,np.inf],labels=["RAZOR <=0.5","THIN 0.5-1.5","MODERATE 1.5-3","WIDE >3"])
+    proj=pd.to_numeric(d.get("Final Resolved Projection",d.get("Projection")),errors="coerce")
+    d["Projection Error"]=(proj-d["ActualNum"]).round(3)
+    keep=[c for c in ["SlateDate","Player","Team","Opponent","Market","Line","Final Resolved Projection","Final Resolved Side","Elite Rank","Elite Status","App130 Blowout Risk","App130 Minutes Range","App130 Edge SD","App130 Distribution Conflict","App128 Challenger Projection","App128 Challenger Side","Actual","ActualMinutes","Result","Actual Clearance From Line","Absolute Clearance","Clearance Band","Projection Error","MinutesError","GradeNote"] if c in d.columns]
+    return d[keep].copy()
+
+
+def _app131_build_forward_audit_zip(mode: str = "Today") -> Tuple[bytes, Dict[str, Any]]:
+    """Diagnostic-only forward audit. Does not fetch or mutate projection inputs."""
+    target = slate_target_date(mode) if mode in ["Today","Tomorrow"] else app_today()
+    buf=io.BytesIO(); meta={"audit_version":APP131_AUDIT_VERSION,"built_at":now_iso(),"scope":mode,"target_date":str(target)}
+    with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
+        def add_text(name,text): z.writestr(name,str(text))
+        def add_json(name,obj): z.writestr(name,json.dumps(obj,indent=2,ensure_ascii=False,default=_json_safe))
+        def add_df(name,df):
+            if isinstance(df,pd.DataFrame) and not df.empty: z.writestr(name,df.to_csv(index=False))
+        def add_path(path,arc):
+            try:
+                if Path(path).exists(): z.write(path,arcname=arc)
+            except Exception: pass
+        readme=(
+            "APP131 WNBA FORWARD AUDIT\n"
+            "Diagnostic only. No projection/side/probability formula is changed by this export.\n"
+            "App128 remains SHADOW ONLY; App130 remains the profitability/ranking gate.\n"
+            "Use after games to compare: projection error, actual minutes/opportunity, blowout/minutes risk, "
+            "raw line clearance, close-win fragility, and production-vs-App128 shadow rescue/break.\n"
+        )
+        add_text("00_README.txt",readme); add_json("01_META.json",meta)
+        add_path(CACHE_FILES.get("projection_board"),"02_CURRENT_PROJECTION_BOARD.csv")
+        add_path(SAVED_BOARD_FILE,"03_SAVED_PREGAME_BOARD.csv")
+        add_path(SAVED_LINES_FILE,"04_SAVED_LINES.csv")
+        add_path(OFFICIAL_LOG,"05_TRACKING_OFFICIAL_LOG.json")
+        add_path(LEARNING_LOG,"06_LEARNING_LOG.json")
+        add_path(LINE_HISTORY_FILE,"07_LINE_HISTORY.json")
+        add_path(DATA_DIR / "wnba_app128_role_availability_audit.csv","08_APP128_ROLE_AVAILABILITY_AUDIT.csv")
+        try: add_df("09_DATASET_STATUS.csv",dataset_status_table())
+        except Exception: pass
+        try:
+            gs=_app131_grade_state_rows([target]); add_df("10_GRADE_STATE.csv",gs); meta["grade_state_rows"]=int(len(gs))
+        except Exception: pass
+        try:
+            mt=_app131_postgame_margin_table();
+            if not mt.empty and "SlateDate" in mt.columns:
+                mask=pd.to_datetime(mt["SlateDate"],errors="coerce").dt.date.eq(target); mt=mt[mask].copy()
+            add_df("11_POSTGAME_CLEARANCE_AND_ERROR.csv",mt); meta["postgame_rows"]=int(len(mt))
+        except Exception: pass
+        try:
+            logs=load_dataset("player_game_logs")
+            if logs is not None and not logs.empty and "GameDate" in logs.columns:
+                ld=pd.to_datetime(logs["GameDate"],errors="coerce").dt.date
+                logs=logs[ld.eq(target)].copy()
+            add_df("12_FINAL_PLAYER_LOGS_TARGET_DATE.csv",logs)
+        except Exception: pass
+        try:
+            board=load_dataset("projection_board")
+            if board is not None and not board.empty:
+                rank=pd.to_numeric(board.get("Elite Rank"),errors="coerce") if "Elite Rank" in board.columns else pd.Series(np.nan,index=board.index)
+                add_df("13_BEST_SLATE_ROWS.csv",board[rank.notna()].sort_values("Elite Rank") if rank.notna().any() else pd.DataFrame())
+                focus=[c for c in ["Elite Rank","Player","Team","Opponent","Market","Line","Final Resolved Projection","Final Resolved Side","Elite Calibrated Probability %","App130 Profit Gate Qualified","App130 Profit Gate Reason","App130 Causal Score","App130 Edge SD","App130 Blowout Risk","App130 Minutes Range","App130 Distribution Conflict","App130 Evidence","App128 Challenger Projection","App128 Challenger Side","App128 Projection Delta","App128 Minutes P25","App128 Minutes P50","App128 Minutes P75","App128 Role Sanity Status","App128 Availability Stress Score"] if c in board.columns]
+                add_df("14_GAME_SCRIPT_AND_FRAGILITY_FOCUS.csv",board[focus].copy() if focus else pd.DataFrame())
+        except Exception: pass
+        add_json("99_META_FINAL.json",meta)
+    buf.seek(0); return buf.getvalue(),meta
+
+
+def pull_final_results_and_grade(mode: Optional[str] = "Today") -> Tuple[int, pd.DataFrame]:
+    """One-click final grading with prospective-snapshot recovery and explicit diagnostics."""
     targets = _pending_grade_dates(mode)
     all_new: List[pd.DataFrame] = []
     diagnostics: List[pd.DataFrame] = []
+    dbg_rows: List[Dict[str, Any]] = []
     if not targets:
         return 0, pd.DataFrame([{"step":"grade", "status":"no_pending_dates", "message":"No pending saved slate dates were found."}])
+
+    before_pending=_app131_pending_count(targets)
+    dbg_rows.append({"step":"prospective_tracking","status":"pending_before","message":f"{before_pending} pending tracked rows across {', '.join(map(str,targets))}."})
+    if before_pending == 0:
+        recovery=_app131_recover_verified_saved_board(targets)
+        dbg_rows.append({"step":"snapshot_recovery","status":recovery.get("status"),"message":json.dumps(recovery,default=_json_safe)})
+    after_recovery=_app131_pending_count(targets)
+    dbg_rows.append({"step":"prospective_tracking","status":"pending_after_recovery","message":f"{after_recovery} pending rows available for grading."})
 
     for target in targets:
         espn_logs, espn_dbg = pull_espn_final_player_logs(mode or "Today", force=True, target_date=target)
@@ -5548,15 +5859,28 @@ def pull_final_results_and_grade(mode: Optional[str] = "Today") -> Tuple[int, pd
             if wnba_logs is not None and not wnba_logs.empty:
                 all_new.append(wnba_logs)
 
-    dbg_rows: List[Dict[str, Any]] = []
     for frame in diagnostics:
         if frame is not None and not frame.empty:
             dbg_rows.extend(frame.to_dict("records"))
     combined = _merge_and_save_final_logs(all_new, dbg_rows)
     if combined.empty:
         combined = load_dataset("player_game_logs")
+
     n = grade_pending(combined, mode=None, allowed_dates=targets)
-    dbg_rows.append({"step":"grade_pending", "status":"done", "message":f"Updated {n} pending plays across {', '.join(map(str, targets))}."})
+    state=_app131_grade_state_rows(targets)
+    pending_after=0; unresolved=[]
+    if state is not None and not state.empty:
+        pending_mask=state["Result"].astype(str).str.upper().eq("PENDING")
+        pending_after=int(pending_mask.sum())
+        if pending_after:
+            unresolved=(state.loc[pending_mask,"GradeNote"].fillna("No grade note").replace("","No grade note").value_counts().head(12).to_dict())
+    dbg_rows.append({"step":"grade_pending", "status":"done" if n else "updated_0", "message":f"Updated {n} pending plays; {pending_after} remain pending across {', '.join(map(str, targets))}."})
+    if unresolved:
+        for reason,count in unresolved.items(): dbg_rows.append({"step":"unresolved","status":str(count),"message":str(reason)})
+    if n == 0 and after_recovery == 0:
+        dbg_rows.append({"step":"root_cause","status":"NO_PREGAME_TRACKING_ROWS","message":"Final boxscores may be available, but no verified pregame tracked/saved rows existed to grade. APP131 now auto-tracks future boards to prevent this."})
+    elif n == 0 and after_recovery > 0:
+        dbg_rows.append({"step":"root_cause","status":"PENDING_ROWS_NOT_MATCHED","message":"Pregame rows existed but could not be resolved to final player logs. Review unresolved reasons above."})
     return n, pd.DataFrame(dbg_rows)
 
 
@@ -8883,7 +9207,10 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     with action_cols[1]:
         if st.button(f"📊 Pull Final Results + Grade", key=f"grade_after_{mode}_{market_key}"):
             n, grade_dbg = pull_final_results_and_grade(mode)
-            st.success(f"Pulled final boxscores and graded {n} pending plays for {mode}.")
+            if n > 0:
+                st.success(f"Pulled final boxscores and graded {n} pending plays for {mode}.")
+            else:
+                st.warning(f"Final-result check completed, but 0 plays were graded for {mode}. Open diagnostics below — this is not treated as a successful grade.")
             if n == 0:
                 with st.expander("Why did grading return 0?", expanded=True):
                     st.dataframe(grade_dbg, use_container_width=True, hide_index=True)
@@ -9725,7 +10052,10 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
     with ac2:
         if st.button(f"📊 Pull Final Results + Grade", key=f"{key_prefix}_grade_after", use_container_width=True):
             n, grade_dbg = pull_final_results_and_grade(mode)
-            st.success(f"Pulled final boxscores and graded {n} pending plays for {mode}.")
+            if n > 0:
+                st.success(f"Pulled final boxscores and graded {n} pending plays for {mode}.")
+            else:
+                st.warning(f"Final-result check completed, but 0 plays were graded for {mode}. Open diagnostics below — this is not treated as a successful grade.")
             if n == 0:
                 with st.expander("Why did grading return 0?", expanded=True):
                     st.dataframe(grade_dbg, use_container_width=True, hide_index=True)
@@ -11785,9 +12115,31 @@ with st.sidebar:
     st.session_state["use_xgb_blend"] = bool(use_xgb_blend)
     auto_final_grade = st.toggle("Auto-check final results + grade learning log", value=False, help="Default OFF. Turn ON only when you want the app to check pending saved WNBA slates and grade completed games while the app is open.")
     st.session_state["auto_final_grade"] = bool(auto_final_grade)
+    with st.expander("🧪 FULL WNBA FORWARD AUDIT", expanded=False):
+        st.caption("Diagnostic only. App128 stays SHADOW ONLY and this export never changes production projections, sides, probabilities, or ranking math.")
+        app131_audit_on = st.toggle("Enable forward audit export", value=True, key="app131_forward_audit_toggle")
+        if app131_audit_on:
+            app131_audit_scope = st.selectbox("Audit scope", ["Today", "Tomorrow"], index=0, key="app131_audit_scope")
+            if st.button("BUILD WNBA AUDIT ZIP", use_container_width=True, key="app131_build_audit_zip"):
+                try:
+                    blob, meta = _app131_build_forward_audit_zip(app131_audit_scope)
+                    st.session_state["app131_audit_blob"] = blob
+                    st.session_state["app131_audit_meta"] = meta
+                    st.success(f"Audit ready · target {meta.get('target_date')} · diagnostic only")
+                except Exception as exc:
+                    st.error(f"Audit failed safely: {str(exc)[:500]}")
+            if st.session_state.get("app131_audit_blob"):
+                _stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+                st.download_button("⬇️ DOWNLOAD WNBA AUDIT ZIP", data=st.session_state["app131_audit_blob"], file_name=f"wnba_app131_forward_audit_{_stamp}.zip", mime="application/zip", use_container_width=True, key="app131_download_audit_zip")
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
     st.markdown("**Model:** Monte Carlo + Bayesian confidence + WNBA game script" + (" + guarded XGBoost/GBM blend" if use_xgb_blend else ""))
     st.caption("Use the top REFRESH TODAY button for schedule, online stats, opponent context, Underdog/manual lines, projections, and cache.")
+    _trk=st.session_state.get("app131_last_auto_track")
+    if isinstance(_trk,dict) and _trk:
+        if _trk.get("error"):
+            st.warning("Prospective tracker: "+str(_trk.get("error")))
+        else:
+            st.caption(f"APP131 pregame tracker · eligible {_trk.get('eligible',0)} · inserted {_trk.get('inserted',0)} · updated {_trk.get('updated',0)} · post-start skipped {_trk.get('skipped_poststart',0)}")
 
 @st.cache_data(show_spinner=False)
 def get_global_datasets() -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -19607,6 +19959,12 @@ def make_projection_board(lines, logs, base, mode: Optional[str] = None):
         legacy_projection=pd.to_numeric(board["Projection"],errors="coerce").copy(); board=attach_model_comparison(board,repository=HHSRepository(),simulations=10_000)
         if not np.allclose(pd.to_numeric(board["Projection"],errors="coerce"),legacy_projection,equal_nan=True): raise RuntimeError("HHS challenger changed the pre-resolver legacy Projection column")
         board=_attach_canonical_injury_state(board,active_mode,logs); board=_attach_final_resolved_projection(board); board=_attach_final_calibration_context(board); board=_elite_rank_board(board); board=_attach_app128_role_availability_challenger(board,active_mode); board=_attach_app130_causal_audit(board,active_mode); board=_apply_app130_profitability_gate(board); board=_promote_final_authority(board); board["Projection Engine Version"]=PROJECTION_ENGINE_VERSION; board["LineParserVersion"]=LINE_PARSER_VERSION; board["Injury Scenario Version"]=INJURY_SCENARIO_VERSION; save_dataset("projection_board",board)
+        # APP131: prospective grading snapshot only. This does not modify board values.
+        try:
+            _track=_app131_upsert_tracking_rows(board, active_mode, snapshot_type="AUTO_PROSPECTIVE_TRACK", require_verified_pregame=True)
+            st.session_state["app131_last_auto_track"]=_track
+        except Exception as _track_exc:
+            st.session_state["app131_last_auto_track"]={"error":str(_track_exc)[:220]}
     return board
 
 
@@ -19796,7 +20154,10 @@ with tabs[4]:
             if st.button("🏁 Pull final results + grade pending plays", use_container_width=True):
                 mode_arg = None if grade_scope == "All pending" else grade_scope
                 n, dbg = pull_final_results_and_grade(mode_arg)
-                st.success(f"Pulled final boxscores and graded {n} pending plays for {grade_scope}.")
+                if n > 0:
+                    st.success(f"Pulled final boxscores and graded {n} pending plays for {grade_scope}.")
+                else:
+                    st.warning(f"Final-result check completed, but 0 plays were graded for {grade_scope}. Review diagnostics; no false-success state is shown.")
                 with st.expander("Final-result pull diagnostics", expanded=(n == 0)):
                     st.dataframe(dbg, use_container_width=True, hide_index=True)
         with c3:
@@ -19946,7 +20307,10 @@ with tabs[7]:
     st.write("Pulls final ESPN boxscores automatically, falls back to official WNBA live boxscores, then writes WIN/LOSS/PUSH/VOID, actual value, closing line, and CLV.")
     if st.button("Run AutoGrader now", type="primary", use_container_width=True):
         n, dbg = pull_final_results_and_grade(None)
-        st.success(f"AutoGrader pulled final boxscores and updated {n} pending plays.")
+        if n > 0:
+            st.success(f"AutoGrader pulled final boxscores and updated {n} pending plays.")
+        else:
+            st.warning("AutoGrader completed with 0 graded plays. Open diagnostics; final stats alone are not counted as a successful grade.")
         if n == 0:
             with st.expander("AutoGrader diagnostics", expanded=True):
                 st.dataframe(dbg, use_container_width=True, hide_index=True)
