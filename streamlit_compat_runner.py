@@ -1,69 +1,37 @@
 # Streamlit UI compatibility runner for Railway/mobile stability.
-# This does NOT modify WNBA projection/model logic. It only translates the
-# deprecated use_container_width kwarg before Streamlit can emit thousands
-# of deprecation messages during a large page render.
+# This does NOT change WNBA projection/model math. It creates a runtime-only
+# copy of app.py with deprecated Streamlit sizing kwargs translated before
+# Streamlit parses/runs the script. The repository app.py remains untouched.
 
-import functools
-import inspect
+from pathlib import Path
+import re
 import sys
 
-import streamlit as st
-from streamlit.delta_generator import DeltaGenerator
+SOURCE = Path("app.py")
+RUNTIME = Path("/tmp/wnba_app_runtime.py")
 
+text = SOURCE.read_text(encoding="utf-8")
 
-def _translate_container_width(fn):
-    """Translate legacy Streamlit sizing kwargs without changing widget data/logic."""
-    if getattr(fn, "_owp_container_width_compat", False):
-        return fn
+# Streamlit 1.62 emits deprecation messages for every legacy sizing kwarg.
+# This app renders a large board, so those messages can exceed Railway's
+# 500 logs/sec cap. Translate the two legacy forms in a runtime-only copy.
+true_pattern = re.compile(r"\buse_container_width\s*=\s*True\b")
+false_pattern = re.compile(r"\buse_container_width\s*=\s*False\b")
 
-    @functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-        if "use_container_width" in kwargs:
-            legacy = kwargs.pop("use_container_width")
-            if "width" not in kwargs:
-                kwargs["width"] = "stretch" if bool(legacy) else "content"
-        return fn(*args, **kwargs)
+n_true = len(true_pattern.findall(text))
+n_false = len(false_pattern.findall(text))
+text = true_pattern.sub('width="stretch"', text)
+text = false_pattern.sub('width="content"', text)
 
-    wrapped._owp_container_width_compat = True
-    return wrapped
+RUNTIME.write_text(text, encoding="utf-8")
 
+# One concise startup line only; avoid noisy per-widget logging.
+print(f"[streamlit-compat] runtime copy ready: translated {n_true + n_false} use_container_width calls", flush=True)
 
-def _accepts_legacy_kwarg(fn):
-    try:
-        return "use_container_width" in inspect.signature(fn).parameters
-    except Exception:
-        return False
-
-
-def _patch_object(obj):
-    patched = 0
-    for name in dir(obj):
-        if name.startswith("_"):
-            continue
-        try:
-            fn = getattr(obj, name)
-        except Exception:
-            continue
-        if not callable(fn) or not _accepts_legacy_kwarg(fn):
-            continue
-        try:
-            setattr(obj, name, _translate_container_width(fn))
-            patched += 1
-        except Exception:
-            pass
-    return patched
-
-
-# Patch both module-level st.* callables and DeltaGenerator methods because
-# Streamlit exposes widgets through both paths.
-_patch_object(st)
-_patch_object(DeltaGenerator)
-
-# Start the existing app unchanged.
 sys.argv = [
     "streamlit",
     "run",
-    "app.py",
+    str(RUNTIME),
     "--server.address=0.0.0.0",
     "--server.port=8080",
     "--server.headless=true",
