@@ -13,6 +13,11 @@ Line-source build:
 """
 
 
+# APP132 TRUE LAZY MOBILE STABILITY BUILD (UI ONLY)
+# - Replaces eager Streamlit tabs with lazy section navigation so Safari receives only one section at a time.
+# - Mobile mode defaults Player Cards to Fast table and caps optional card rendering.
+# - NO production model/projection/ranking/grading math changes.
+#
 # APP131 MOBILE STABILITY DIRECT BUILD (UI ONLY)
 # - Directly migrates the legacy full-width Streamlit UI calls to width="stretch".
 # - Adds Mobile stability mode (default ON) to reduce iPhone/Safari frontend load.
@@ -10092,7 +10097,7 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
     display_mode = st.radio(
         "View",
         ["Fast table", "Player cards"],
-        index=1 if default_cards else 0,
+        index=0 if bool(st.session_state.get("owp_mobile_stability_mode", True)) else (1 if default_cards else 0),
         horizontal=True,
         key=f"{key_prefix}_display_mode",
         help="Fast table loads quickest. Player cards show the full grouped-card view."
@@ -10130,9 +10135,12 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
         render_fast_projection_rows(view_df)
         return view_df
 
-    show_all = st.toggle("Show all player cards", value=True, key=f"{key_prefix}_show_all_cards")
-    max_default = min(40, max(10, int(view_df["Player"].nunique() if "Player" in view_df.columns else 40)))
-    max_players = len(view_df["Player"].dropna().unique()) if show_all and "Player" in view_df.columns else st.slider("Max player cards", 10, 120, max_default, 5, key=f"{key_prefix}_max_cards")
+    _owp_mobile_cards = bool(st.session_state.get("owp_mobile_stability_mode", True))
+    show_all = st.toggle("Show all player cards", value=(not _owp_mobile_cards), key=f"{key_prefix}_show_all_cards")
+    _owp_card_floor = 5 if _owp_mobile_cards else 10
+    _owp_card_cap = 12 if _owp_mobile_cards else 40
+    max_default = min(_owp_card_cap, max(_owp_card_floor, int(view_df["Player"].nunique() if "Player" in view_df.columns else _owp_card_cap)))
+    max_players = len(view_df["Player"].dropna().unique()) if show_all and "Player" in view_df.columns else st.slider("Max player cards", _owp_card_floor, 120, max_default, 5, key=f"{key_prefix}_max_cards")
     sort_df = view_df.copy()
     sort_df["_abs_edge"] = pd.to_numeric(sort_df.get("Edge", np.nan), errors="coerce").abs()
     sort_df["_score"] = pd.to_numeric(sort_df.get("Official Play Score", np.nan), errors="coerce")
@@ -13811,10 +13819,10 @@ def render_hhs_model_tab() -> None:
         auto_status = ", ".join(sorted(auto_report.get("Status", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()))
         st.caption(f"Automatic authorized-feed check: {auto_status or 'unknown'}. Refreshes are TTL-cached and failures preserve the last-good HHS data.")
 
-    data_tab, compare_tab, evaluation_tab, diagnostics_tab = st.tabs(
-        ["HHS Data", "Model Compare", "Evaluation", "Diagnostics"]
+    _owp_hhs_view = st.selectbox(
+        "HHS section", ["HHS Data", "Model Compare", "Evaluation", "Diagnostics"], key="owp_hhs_view"
     )
-    with data_tab:
+    if _owp_hhs_view == 'HHS Data':
         st.info(
             "Import an HHS CSV/Parquet/XLSX/JSON export that you are authorized to use. "
             "Missing or rejected data leaves the last good cache and legacy app untouched."
@@ -13858,7 +13866,7 @@ def render_hhs_model_tab() -> None:
                 width="stretch",
             )
 
-    with compare_tab:
+    if _owp_hhs_view == 'Model Compare':
         board = load_dataset("projection_board")
         if board is None or board.empty:
             st.info("No projection board is cached yet.")
@@ -13886,7 +13894,7 @@ def render_hhs_model_tab() -> None:
                 width="stretch",
             )
 
-    with evaluation_tab:
+    if _owp_hhs_view == 'Evaluation':
         graded = pd.DataFrame(load_json(LEARNING_LOG, []))
         evaluation_rows = model_evaluation_rows(graded)
         if evaluation_rows.empty:
@@ -13918,7 +13926,7 @@ def render_hhs_model_tab() -> None:
                 width="stretch",
             )
 
-    with diagnostics_tab:
+    if _owp_hhs_view == 'Diagnostics':
         st.markdown("#### HHS cache diagnostics")
         st.dataframe(repository.diagnostics(), width="stretch", hide_index=True)
         match_path = repository.config.root / "hhs_player_match_diagnostics.csv"
@@ -20088,20 +20096,31 @@ except Exception as _stable_startup_exc:
 if st.session_state.get("wnba_app125_refresh_required"):
     st.warning(st.session_state.get("wnba_app125_refresh_required"))
 
-tabs = st.tabs(["Player Cards", "Best Bets", "Slate Tracker", "Moneyline", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports", "HHS / Models"])
+_owp_main_sections = ["Player Cards", "Best Bets", "Slate Tracker", "Moneyline", "Official + Grade", "Data Manager", "Debug / Status", "Model Reports", "HHS / Models"]
+_owp_main_view = st.selectbox(
+    "App section",
+    _owp_main_sections,
+    index=_owp_main_sections.index(st.session_state.get("owp_main_section", "Player Cards")) if st.session_state.get("owp_main_section", "Player Cards") in _owp_main_sections else 0,
+    key="owp_main_section",
+    help="Mobile-safe lazy navigation: only the selected section is rendered. Projection/model calculations are unchanged.",
+)
+if bool(st.session_state.get("owp_mobile_stability_mode", True)):
+    st.caption("📱 Lazy-render mode: only this section is loaded into Safari.")
 
-with tabs[0]:
+if _owp_main_view == 'Player Cards':
     st.markdown("<div class='section-title'>PLAYER CARDS / Grouped Markets</div>", unsafe_allow_html=True)
     st.caption("One player card now shows every live market pulled for that player: PTS, REB, AST, and PRA. The Underdog line pull and main-line selector are unchanged.")
-    slate_tabs = st.tabs(["Today", "Tomorrow", "All Lines"])
-    with slate_tabs[0]:
+    _owp_player_slate = st.radio(
+        "Player-card slate", ["Today", "Tomorrow", "All Lines"], horizontal=True, key="owp_player_slate_view"
+    )
+    if _owp_player_slate == 'Today':
         render_grouped_player_board("Today", use_ud, logs_global, master_global)
-    with slate_tabs[1]:
+    if _owp_player_slate == 'Tomorrow':
         render_grouped_player_board("Tomorrow", use_ud, logs_global, master_global)
-    with slate_tabs[2]:
+    if _owp_player_slate == 'All Lines':
         render_grouped_player_board("All Lines", use_ud, logs_global, master_global)
 
-with tabs[1]:
+if _owp_main_view == 'Best Bets':
     st.subheader("Elite Best Plays / Rank 1–200")
     st.caption("App127 Best Slate: App126 remains projection authority, while rank 1-200 now requires volatility-adjusted edge, recent prior-line support, independent-family breadth, role/minutes stability, calibration, and loss-rescue reliability. Fragile high-role UNDERs and concentrated creator assumptions can stay on Player Cards but are denied Best-Slate rank until they clear the stronger selection gate.")
     board_path = CACHE_FILES["projection_board"]
@@ -20160,11 +20179,11 @@ with tabs[1]:
         st.dataframe(show[display_cols] if display_cols else show, width="stretch")
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
-with tabs[2]:
+if _owp_main_view == 'Slate Tracker':
     tracker_board = load_dataset("projection_board")
     render_slate_tracker(tracker_board, "main_slate_tracker")
 
-with tabs[3]:
+if _owp_main_view == 'Moneyline':
     st.subheader("Moneyline / Game Script")
     st.caption("WNBA game-level model: pace, ORtg, DRtg, projected score, spread, total, win probability, blowout risk, and 15k game simulation.")
     ml_mode = st.radio(
@@ -20186,11 +20205,13 @@ with tabs[3]:
         st.dataframe(ml_games, width="stretch", hide_index=True)
         st.download_button("Download Moneyline/Game Script CSV", ml_games.to_csv(index=False), "wnba_moneyline_game_script.csv", "text/csv")
 
-with tabs[4]:
+if _owp_main_view == 'Official + Grade':
     st.subheader("Official + Grade")
     st.caption("Save official plays before games. Grade after results are imported. The Results tab shows ✅/❌ by player and market so you can quickly see what cleared the line.")
-    grade_tabs = st.tabs(["Save / Grade", "After Game Results ✅❌", "Raw Logs"])
-    with grade_tabs[0]:
+    _owp_grade_view = st.radio(
+        "Grade view", ["Save / Grade", "After Game Results ✅❌", "Raw Logs"], horizontal=True, key="owp_grade_view"
+    )
+    if _owp_grade_view == 'Save / Grade':
         board = load_dataset("projection_board")
         diag_scope_preview = st.selectbox("Grade diagnostics scope", ["Today", "Tomorrow", "All pending"], index=0, key="grade_diag_scope_after_results")
         diag_mode = None if diag_scope_preview == "All pending" else diag_scope_preview
@@ -20241,7 +20262,7 @@ with tabs[4]:
         st.info("The grader now pulls final ESPN boxscores automatically, falls back to the official WNBA feed, and grades only completed games. Future/not-started games remain pending.")
     official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
     learning = pd.DataFrame(load_json(LEARNING_LOG, []))
-    with grade_tabs[1]:
+    if _owp_grade_view == 'After Game Results ✅❌':
         st.markdown("### After Game Results")
         results_source = learning if not learning.empty else official
         results = build_after_game_results_table(results_source)
@@ -20262,7 +20283,7 @@ with tabs[4]:
                 st.metric("Final win rate", f"{summary['wins']}-{summary['losses']} ({summary['win_rate']:.1%})")
             st.dataframe(show_results, width="stretch")
             st.download_button("Download after-game results CSV", show_results.to_csv(index=False), "wnba_after_game_results.csv", "text/csv")
-    with grade_tabs[2]:
+    if _owp_grade_view == 'Raw Logs':
         if not official.empty:
             st.markdown("### Official snapshot log")
             official_show = attach_result_symbols(official.tail(300))
@@ -20282,10 +20303,10 @@ with tabs[4]:
             st.dataframe(learning_show, width="stretch")
             st.download_button("Download learning log CSV", attach_result_symbols(learning).to_csv(index=False), "wnba_learning_log.csv", "text/csv")
 
-with tabs[5]:
+if _owp_main_view == 'Data Manager':
     render_data_manager_tab()
 
-with tabs[6]:
+if _owp_main_view == 'Debug / Status':
     st.subheader("Debug / Status")
     st.caption("Diagnostics only. Heavy imports/rebuilds are in Data Manager and never run automatically.")
     st.markdown("### Data status")
@@ -20354,7 +20375,7 @@ with tabs[6]:
     st.markdown("### Cached master preview")
     st.dataframe(master_global.head(50), width="stretch")
 
-with tabs[7]:
+if _owp_main_view == 'Model Reports':
     st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
     st.caption("This page keeps the main UI clean while giving you the same deeper review tools: line movement, closing-line value, projection calibration, and historical model testing.")
 
@@ -20510,5 +20531,5 @@ with tabs[7]:
             st.dataframe(bt.tail(1000), width="stretch")
             st.download_button("Download full backtest rows CSV", bt.to_csv(index=False), "wnba_backtest_rows.csv", "text/csv")
 
-with tabs[8]:
+if _owp_main_view == 'HHS / Models':
     render_hhs_model_tab()
