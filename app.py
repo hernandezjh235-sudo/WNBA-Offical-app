@@ -13,6 +13,13 @@ Line-source build:
 """
 
 
+# APP131 MOBILE STABILITY DIRECT BUILD (UI ONLY)
+# - Directly migrates the legacy full-width Streamlit UI calls to width="stretch".
+# - Adds Mobile stability mode (default ON) to reduce iPhone/Safari frontend load.
+# - In mobile mode, large on-screen dataframes are preview-capped and nonessential download buttons are hidden.
+# - FULL WNBA FORWARD AUDIT ZIP download remains available.
+# - NO projection, side, probability, ranking, App128, App130, grading math, or market logic changes.
+#
 # APP131 PROSPECTIVE TRACKING + GRADER RECOVERY + FORWARD AUDIT
 # - NO production projection, side, probability, App128 shadow, or App130 profitability-gate math changes.
 # - Automatically freezes/updates one PRE-GAME tracking row per player/market/slate so grading no longer depends on the
@@ -131,6 +138,59 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+
+# APP131 MOBILE STABILITY UI GUARD — display/export only.
+# This layer never changes the projection dataframe or any model calculation.
+import warnings as _owp_warnings
+_owp_warnings.filterwarnings("ignore", message="Downcasting object dtype arrays on .fillna.*", category=FutureWarning)
+_owp_warnings.filterwarnings("ignore", message="The behavior of DataFrame concatenation with empty or all-NA entries is deprecated.*", category=FutureWarning)
+
+try:
+    st.session_state.setdefault("owp_mobile_stability_mode", True)
+    st.session_state.setdefault("owp_show_all_downloads", False)
+except Exception:
+    pass
+
+_OWP_REAL_DATAFRAME = st.dataframe
+_OWP_REAL_DOWNLOAD_BUTTON = st.download_button
+
+def _owp_mobile_safe_dataframe(data=None, *args, **kwargs):
+    """Reduce browser payload only; underlying data/model objects are untouched."""
+    try:
+        mobile = bool(st.session_state.get("owp_mobile_stability_mode", True))
+    except Exception:
+        mobile = True
+    shown = data
+    if mobile and isinstance(data, pd.DataFrame):
+        try:
+            max_rows = 80
+            max_cols = 36
+            if len(data) > max_rows or len(data.columns) > max_cols:
+                shown = data.iloc[:max_rows, :max_cols].copy()
+        except Exception:
+            shown = data
+    return _OWP_REAL_DATAFRAME(shown, *args, **kwargs)
+
+def _owp_mobile_safe_download_button(label, *args, **kwargs):
+    """Avoid registering dozens of media assets on iPhone unless requested."""
+    try:
+        mobile = bool(st.session_state.get("owp_mobile_stability_mode", True))
+        show_all = bool(st.session_state.get("owp_show_all_downloads", False))
+    except Exception:
+        mobile, show_all = True, False
+    key = str(kwargs.get("key", "") or "")
+    text = str(label or "")
+    essential = (
+        key == "app131_download_audit_zip"
+        or "WNBA AUDIT ZIP" in text.upper()
+        or "BEST SLATE" in text.upper()
+    )
+    if mobile and not show_all and not essential:
+        return False
+    return _OWP_REAL_DOWNLOAD_BUTTON(label, *args, **kwargs)
+
+st.dataframe = _owp_mobile_safe_dataframe
+st.download_button = _owp_mobile_safe_download_button
 
 # The HHS package is embedded so this file can be deployed by itself.
 def _install_embedded_wnba_hhs() -> None:
@@ -7018,11 +7078,11 @@ def hero_panel(board_rows: int = 0, real_lines: int = 0, no_line: int = 0, stron
     with c0:
         refresh_mode = st.selectbox("Refresh slate", ["Today", "Tomorrow"], index=0, key="hero_refresh_slate")
     with c1:
-        if st.button(f"🔄 REFRESH {refresh_mode.upper()} — Schedule + Lines + Board", use_container_width=True, key="hero_refresh_live_board"):
+        if st.button(f"🔄 REFRESH {refresh_mode.upper()} — Schedule + Lines + Board", width="stretch", key="hero_refresh_live_board"):
             st.session_state["wnba_run_top_refresh_mode"] = refresh_mode
             st.rerun()
     with c2:
-        if st.button("💾 SAVE OFFICIAL BEFORE-GAME SNAPSHOT", use_container_width=True, key="hero_save_official_before"):
+        if st.button("💾 SAVE OFFICIAL BEFORE-GAME SNAPSHOT", width="stretch", key="hero_save_official_before"):
             board_path = CACHE_FILES.get("projection_board")
             if board_path and board_path.exists():
                 try:
@@ -9011,7 +9071,7 @@ def render_manual_line_entry(mode: str, market: str, master_global: pd.DataFrame
             return
         edited = st.data_editor(
             template[["Player","Team","Opponent","Matchup","HomeAway","Market","Line","OverOdds","UnderOdds","Source","Start","Raw"]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             num_rows="fixed",
             disabled=["Player","Team","Opponent","Matchup","HomeAway","Market","Source","Start","Raw"],
@@ -9024,7 +9084,7 @@ def render_manual_line_entry(mode: str, market: str, master_global: pd.DataFrame
         )
         csave, cclear = st.columns([1,1])
         with csave:
-            if st.button(f"💾 Save {market} manual lines", key=f"save_manual_{mode}_{market}", use_container_width=True):
+            if st.button(f"💾 Save {market} manual lines", key=f"save_manual_{mode}_{market}", width="stretch"):
                 clean = edited.copy()
                 clean["Line"] = pd.to_numeric(clean["Line"], errors="coerce")
                 clean = clean.dropna(subset=["Player", "Line"])
@@ -9044,7 +9104,7 @@ def render_manual_line_entry(mode: str, market: str, master_global: pd.DataFrame
                 st.success(f"Saved {len(clean):,} {market} manual lines for {mode}.")
                 st.rerun()
         with cclear:
-            if st.button(f"🧹 Clear {market} manual slate", key=f"clear_manual_{mode}_{market}", use_container_width=True):
+            if st.button(f"🧹 Clear {market} manual slate", key=f"clear_manual_{mode}_{market}", width="stretch"):
                 prev = load_manual_lines()
                 if prev is not None and not prev.empty:
                     slate_start = str(slate_target_date(mode) or "")
@@ -9082,20 +9142,20 @@ def render_line_audit_panel(lines: pd.DataFrame, board: Optional[pd.DataFrame] =
         c4.metric("Missing lines", missing_lines)
         if not l.empty and "Source" in l.columns:
             src_counts = l["Source"].astype(str).value_counts().rename_axis("Source").reset_index(name="Rows")
-            st.dataframe(src_counts, use_container_width=True, hide_index=True)
+            st.dataframe(src_counts, width="stretch", hide_index=True)
         if not l.empty:
             detail_cols = [c for c in ["Team", "Opponent", "Matchup", "Player", "Market", "Line", "Source", "Parser Mode", "Raw"] if c in l.columns]
             if "Team" in l.columns:
                 team_counts = l["Team"].astype(str).map(team_abbrev).value_counts().rename_axis("Team").reset_index(name="Line Rows")
                 st.markdown("**Pulled line rows by team**")
-                st.dataframe(team_counts, use_container_width=True, hide_index=True)
+                st.dataframe(team_counts, width="stretch", hide_index=True)
             if "Matchup" in l.columns:
                 matchup_counts = l["Matchup"].astype(str).replace("", "Unknown").value_counts().rename_axis("Matchup").reset_index(name="Line Rows")
                 st.markdown("**Pulled line rows by matchup**")
-                st.dataframe(matchup_counts.head(40), use_container_width=True, hide_index=True)
+                st.dataframe(matchup_counts.head(40), width="stretch", hide_index=True)
             if detail_cols:
                 st.markdown("**All pulled line rows sample**")
-                st.dataframe(l[detail_cols].head(120), use_container_width=True, hide_index=True)
+                st.dataframe(l[detail_cols].head(120), width="stretch", hide_index=True)
         if not b.empty:
             audit_cols = [c for c in [
                 "Player", "Team", "Opponent", "Market", "Line", "Projection", "Edge", "Lean",
@@ -9111,10 +9171,10 @@ def render_line_audit_panel(lines: pd.DataFrame, board: Optional[pd.DataFrame] =
                     st.caption("No missing/invalid line rows detected in the current board.")
                 else:
                     st.warning("Rows below have missing/fallback/invalid line data.")
-                    st.dataframe(bad[audit_cols].head(80), use_container_width=True, hide_index=True)
+                    st.dataframe(bad[audit_cols].head(80), width="stretch", hide_index=True)
         if ud_debug is not None and not getattr(ud_debug, "empty", True):
             st.markdown("**Underdog pull/debug**")
-            st.dataframe(ud_debug.tail(80), use_container_width=True, hide_index=True)
+            st.dataframe(ud_debug.tail(80), width="stretch", hide_index=True)
 
 def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame, force_market: Optional[str] = None):
     market_label = f" — {force_market}" if force_market else ""
@@ -9142,7 +9202,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     sched = schedule_for_slate(mode)
     if not sched.empty:
         with st.expander(f"{mode} schedule context", expanded=False):
-            st.dataframe(sched, use_container_width=True)
+            st.dataframe(sched, width="stretch")
     elif mode in ["Today", "Tomorrow"]:
         st.info(f"No cached schedule rows found for {mode.lower()}. If WNBA is off that day, lines may correctly return 0.")
 
@@ -9213,7 +9273,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
                 st.warning(f"Final-result check completed, but 0 plays were graded for {mode}. Open diagnostics below — this is not treated as a successful grade.")
             if n == 0:
                 with st.expander("Why did grading return 0?", expanded=True):
-                    st.dataframe(grade_dbg, use_container_width=True, hide_index=True)
+                    st.dataframe(grade_dbg, width="stretch", hide_index=True)
     with action_cols[2]:
         st.download_button(f"Download {mode} Board CSV", proj_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ', '_')}_projection_board.csv", "text/csv", key=f"dl_{mode}_{market_key}")
     with action_cols[3]:
@@ -9243,7 +9303,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
             "Edge", "Lean", "Official", "Official Play Score", "PASS Reason", "Opponent Context Note",
             "Underdog Line", "Sleeper Line", "Best Over Line", "Best Under Line", "Over %", "Under %"
         ]
-        st.dataframe(display_df[[c for c in show_cols if c in display_df.columns]], use_container_width=True)
+        st.dataframe(display_df[[c for c in show_cols if c in display_df.columns]], width="stretch")
     return proj_df
 
 
@@ -9259,10 +9319,10 @@ def render_data_manager_tab():
     for abbr in sorted(set(TEAM_LOGO_ALIASES.values())):
         found = any((LOGO_DIR / f"{abbr}.{ext}").exists() for ext in ["png", "jpg", "jpeg", "webp", "svg"])
         logo_rows.append({"Team": abbr, "Local Logo": "✅ found" if found else "⚠️ missing", "Expected Path": f"assets/logos/{abbr}.png"})
-    st.dataframe(pd.DataFrame(logo_rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(logo_rows), width="stretch")
 
     st.markdown("### Data status")
-    st.dataframe(dataset_status_table(), use_container_width=True)
+    st.dataframe(dataset_status_table(), width="stretch")
 
     st.markdown("### Fast-safe data tools")
     st.caption("Use these only when you need to reload historical/stat data. Daily betting use should stay on Refresh Today.")
@@ -9280,36 +9340,36 @@ def render_data_manager_tab():
         season_a = st.number_input("Current season to pull", min_value=2020, max_value=2032, value=int(season_now), step=1, key="dm_season_now_visible")
     with y2:
         season_b = st.number_input("Last season to pull", min_value=2020, max_value=2032, value=int(season_last), step=1, key="dm_season_last_visible")
-    if st.button("🔄 Refresh SportsDataverse + Build Advanced Features", use_container_width=True, key="dm_refresh_sd_visible"):
+    if st.button("🔄 Refresh SportsDataverse + Build Advanced Features", width="stretch", key="dm_refresh_sd_visible"):
         with st.spinner("Refreshing data and rebuilding advanced features..."):
             master, team_ranks, debug, audit = refresh_data_and_build_advanced_features(dataset_choices, [int(season_b), int(season_a)], include_heavy)
         st.success(f"Done. Master rows: {len(master)} | Team-rank rows: {len(team_ranks)}")
         st.markdown("#### Refresh debug")
-        st.dataframe(debug, use_container_width=True)
+        st.dataframe(debug, width="stretch")
         st.markdown("#### Missing-field report")
-        st.dataframe(audit, use_container_width=True)
+        st.dataframe(audit, width="stretch")
 
-    if st.button("🧠 Build Advanced Features / Fix Missing Columns Only", use_container_width=True, key="dm_build_features_only_visible"):
+    if st.button("🧠 Build Advanced Features / Fix Missing Columns Only", width="stretch", key="dm_build_features_only_visible"):
         with st.spinner("Rebuilding master features from cached files..."):
             master, team_ranks = build_master_features()
             audit = feature_missing_report(master)
             audit.to_csv(DATA_DIR / "wnba_feature_missing_report.csv", index=False)
         st.success(f"Advanced features rebuilt. Master rows: {len(master)}")
-        st.dataframe(audit, use_container_width=True)
+        st.dataframe(audit, width="stretch")
 
     report_path = DATA_DIR / "wnba_feature_missing_report.csv"
     if report_path.exists():
         try:
             report_df = pd.read_csv(report_path)
-            st.download_button("Download missing-field report", report_df.to_csv(index=False), "wnba_feature_missing_report.csv", "text/csv", use_container_width=True)
+            st.download_button("Download missing-field report", report_df.to_csv(index=False), "wnba_feature_missing_report.csv", "text/csv", width="stretch")
         except Exception:
             pass
 
     st.markdown("### Manual upload/import backup")
     uploaded = st.file_uploader("Upload SportsDataverse CSV/Parquet/ZIP files", type=["csv", "parquet", "xlsx", "json", "zip"], accept_multiple_files=True, key="dm_manual_upload_visible")
-    if uploaded and st.button("Import uploaded files", use_container_width=True, key="dm_import_uploads_visible"):
+    if uploaded and st.button("Import uploaded files", width="stretch", key="dm_import_uploads_visible"):
         rows = import_uploaded_dataset_files(uploaded)
-        st.dataframe(rows, use_container_width=True)
+        st.dataframe(rows, width="stretch")
         try:
             master, _ = build_master_features()
             st.success(f"Uploaded files imported and master rebuilt: {len(master)} rows")
@@ -9322,7 +9382,7 @@ def render_data_manager_tab():
         if path and path.exists():
             try:
                 data = path.read_text(errors="ignore")
-                st.download_button(f"Download {key}.csv", data, f"{key}.csv", "text/csv", use_container_width=True, key=f"dm_download_{key}")
+                st.download_button(f"Download {key}.csv", data, f"{key}.csv", "text/csv", width="stretch", key=f"dm_download_{key}")
             except Exception:
                 pass
 
@@ -9860,10 +9920,10 @@ def render_grouped_player_card(player_df: pd.DataFrame):
         proj = _fmt_num_compact(rr.get("Projection"), 1)
         line = _fmt_num_compact(rr.get("Line"), 1)
         with st.expander(f"Why — {player} {m}: proj {proj} vs line {line} ({lean})", expanded=False):
-            st.dataframe(_market_why_df(rr), use_container_width=True, hide_index=True)
+            st.dataframe(_market_why_df(rr), width="stretch", hide_index=True)
     with st.expander(f"Advanced details — {player} all markets", expanded=False):
         show_cols = [c for c in ["Market","Projection","Line","Edge","Lean","Over %","Under %","Official Play Score","Tier","Source","Line Selection","UD Candidate Order","UD Base Score","UD Line Kind","UD Two Sided","Opening Line","CLV","Line Age Minutes","Line Snapshot Count","Freshness Status","Opponent","HomeAway","Matchup","Raw","Projection Explanation"] if c in player_df.columns]
-        st.dataframe(player_df[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(player_df[show_cols], width="stretch", hide_index=True)
 
 
 
@@ -10019,15 +10079,15 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
     c4.metric("Avg edge", round(float(pd.to_numeric(view_df.get("Edge", pd.Series(dtype=float)), errors="coerce").abs().mean()), 2) if not view_df.empty else 0)
     with st.expander("Board coverage — teams / matchups / markets", expanded=False):
         if "Matchup" in view_df.columns:
-            st.dataframe(view_df["Matchup"].astype(str).replace("", "Unknown").value_counts().rename_axis("Matchup").reset_index(name="Rows"), use_container_width=True, hide_index=True)
+            st.dataframe(view_df["Matchup"].astype(str).replace("", "Unknown").value_counts().rename_axis("Matchup").reset_index(name="Rows"), width="stretch", hide_index=True)
         if "Slate Missing From Player Props" in view_df.columns:
             missing_props = str(view_df["Slate Missing From Player Props"].dropna().astype(str).iloc[0]) if len(view_df["Slate Missing From Player Props"].dropna()) else ""
             if missing_props:
                 st.warning(f"Schedule has no pulled player props for: {missing_props}. Moneyline can still show those games.")
         if "Team" in view_df.columns:
-            st.dataframe(view_df["Team"].astype(str).map(team_abbrev).value_counts().rename_axis("Team").reset_index(name="Rows"), use_container_width=True, hide_index=True)
+            st.dataframe(view_df["Team"].astype(str).map(team_abbrev).value_counts().rename_axis("Team").reset_index(name="Rows"), width="stretch", hide_index=True)
         if all(c in view_df.columns for c in ["Player", "Team", "Opponent", "Market", "Line", "Source"]):
-            st.dataframe(view_df[["Player", "Team", "Opponent", "Matchup", "Market", "Line", "Source"] if "Matchup" in view_df.columns else ["Player", "Team", "Opponent", "Market", "Line", "Source"]].sort_values([c for c in ["Matchup", "Team", "Player", "Market"] if c in view_df.columns]), use_container_width=True, hide_index=True, height=360)
+            st.dataframe(view_df[["Player", "Team", "Opponent", "Matchup", "Market", "Line", "Source"] if "Matchup" in view_df.columns else ["Player", "Team", "Opponent", "Market", "Line", "Source"]].sort_values([c for c in ["Matchup", "Team", "Player", "Market"] if c in view_df.columns]), width="stretch", hide_index=True, height=360)
 
     display_mode = st.radio(
         "View",
@@ -10040,7 +10100,7 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
 
     ac1, ac2, ac3 = st.columns([1.2,1.2,1.4])
     with ac1:
-        if st.button(f"✅ Save {mode} Official Before", key=f"{key_prefix}_save_before", use_container_width=True):
+        if st.button(f"✅ Save {mode} Official Before", key=f"{key_prefix}_save_before", width="stretch"):
             n = save_officials(view_df)
             snapshot_n = save_board_snapshot(
                 view_df,
@@ -10050,7 +10110,7 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
             st.session_state["wnba_prefer_projection_cache_after_refresh"] = False
             st.success(f"Saved {n} tracked plays and {snapshot_n} board rows. {mode} will reload without refreshing.")
     with ac2:
-        if st.button(f"📊 Pull Final Results + Grade", key=f"{key_prefix}_grade_after", use_container_width=True):
+        if st.button(f"📊 Pull Final Results + Grade", key=f"{key_prefix}_grade_after", width="stretch"):
             n, grade_dbg = pull_final_results_and_grade(mode)
             if n > 0:
                 st.success(f"Pulled final boxscores and graded {n} pending plays for {mode}.")
@@ -10058,7 +10118,7 @@ def render_grouped_table_or_cards(proj_df: pd.DataFrame, mode: str, key_prefix: 
                 st.warning(f"Final-result check completed, but 0 plays were graded for {mode}. Open diagnostics below — this is not treated as a successful grade.")
             if n == 0:
                 with st.expander("Why did grading return 0?", expanded=True):
-                    st.dataframe(grade_dbg, use_container_width=True, hide_index=True)
+                    st.dataframe(grade_dbg, width="stretch", hide_index=True)
     with ac3:
         st.download_button(f"Download {mode} Board CSV", view_df.to_csv(index=False), f"wnba_{mode.lower().replace(' ','_')}_board.csv", "text/csv", key=f"{key_prefix}_download")
 
@@ -10699,7 +10759,7 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
             })
             ud_dbg = st.session_state.get("wnba_moneyline_underdog_debug", pd.DataFrame())
             if ud_dbg is not None and not getattr(ud_dbg, "empty", True):
-                st.dataframe(ud_dbg, use_container_width=True, hide_index=True)
+                st.dataframe(ud_dbg, width="stretch", hide_index=True)
         return pd.DataFrame()
     if schedule_pairs:
         st.caption(f"Moneyline games: {len(pairs)} total ({len(schedule_pairs)} live/scheduled, {len(line_pairs)} from pulled lines, {len(board_pairs)} from prop board).")
@@ -10717,10 +10777,10 @@ def render_wnba_ml_system(board_df: pd.DataFrame, key_prefix: str = "ml_system",
         })
         ud_dbg = st.session_state.get("wnba_moneyline_underdog_debug", pd.DataFrame())
         if ud_dbg is not None and not getattr(ud_dbg, "empty", True):
-            st.dataframe(ud_dbg, use_container_width=True, hide_index=True)
+            st.dataframe(ud_dbg, width="stretch", hide_index=True)
         dbg = st.session_state.get("wnba_moneyline_schedule_debug", pd.DataFrame())
         if dbg is not None and not getattr(dbg, "empty", True):
-            st.dataframe(dbg, use_container_width=True, hide_index=True)
+            st.dataframe(dbg, width="stretch", hide_index=True)
 
     # App120: use the same injury/rotation-aware game environment that feeds
     # the Elite player budgets whenever those caches are available.  If any
@@ -11005,7 +11065,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
         with bc1:
             st.info("Use the top refresh button only.")
         with bc2:
-            if st.button("🧹 Clear saved board", key=f"clear_saved_board_{mode}", use_container_width=True):
+            if st.button("🧹 Clear saved board", key=f"clear_saved_board_{mode}", width="stretch"):
                 for _p in [SAVED_BOARD_FILE, SAVED_LINES_FILE, SAVED_BOARD_META_FILE]:
                     try:
                         if _p.exists(): _p.unlink()
@@ -11037,7 +11097,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     sched = schedule_for_slate(mode)
     if not sched.empty:
         with st.expander(f"{mode} schedule context", expanded=False):
-            st.dataframe(sched, use_container_width=True)
+            st.dataframe(sched, width="stretch")
 
     if lines is None or lines.empty:
         cached_board, cached_label = _load_last_good_projection_board(mode)
@@ -11074,7 +11134,7 @@ def render_grouped_player_board(mode: str, use_ud_flag: bool, logs_global: pd.Da
     # Current live board is now built; allow user to persist it for instant reload later.
     save_cols = st.columns([1.2, 2.8])
     with save_cols[0]:
-        if st.button("💾 Save Board", key=f"save_board_snapshot_{mode}", use_container_width=True):
+        if st.button("💾 Save Board", key=f"save_board_snapshot_{mode}", width="stretch"):
             n = save_board_snapshot(proj_df, lines_all, mode)
             st.session_state[f"wnba_force_live_{mode}"] = False
             st.session_state["wnba_prefer_projection_cache_after_refresh"] = False
@@ -11093,33 +11153,33 @@ def render_data_manager_tab():
     st.caption("The app now pulls and rebuilds data automatically. This tab is optional for diagnostics, exports, and backup imports only.")
 
     st.markdown("### Data status")
-    st.dataframe(dataset_status_table(), use_container_width=True)
+    st.dataframe(dataset_status_table(), width="stretch")
 
     st.markdown("### GitHub cache fallback")
     st.caption("Optional: commit CSVs into wnba_engine/data or set WNBA_DATA_BASE_URL to a raw GitHub data folder. The app loads GitHub/cache first, then official WNBA fallback if missing.")
-    st.dataframe(github_cache_status_table(), use_container_width=True)
-    if st.button("🔎 Test GitHub Cache Load", use_container_width=True, key="dm_test_github_cache_load"):
+    st.dataframe(github_cache_status_table(), width="stretch")
+    if st.button("🔎 Test GitHub Cache Load", width="stretch", key="dm_test_github_cache_load"):
         test_rows = []
         for _k in GITHUB_CACHE_DATA_KEYS:
             _df, _status = fetch_github_cache_dataset(_k)
             test_rows.append({"Dataset": _k, "Rows": 0 if _df is None or _df.empty else len(_df), "Status": _status})
-        st.dataframe(pd.DataFrame(test_rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(test_rows), width="stretch")
 
     st.markdown("### Official WNBA online fallback")
     st.write("Use this if Streamlit cache is empty. It pulls official WNBA player/team stats and builds a usable master baseline so live Underdog lines can still project.")
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("🌐 Pull Official WNBA Stats + Build Baselines", use_container_width=True, key="dm_official_online_build"):
+        if st.button("🌐 Pull Official WNBA Stats + Build Baselines", width="stretch", key="dm_official_online_build"):
             with st.spinner("Pulling official WNBA stats and building fallback baselines..."):
                 master, team_ranks, dbg = ensure_online_wnba_master_features(force_official=True)
             st.session_state["wnba_online_master_debug"] = dbg
             if master is not None and not master.empty:
                 st.success(f"Official WNBA fallback master built: {len(master):,} players")
-                st.dataframe(feature_missing_report(master), use_container_width=True)
+                st.dataframe(feature_missing_report(master), width="stretch")
             else:
                 st.error("Official WNBA fallback did not return player baselines. Check Debug / Status.")
     with c2:
-        if st.button("🧠 Build Advanced Features / Fix Missing Columns", use_container_width=True, key="dm_build_advanced_visible_nologo"):
+        if st.button("🧠 Build Advanced Features / Fix Missing Columns", width="stretch", key="dm_build_advanced_visible_nologo"):
             with st.spinner("Rebuilding master features from cached files, with official fallback if needed..."):
                 master, team_ranks, dbg = ensure_online_wnba_master_features(force_official=False)
                 if master is None or master.empty:
@@ -11127,11 +11187,11 @@ def render_data_manager_tab():
                 audit = feature_missing_report(master)
                 audit.to_csv(DATA_DIR / "wnba_feature_missing_report.csv", index=False)
             st.success(f"Advanced features ready. Master rows: {len(master)}")
-            st.dataframe(audit, use_container_width=True)
+            st.dataframe(audit, width="stretch")
 
     if "wnba_online_master_debug" in st.session_state:
         with st.expander("Official WNBA fallback debug", expanded=False):
-            st.dataframe(st.session_state.get("wnba_online_master_debug", pd.DataFrame()), use_container_width=True)
+            st.dataframe(st.session_state.get("wnba_online_master_debug", pd.DataFrame()), width="stretch")
 
     st.markdown("### Remote SportsDataverse refresh")
     st.caption("Use only when you need to reload historical/stat data. Daily betting use should stay on Refresh Today.")
@@ -11146,27 +11206,27 @@ def render_data_manager_tab():
     include_heavy = st.toggle("Include heavier add-ons: lineups + shots", value=True, key="dm_include_heavy_visible_nologo")
     y1, y2 = st.columns(2)
     with y1:
-        if st.button("Refresh SportsDataverse Database", use_container_width=True, key="dm_refresh_remote_visible_nologo"):
+        if st.button("Refresh SportsDataverse Database", width="stretch", key="dm_refresh_remote_visible_nologo"):
             with st.spinner("Refreshing SportsDataverse cache..."):
                 master, team_ranks, dbg, audit = refresh_data_and_build_advanced_features(dataset_choices, [int(season_last), int(season_now)], include_heavy)
             st.success(f"SportsDataverse refresh complete. Master rows: {0 if master is None else len(master)}")
-            st.dataframe(dbg, use_container_width=True)
+            st.dataframe(dbg, width="stretch")
             if audit is not None and not audit.empty:
                 st.caption("Missing-field audit")
-                st.dataframe(audit, use_container_width=True)
+                st.dataframe(audit, width="stretch")
     with y2:
-        if st.button("Download missing-field report", use_container_width=True, key="dm_report_button_nologo"):
+        if st.button("Download missing-field report", width="stretch", key="dm_report_button_nologo"):
             report_path = DATA_DIR / "wnba_feature_missing_report.csv"
             if report_path.exists():
-                st.download_button("Download CSV", report_path.read_text(errors="ignore"), "wnba_feature_missing_report.csv", "text/csv", use_container_width=True)
+                st.download_button("Download CSV", report_path.read_text(errors="ignore"), "wnba_feature_missing_report.csv", "text/csv", width="stretch")
             else:
                 st.info("No report yet. Build features first.")
 
     st.markdown("### Manual upload/import backup")
     uploaded = st.file_uploader("Upload SportsDataverse CSV/Parquet/ZIP files", type=["csv", "parquet", "xlsx", "json", "zip"], accept_multiple_files=True, key="dm_manual_upload_visible_nologo")
-    if uploaded and st.button("Import uploaded files", use_container_width=True, key="dm_import_uploads_visible_nologo"):
+    if uploaded and st.button("Import uploaded files", width="stretch", key="dm_import_uploads_visible_nologo"):
         rows = import_uploaded_dataset_files(uploaded)
-        st.dataframe(rows, use_container_width=True)
+        st.dataframe(rows, width="stretch")
         master, _, dbg = ensure_online_wnba_master_features(force_official=False)
         st.success(f"Files imported and master ready: {0 if master is None else len(master)} rows")
 
@@ -11175,7 +11235,7 @@ def render_data_manager_tab():
         path = CACHE_FILES.get(key)
         if path and path.exists():
             try:
-                st.download_button(f"Download {key}.csv", path.read_text(errors="ignore"), f"{key}.csv", "text/csv", use_container_width=True, key=f"dm_download_{key}_nologo")
+                st.download_button(f"Download {key}.csv", path.read_text(errors="ignore"), f"{key}.csv", "text/csv", width="stretch", key=f"dm_download_{key}_nologo")
             except Exception:
                 pass
 
@@ -12103,6 +12163,20 @@ def _grouped_market_html(r: pd.Series) -> str:
 
 with st.sidebar:
     st.header("Setup")
+    mobile_stability_mode = st.toggle(
+        "Mobile stability mode",
+        value=bool(st.session_state.get("owp_mobile_stability_mode", True)),
+        help="UI-only. Keeps full model calculations but limits heavy on-screen tables and hides nonessential download assets to prevent iPhone/Safari reload crashes.",
+        key="owp_mobile_stability_mode",
+    )
+    show_all_downloads = st.toggle(
+        "Show all download/export buttons",
+        value=bool(st.session_state.get("owp_show_all_downloads", False)),
+        help="Leave OFF on iPhone. The Full WNBA Forward Audit ZIP and Best Slate download stay available.",
+        key="owp_show_all_downloads",
+    )
+    if mobile_stability_mode:
+        st.caption("📱 Mobile stability ON · model math unchanged · heavy UI previews reduced")
     season_now = st.number_input("Current season", min_value=2020, max_value=2032, value=datetime.now().year, step=1)
     season_last = st.number_input("Last season baseline", min_value=2020, max_value=2032, value=datetime.now().year - 1, step=1)
     use_ud = st.toggle("Pull Underdog", value=True)
@@ -12120,7 +12194,7 @@ with st.sidebar:
         app131_audit_on = st.toggle("Enable forward audit export", value=True, key="app131_forward_audit_toggle")
         if app131_audit_on:
             app131_audit_scope = st.selectbox("Audit scope", ["Today", "Tomorrow"], index=0, key="app131_audit_scope")
-            if st.button("BUILD WNBA AUDIT ZIP", use_container_width=True, key="app131_build_audit_zip"):
+            if st.button("BUILD WNBA AUDIT ZIP", width="stretch", key="app131_build_audit_zip"):
                 try:
                     blob, meta = _app131_build_forward_audit_zip(app131_audit_scope)
                     st.session_state["app131_audit_blob"] = blob
@@ -12130,7 +12204,7 @@ with st.sidebar:
                     st.error(f"Audit failed safely: {str(exc)[:500]}")
             if st.session_state.get("app131_audit_blob"):
                 _stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
-                st.download_button("⬇️ DOWNLOAD WNBA AUDIT ZIP", data=st.session_state["app131_audit_blob"], file_name=f"wnba_app131_forward_audit_{_stamp}.zip", mime="application/zip", use_container_width=True, key="app131_download_audit_zip")
+                st.download_button("⬇️ DOWNLOAD WNBA AUDIT ZIP", data=st.session_state["app131_audit_blob"], file_name=f"wnba_app131_forward_audit_{_stamp}.zip", mime="application/zip", width="stretch", key="app131_download_audit_zip")
     st.markdown("**Markets active:** PTS, REB, AST, PRA")
     st.markdown("**Model:** Monte Carlo + Bayesian confidence + WNBA game script" + (" + guarded XGBoost/GBM blend" if use_xgb_blend else ""))
     st.caption("Use the top REFRESH TODAY button for schedule, online stats, opponent context, Underdog/manual lines, projections, and cache.")
@@ -13756,9 +13830,9 @@ def render_hhs_model_tab() -> None:
             type=["csv", "parquet", "xlsx", "xls", "json"],
             key="hhs_authorized_upload",
         )
-        if st.button("Import validated HHS export", disabled=upload is None, use_container_width=True):
+        if st.button("Import validated HHS export", disabled=upload is None, width="stretch"):
             report = repository.import_bytes(dataset, upload.getvalue(), upload.name)
-            st.dataframe(pd.DataFrame([report.as_dict()]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame([report.as_dict()]), width="stretch", hide_index=True)
             if report.ok:
                 st.success(f"Imported {report.rows_valid:,} validated rows into {dataset}.")
                 st.cache_data.clear()
@@ -13769,10 +13843,10 @@ def render_hhs_model_tab() -> None:
             "Optional structured endpoint: set HHS_STRUCTURED_DATA_BASE_URL to an authorized "
             "manifest folder and HHS_API_TOKEN when required. Direct HHS HTML crawling is blocked."
         )
-        if st.button("Force refresh authorized structured endpoint", disabled=not configured, use_container_width=True):
+        if st.button("Force refresh authorized structured endpoint", disabled=not configured, width="stretch"):
             with st.spinner("Refreshing authorized structured HHS exports..."):
                 refresh_report = automatic_hhs_refresh(force=True)
-            st.dataframe(refresh_report, use_container_width=True, hide_index=True)
+            st.dataframe(refresh_report, width="stretch", hide_index=True)
             st.cache_data.clear()
         cache_zip = repository.export_cache_zip()
         if cache_zip:
@@ -13781,7 +13855,7 @@ def render_hhs_model_tab() -> None:
                 cache_zip,
                 "wnba_hhs_cache_backup.zip",
                 "application/zip",
-                use_container_width=True,
+                width="stretch",
             )
 
     with compare_tab:
@@ -13803,13 +13877,13 @@ def render_hhs_model_tab() -> None:
                 "HHS Model Status", "Hybrid Status",
             ]
             display = board[[column for column in columns if column in board.columns]].copy()
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.dataframe(display, width="stretch", hide_index=True)
             st.download_button(
                 "Download Legacy vs HHS vs Hybrid CSV",
                 board.to_csv(index=False),
                 "wnba_legacy_hhs_hybrid_comparison.csv",
                 "text/csv",
-                use_container_width=True,
+                width="stretch",
             )
 
     with evaluation_tab:
@@ -13823,37 +13897,37 @@ def render_hhs_model_tab() -> None:
         else:
             summary = summarize_hhs_models(evaluation_rows)
             st.markdown("#### Same-slate model metrics")
-            st.dataframe(summary, use_container_width=True, hide_index=True)
+            st.dataframe(summary, width="stretch", hide_index=True)
             calibration = hhs_calibration_table(evaluation_rows)
             st.markdown("#### Probability calibration")
-            st.dataframe(calibration, use_container_width=True, hide_index=True)
+            st.dataframe(calibration, width="stretch", hide_index=True)
             recommendations = validated_hybrid_recommendations(evaluation_rows)
             st.markdown("#### Hybrid holdout validation")
-            st.dataframe(recommendations, use_container_width=True, hide_index=True)
+            st.dataframe(recommendations, width="stretch", hide_index=True)
             st.caption(
                 "Recommendations use a chronological train/holdout split and are not promoted automatically."
             )
             misses = hhs_diagnose_misses(evaluation_rows)
             with st.expander("Miss diagnosis queue", expanded=False):
-                st.dataframe(misses, use_container_width=True, hide_index=True)
+                st.dataframe(misses, width="stretch", hide_index=True)
             st.download_button(
                 "Download model evaluation rows",
                 evaluation_rows.to_csv(index=False),
                 "wnba_model_evaluation_rows.csv",
                 "text/csv",
-                use_container_width=True,
+                width="stretch",
             )
 
     with diagnostics_tab:
         st.markdown("#### HHS cache diagnostics")
-        st.dataframe(repository.diagnostics(), use_container_width=True, hide_index=True)
+        st.dataframe(repository.diagnostics(), width="stretch", hide_index=True)
         match_path = repository.config.root / "hhs_player_match_diagnostics.csv"
         if match_path.exists():
             st.markdown("#### Player identity diagnostics")
-            st.dataframe(pd.read_csv(match_path, low_memory=False), use_container_width=True, hide_index=True)
+            st.dataframe(pd.read_csv(match_path, low_memory=False), width="stretch", hide_index=True)
         store = ProjectionSnapshotStore(LOCAL_DIR / "wnba_projection_history.sqlite3")
         st.markdown("#### Immutable projection batches")
-        st.dataframe(store.list_batches(), use_container_width=True, hide_index=True)
+        st.dataframe(store.list_batches(), width="stretch", hide_index=True)
         if coverage["last_error"]:
             st.warning(f"Last HHS error: {coverage['last_error']}")
 
@@ -20077,13 +20151,13 @@ with tabs[1]:
         with st.expander("Best Bets export integrity check", expanded=False):
             st.json(health)
             if health_issues is not None and not health_issues.empty:
-                st.dataframe(health_issues, use_container_width=True, hide_index=True)
+                st.dataframe(health_issues, width="stretch", hide_index=True)
         card_view = st.toggle("Show player cards", value=True, key="best_bets_card_view")
         if card_view:
             for _, rr in show.head(50).iterrows():
                 render_elite_rank_card(rr)
         display_cols = [c for c in ["Elite Rank", "Elite Market Rank", "Elite Status", "Elite Rank Score", "Elite Best Play", "Elite Side", "Elite Projection", "Elite Edge", "Elite Calibrated Probability %", "Elite P50", "Elite Scoring Role", "Elite Rebound Role", "Elite Creation Role", "Elite Role Security", "Elite Market Role Fit", "Elite Role Summary", "Elite Scoring Hierarchy Rank", "Elite Rebound Hierarchy Rank", "Elite Creation Hierarchy Rank", "Elite Team FGA Share %", "Elite Team PTS Share %", "Elite Team REB Share %", "Elite Team AST Share %", "Elite Expected Team Points", "Elite Expected Opp Points", "Elite Expected Game Total", "Elite Projected FGA", "Elite Projected FTA", "Elite Vacancy Minutes", "Elite Vacancy FGA", "Elite Vacancy REB", "Elite Vacancy AST", "Elite Team Player PTS Sum", "Elite Projected PTS", "Elite Projected REB", "Elite Projected AST", "App127 Best Slate Qualified", "App127 Best Slate Gate Reason", "App127 Edge To Volatility", "App127 Prior Line Hit Shrunk %", "App127 Independent Family N", "App127 Independent Family Agree", "App127 Independent Family Score %", "App127 Independent Family Votes", "App127 Recent Robust SD", "App127 Fragile Accumulator Under", "App127 AST Share Concentration", "App129 Star Under Gate", "App129 Primary Role", "App129 Concentrated Role", "App130 Profit Gate Qualified", "App130 Profit Gate Reason", "App130 Adjusted Rank Score", "App130 Causal Score", "App130 Edge SD", "App130 Opp Role Defense", "App130 Game Environment Score", "App130 Blowout Risk", "App130 Rebound Miss Pool Score", "App130 Assist Creation Score", "App130 Minutes Range", "App130 Market Audit", "App130 Market Side Shrunk WR", "App130 Distribution Conflict", "App130 Evidence", "App127 Selection Adjustment", "App127 Selection Penalties", "App127 Selection Bonuses", "App128 Role Sanity Status", "App128 Recommended Action", "App128 Production Projection", "App128 Production Side", "App128 Challenger Projection", "App128 Challenger Side", "App128 Challenger Edge", "App128 Projection Delta", "App128 Side Agreement", "App128 Side Disagreement", "App128 Challenger Confidence", "App128 Role Conflict Flags", "App128 Availability Stress Score", "App128 Team Outs", "App128 Team Questionable", "App128 Recent Role Surge", "App128 Minutes Role Conflict", "App128 Minutes Production", "App128 Minutes P25", "App128 Minutes P50", "App128 Minutes P75", "App128 Projected FGA", "App128 Projected FTA", "App128 Projected 3PA", "App128 Attempt Model PTS", "App128 Recent Role PTS Anchor", "App128 Recent Role REB Anchor", "App128 Recent Role AST Anchor", "App128 Rebound Environment Factor", "App128 Assist Environment Factor", "App128 Challenger PTS", "App128 Challenger REB", "App128 Challenger AST", "App128 Challenger PRA", "Elite Flags", "Elite Agreement Score", "Elite Data Quality", "Elite Risk Penalty", "Projection Readiness", "Projection Missing Inputs", "Projection Data Through", "Projection Data Age Days", "Player Games Available", "Player Last Game", "Full Live Board Rows", "Projected Live Rows", "Unprojected Live Rows", "Tier", "Official", "Clean Risk", "Playable Gate", "Winning Play Score", "Projection Engine Version", "LineParserVersion", "Winning Gate Version", "Projection Integrity", "Player Identity Verified", "Market Projection Verified", "Pick Side Verified", "Strong Play", "Strong Play Score", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Line Selection", "UD Candidate Order", "UD Base Score", "UD Line Kind", "UD Two Sided", "Slate Player Prop Coverage", "Slate Missing From Player Props", "Opening Line", "CLV", "Projection", "Legacy Projection", "Challenger Projection", "PTS V2 Projection", "PTS V2 Side", "PTS V2 Edge", "PTS V2 Over %", "PTS V2 Under %", "PTS V2 P50", "PTS V2 Projected FGA", "PTS V2 Projected 3PA", "PTS V2 Projected FTA", "PTS V2 Usage %", "PTS V2 Team FGA Share %", "PTS V2 Team Total Scale", "PTS V2 Flags", "PTS V2 Data Quality", "PRA V2 Projection", "V2 Market Policy", "Projection Before Component Opportunity", "Component Opportunity Factor", "Component Opportunity Note", "WNBA ML Game Script", "WNBA ML Game Script Factor", "Projected Team Score ML", "Projected Opp Score ML", "Projected Game Total ML", "Projected Spread ML", "Team Win Probability ML", "Game Pace ML", "Blowout Risk ML", "XGBoost Blend Status", "PTS Component Opportunity", "REB Component Opportunity", "AST Component Opportunity", "PRA Component PTS", "PRA Component REB", "PRA Component AST", "PRA Component Sum", "PRA Identity Check", "Edge", "Lean", "Official Play Score", "Over %", "Under %", "MC Over %", "MC Under %", "MC Median", "MC Agreement", "Hit Rate Context", "Veteran Capability", "Evidence Support Score", "Opponent Market Specific Grade", "Opponent Market Allowed", "Opponent Market Allowed L5", "Opponent Market Allowed Rank", "Opponent Market Allowed Percentile", "Recent Support", "Freshness Status", "Line Age Minutes", "Lineup Confirmed", "Late Scratch Risk", "Injury Status", "Calibration Label", "Calibration Win Rate %", "Projection Integrity Note", "No-Bet Risk Flags", "Winning Gate Note", "Strong Play Missing", "Volatility", "Model Agreement", "PASS Reason", "Feature Importance"] if c in show.columns]
-        st.dataframe(show[display_cols] if display_cols else show, use_container_width=True)
+        st.dataframe(show[display_cols] if display_cols else show, width="stretch")
         st.download_button("Download best bets CSV", show.to_csv(index=False), "wnba_best_bets.csv", "text/csv")
 
 with tabs[2]:
@@ -20109,7 +20183,7 @@ with tabs[3]:
         ml_games = render_wnba_ml_system(ml_board, "moneyline_tab", mode=ml_mode)
     if ml_games is not None and not ml_games.empty:
         st.markdown("#### Moneyline model output")
-        st.dataframe(ml_games, use_container_width=True, hide_index=True)
+        st.dataframe(ml_games, width="stretch", hide_index=True)
         st.download_button("Download Moneyline/Game Script CSV", ml_games.to_csv(index=False), "wnba_moneyline_game_script.csv", "text/csv")
 
 with tabs[4]:
@@ -20133,10 +20207,10 @@ with tabs[4]:
             h4.metric("Opponent ctx", health.get("Opponent context ready", "0/0"))
             st.caption(f"XGBoost safety: {health.get('XGBoost default safe', 'OFF')}. Save only when the plays you trust show VERIFIED/context-ready, especially near lock.")
             if health_issues is not None and not health_issues.empty:
-                st.dataframe(health_issues, use_container_width=True, hide_index=True)
+                st.dataframe(health_issues, width="stretch", hide_index=True)
         c1, c2, c3 = st.columns(3)
         with c1:
-            if st.button("💾 Save official before games", use_container_width=True):
+            if st.button("💾 Save official before games", width="stretch"):
                 if board.empty:
                     st.warning("No projection board cached yet. Refresh a market board first.")
                 else:
@@ -20151,7 +20225,7 @@ with tabs[4]:
                     st.success(f"Saved {n} tracked plays and {snapshot_n} board rows. The saved slate will reload without refreshing.")
         with c2:
             grade_scope = st.selectbox("Grade scope", ["Today", "Tomorrow", "All pending"], index=0, key="grade_scope_after_results")
-            if st.button("🏁 Pull final results + grade pending plays", use_container_width=True):
+            if st.button("🏁 Pull final results + grade pending plays", width="stretch"):
                 mode_arg = None if grade_scope == "All pending" else grade_scope
                 n, dbg = pull_final_results_and_grade(mode_arg)
                 if n > 0:
@@ -20159,7 +20233,7 @@ with tabs[4]:
                 else:
                     st.warning(f"Final-result check completed, but 0 plays were graded for {grade_scope}. Review diagnostics; no false-success state is shown.")
                 with st.expander("Final-result pull diagnostics", expanded=(n == 0)):
-                    st.dataframe(dbg, use_container_width=True, hide_index=True)
+                    st.dataframe(dbg, width="stretch", hide_index=True)
         with c3:
             st.metric("Current board", 0 if board.empty else len(board))
             st.metric("Last auto graded", st.session_state.get("last_auto_final_grade_count", "N/A"))
@@ -20186,13 +20260,13 @@ with tabs[4]:
             c4.metric("➖ Pushes / 🚫 Voids", f"{summary['pushes']} / {summary['voids']}")
             if summary["decisions"]:
                 st.metric("Final win rate", f"{summary['wins']}-{summary['losses']} ({summary['win_rate']:.1%})")
-            st.dataframe(show_results, use_container_width=True)
+            st.dataframe(show_results, width="stretch")
             st.download_button("Download after-game results CSV", show_results.to_csv(index=False), "wnba_after_game_results.csv", "text/csv")
     with grade_tabs[2]:
         if not official.empty:
             st.markdown("### Official snapshot log")
             official_show = attach_result_symbols(official.tail(300))
-            st.dataframe(official_show, use_container_width=True)
+            st.dataframe(official_show, width="stretch")
             st.download_button("Download official log CSV", attach_result_symbols(official).to_csv(index=False), "wnba_official_pick_log.csv", "text/csv")
         else:
             st.info("No official plays saved yet.")
@@ -20205,7 +20279,7 @@ with tabs[4]:
                 else:
                     st.metric("Learning final win rate", "0-0")
             learning_show = attach_result_symbols(learning.tail(300))
-            st.dataframe(learning_show, use_container_width=True)
+            st.dataframe(learning_show, width="stretch")
             st.download_button("Download learning log CSV", attach_result_symbols(learning).to_csv(index=False), "wnba_learning_log.csv", "text/csv")
 
 with tabs[5]:
@@ -20215,12 +20289,12 @@ with tabs[6]:
     st.subheader("Debug / Status")
     st.caption("Diagnostics only. Heavy imports/rebuilds are in Data Manager and never run automatically.")
     st.markdown("### Data status")
-    st.dataframe(dataset_status_table(), use_container_width=True)
+    st.dataframe(dataset_status_table(), width="stretch")
     embedded_report = pd.DataFrame(st.session_state.get("embedded_core_data_report", []))
     if not embedded_report.empty:
         with st.expander("Embedded core-data self-heal", expanded=False):
             st.caption("Automatically creates player season stats and rosters from cached game logs/master features when the repository files are missing. The Underdog line pull is untouched.")
-            st.dataframe(embedded_report, use_container_width=True)
+            st.dataframe(embedded_report, width="stretch")
     st.markdown("### Aggregated real lines")
     lines = st.session_state.get("wnba_lines_all", pd.DataFrame())
     if (lines is None or lines.empty) and SAVED_LINES_FILE.exists():
@@ -20233,9 +20307,9 @@ with tabs[6]:
     if lines is None or lines.empty:
         st.info("No line pull is cached. Use the top Refresh button; Debug/Status does not pull automatically.")
     render_source_status_card(lines, ud_debug, sl_debug, False, "")
-    st.dataframe(lines, use_container_width=True)
+    st.dataframe(lines, width="stretch")
     st.markdown("### Underdog debug")
-    st.dataframe(ud_debug, use_container_width=True)
+    st.dataframe(ud_debug, width="stretch")
 
     st.markdown("### Underdog Decode Mode")
     decode_path = DATA_DIR / "wnba_underdog_decode.csv"
@@ -20243,7 +20317,7 @@ with tabs[6]:
         try:
             decode_df = pd.read_csv(decode_path, low_memory=False)
             st.caption("Raw Underdog row → parsed market/line → resolved player → accepted/rejected reason.")
-            st.dataframe(decode_df.tail(250), use_container_width=True)
+            st.dataframe(decode_df.tail(250), width="stretch")
             st.download_button("Download Underdog decode CSV", decode_df.to_csv(index=False), "wnba_underdog_decode.csv", "text/csv")
         except Exception as e:
             st.warning(f"Decode file exists but could not be read: {e}")
@@ -20256,19 +20330,19 @@ with tabs[6]:
             candidate_df = pd.read_csv(candidate_path, low_memory=False)
             st.markdown("### Full-Game Main-Line Audit")
             st.caption("Every duplicate candidate is scored against its full-game baseline. Period/live/one-sided/implausible rows are blocked before projections are built.")
-            st.dataframe(candidate_df.tail(300), use_container_width=True)
+            st.dataframe(candidate_df.tail(300), width="stretch")
             st.download_button("Download main-line audit CSV", candidate_df.to_csv(index=False), "wnba_underdog_mainline_candidates.csv", "text/csv")
         except Exception as e:
             st.warning(f"Could not read main-line audit file: {e}")
 
     with st.expander("PrizePicks test pull — debug only", expanded=False):
         st.caption("This only tests whether a public PrizePicks JSON response is reachable. It does not feed projections yet.")
-        if st.button("Test PrizePicks public pull", use_container_width=True):
+        if st.button("Test PrizePicks public pull", width="stretch"):
             pp_dbg = fetch_prizepicks_test_pull()
-            st.dataframe(pp_dbg, use_container_width=True)
+            st.dataframe(pp_dbg, width="stretch")
 
     st.markdown("### Manual line debug")
-    st.dataframe(sl_debug, use_container_width=True)
+    st.dataframe(sl_debug, width="stretch")
     st.markdown("### Daily Team Context Cache 2.0")
     ctx_debug = st.session_state.get("wnba_daily_team_context_v2", pd.DataFrame())
     if (ctx_debug is None or ctx_debug.empty) and DAILY_TEAM_CONTEXT_FILE.exists():
@@ -20276,9 +20350,9 @@ with tabs[6]:
             ctx_debug = pd.read_csv(DAILY_TEAM_CONTEXT_FILE, low_memory=False)
         except Exception:
             ctx_debug = pd.DataFrame()
-    st.dataframe(ctx_debug, use_container_width=True)
+    st.dataframe(ctx_debug, width="stretch")
     st.markdown("### Cached master preview")
-    st.dataframe(master_global.head(50), use_container_width=True)
+    st.dataframe(master_global.head(50), width="stretch")
 
 with tabs[7]:
     st.subheader("Model Reports: AutoGrader / CLV / Calibration / Backtest")
@@ -20305,7 +20379,7 @@ with tabs[7]:
 
     st.markdown("### 1) Result AutoGrader")
     st.write("Pulls final ESPN boxscores automatically, falls back to official WNBA live boxscores, then writes WIN/LOSS/PUSH/VOID, actual value, closing line, and CLV.")
-    if st.button("Run AutoGrader now", type="primary", use_container_width=True):
+    if st.button("Run AutoGrader now", type="primary", width="stretch"):
         n, dbg = pull_final_results_and_grade(None)
         if n > 0:
             st.success(f"AutoGrader pulled final boxscores and updated {n} pending plays.")
@@ -20313,36 +20387,36 @@ with tabs[7]:
             st.warning("AutoGrader completed with 0 graded plays. Open diagnostics; final stats alone are not counted as a successful grade.")
         if n == 0:
             with st.expander("AutoGrader diagnostics", expanded=True):
-                st.dataframe(dbg, use_container_width=True, hide_index=True)
+                st.dataframe(dbg, width="stretch", hide_index=True)
     refreshed_official = pd.DataFrame(load_json(OFFICIAL_LOG, []))
     if not refreshed_official.empty:
         cols = [c for c in ["SavedAt", "Player", "Team", "Opponent", "Matchup", "Market", "Line", "Projection", "Lean", "Actual", "Result", "ClosingLine", "CLV", "GradeNote"] if c in refreshed_official.columns]
         refreshed_show = attach_result_symbols(refreshed_official.tail(250)[cols] if cols else refreshed_official.tail(250))
-        st.dataframe(refreshed_show, use_container_width=True)
+        st.dataframe(refreshed_show, width="stretch")
 
     st.markdown("### 2) Line Movement + CLV Dashboard")
     lm_df = line_movement_report()
     if lm_df.empty:
         st.info("No line movement snapshots yet. Refresh board lines a few times and/or save official plays to build this database.")
     else:
-        st.dataframe(lm_df.head(300), use_container_width=True)
+        st.dataframe(lm_df.head(300), width="stretch")
         st.download_button("Download line movement CSV", lm_df.to_csv(index=False), "wnba_line_movement.csv", "text/csv")
     if not learning_df.empty and "CLV" in learning_df.columns:
         clv = learning_df.copy()
         clv["CLV"] = pd.to_numeric(clv["CLV"], errors="coerce")
         st.markdown("#### CLV by Market")
         clv_sum = clv.groupby("Market", dropna=False).agg(Plays=("CLV", "count"), AvgCLV=("CLV", "mean"), PositiveCLV=("CLV", lambda x: (pd.to_numeric(x, errors='coerce') > 0).mean())).reset_index()
-        st.dataframe(clv_sum, use_container_width=True)
+        st.dataframe(clv_sum, width="stretch")
 
     st.markdown("### 3) Model Calibration Report")
     learn_raw, cal = calibration_report()
     if cal.empty:
         st.info("No graded learning data yet. Save official plays, import final player logs, then run AutoGrader.")
     else:
-        st.dataframe(cal, use_container_width=True)
+        st.dataframe(cal, width="stretch")
         st.download_button("Download calibration CSV", cal.to_csv(index=False), "wnba_model_calibration.csv", "text/csv")
         with st.expander("Raw graded learning data", expanded=False):
-            st.dataframe(learn_raw.tail(500), use_container_width=True)
+            st.dataframe(learn_raw.tail(500), width="stretch")
 
     st.markdown("### 4) App126 Loss Rescue / Projection Forensics")
     st.caption("Uses only completed prior Final-Resolved grades. Shows which losses were predictable, whether residual corrections rescue more losses than wins they break, and why losses happened. Projection corrections remain replay-gated and sample-shrunk.")
@@ -20352,17 +20426,17 @@ with tabs[7]:
         if _lr_summary is None or _lr_summary.empty:
             st.info("Loss Rescue is waiting for enough completed Final-Resolved grades.")
         else:
-            st.dataframe(_lr_summary,use_container_width=True,hide_index=True)
+            st.dataframe(_lr_summary,width="stretch",hide_index=True)
             st.download_button("Download App126 loss-rescue replay CSV",_app126_replay_loss_rescue().to_csv(index=False),"wnba_app126_loss_rescue_replay.csv","text/csv")
         if _lr_ledger is not None and not _lr_ledger.empty:
             _losses=_lr_ledger[_lr_ledger.get("ResultKey",pd.Series("",index=_lr_ledger.index)).astype(str).str.contains("LOSS",na=False)].copy()
             if not _losses.empty:
                 _reason=_losses.groupby("App126 Loss Primary Reason",dropna=False).size().reset_index(name="Losses").sort_values("Losses",ascending=False)
                 st.markdown("#### Loss reason distribution")
-                st.dataframe(_reason,use_container_width=True,hide_index=True)
+                st.dataframe(_reason,width="stretch",hide_index=True)
                 _cols=[c for c in ["SavedAt","Player","Market","Side","LineNum","ProjectionNum","ActualNum","ProjectionErrorNum","ProjMinutes","ActualMinutes","MinutesErrorNum","ActualFGA","ActualFTA","App126 Loss Primary Reason","App126 Loss Reason Tags"] if c in _losses.columns]
                 with st.expander("Exact App126 loss ledger",expanded=False):
-                    st.dataframe(_losses[_cols].tail(400),use_container_width=True,hide_index=True)
+                    st.dataframe(_losses[_cols].tail(400),width="stretch",hide_index=True)
                     st.download_button("Download App126 loss ledger CSV",_lr_ledger.to_csv(index=False),"wnba_app126_loss_ledger.csv","text/csv")
     except Exception as _app126_ui_exc:
         st.warning(f"App126 Loss Rescue report unavailable: {_app126_ui_exc}")
@@ -20387,9 +20461,9 @@ with tabs[7]:
             _ranked=_a127[pd.to_numeric(_a127.get("Elite Rank"),errors="coerce").notna()].sort_values("Elite Rank") if "Elite Rank" in _a127.columns else pd.DataFrame()
             if not _ranked.empty:
                 st.markdown("#### Current App127 Best Slate")
-                st.dataframe(_ranked[_cols].head(50),use_container_width=True,hide_index=True)
+                st.dataframe(_ranked[_cols].head(50),width="stretch",hide_index=True)
             with st.expander("Rows filtered from Best Slate",expanded=False):
-                st.dataframe(_a127.loc[~_q,_cols].sort_values("Elite Rank Score",ascending=False).head(100),use_container_width=True,hide_index=True)
+                st.dataframe(_a127.loc[~_q,_cols].sort_values("Elite Rank Score",ascending=False).head(100),width="stretch",hide_index=True)
     except Exception as _app127_ui_exc:
         st.warning(f"App127 Best Slate audit unavailable: {_app127_ui_exc}")
 
@@ -20404,7 +20478,7 @@ with tabs[7]:
             _d128=_a128.copy(); _conf=_d128.get("App128 Role Sanity Status",pd.Series("",index=_d128.index)).astype(str).str.upper().eq("CONFLICT"); _dis=_d128.get("App128 Side Disagreement",pd.Series(False,index=_d128.index)).fillna(False).astype(bool); _surge=_d128.get("App128 Recent Role Surge",pd.Series(False,index=_d128.index)).fillna(False).astype(bool)
             _m1,_m2,_m3,_m4=st.columns(4); _m1.metric("Role conflicts",int(_conf.sum())); _m2.metric("Side disagreements",int(_dis.sum())); _m3.metric("Recent role surges",int(_surge.sum())); _m4.metric("High availability stress",int((pd.to_numeric(_d128.get("App128 Availability Stress Score"),errors="coerce")>=30).sum()))
             _cols=[c for c in ["Elite Rank","Player","Team","Opponent","Market","Line","Final Resolved Projection","Final Resolved Side","App128 Challenger Projection","App128 Challenger Side","App128 Projection Delta","App128 Role Sanity Status","App128 Role Conflict Flags","App128 Challenger Confidence","App128 Availability Stress Score","App128 Team Outs","App128 Team Questionable","App128 Recent Role Surge","App128 Minutes Production","App128 Minutes P25","App128 Minutes P50","App128 Minutes P75","App128 Projected FGA","App128 Projected FTA","App128 Attempt Model PTS","App128 Recent Role PTS Anchor","App128 Recent Role REB Anchor","App128 Recent Role AST Anchor","App128 Challenger PTS","App128 Challenger REB","App128 Challenger AST","App128 Challenger PRA","App128 Recommended Action"] if c in _d128.columns]
-            st.dataframe(_d128[_cols].sort_values(["App128 Role Sanity Status","App128 Availability Stress Score"],ascending=[True,False]).head(150),use_container_width=True,hide_index=True)
+            st.dataframe(_d128[_cols].sort_values(["App128 Role Sanity Status","App128 Availability Stress Score"],ascending=[True,False]).head(150),width="stretch",hide_index=True)
             st.download_button("Download App128 role/availability audit CSV",_d128[_cols].to_csv(index=False),"wnba_app128_role_availability_audit.csv","text/csv")
         _g128=pd.DataFrame(load_json(LEARNING_LOG,[]))
         if _g128 is not None and not _g128.empty and "App128 Challenger Result" in _g128.columns:
@@ -20415,14 +20489,14 @@ with tabs[7]:
                 _g1,_g2,_g3,_g4=st.columns(4); _g1.metric("Challenger graded",len(_valid)); _g2.metric("Losses rescued",_rescue); _g3.metric("Wins broken",_break); _g4.metric("Net rescue score",f"{_net:+.2f}")
                 _cmp=_valid.groupby("Market",dropna=False).agg(Plays=("App128 Challenger Result","count"),ChallengerWins=("App128 Challenger Result",lambda x:(x.astype(str).str.upper()=="WIN").sum()),ChallengerMAE=("App128 Challenger Abs Error","mean"),ProductionMAE=("App128 Production Final Abs Error","mean"),Rescued=("App128 Rescued Production Loss",lambda x:pd.Series(x).fillna(False).astype(bool).sum()),Broken=("App128 Broke Production Win",lambda x:pd.Series(x).fillna(False).astype(bool).sum())).reset_index(); _cmp["ChallengerWinRate %"]=100*_cmp["ChallengerWins"]/_cmp["Plays"].clip(lower=1); _cmp["MAE Improvement"]= _cmp["ProductionMAE"]-_cmp["ChallengerMAE"]; _cmp["Net Rescue Score"]=_cmp["Rescued"]-1.25*_cmp["Broken"]
                 st.markdown("#### Graded App128 shadow vs production")
-                st.dataframe(_cmp,use_container_width=True,hide_index=True)
+                st.dataframe(_cmp,width="stretch",hide_index=True)
     except Exception as _a128_ui_exc:
         st.warning(f"App128 challenger audit unavailable: {_a128_ui_exc}")
 
     st.markdown("### 7) Automated Historical Backtest")
     st.caption("Backtests the projection formula on historical logs using a prior-games-only line proxy. This validates model direction/calibration without claiming it had real sportsbook historical lines.")
     min_prior = st.slider("Minimum prior games before testing", 3, 15, 5)
-    if st.button("Run historical backtest", use_container_width=True):
+    if st.button("Run historical backtest", width="stretch"):
         bt = build_historical_backtest(logs_global, min_prior_games=min_prior)
         st.session_state["wnba_backtest_df"] = bt
     bt = st.session_state.get("wnba_backtest_df", pd.DataFrame())
@@ -20430,10 +20504,10 @@ with tabs[7]:
         st.info("Run the backtest after player logs are imported.")
     else:
         bts = summarize_backtest(bt)
-        st.dataframe(bts, use_container_width=True)
+        st.dataframe(bts, width="stretch")
         st.download_button("Download backtest summary CSV", bts.to_csv(index=False), "wnba_backtest_summary.csv", "text/csv")
         with st.expander("Backtest rows", expanded=False):
-            st.dataframe(bt.tail(1000), use_container_width=True)
+            st.dataframe(bt.tail(1000), width="stretch")
             st.download_button("Download full backtest rows CSV", bt.to_csv(index=False), "wnba_backtest_rows.csv", "text/csv")
 
 with tabs[8]:
