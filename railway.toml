@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python -m streamlit run app.py --server.address=0.0.0.0 --server.port=$PORT --server.headless=true"
+startCommand = "python streamlit_compat_runner.py"
