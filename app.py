@@ -5,14 +5,21 @@ Full single-file Streamlit app.
 
 Markets: PTS / REB / AST / PRA
 Line-source build:
-- Keeps Underdog as the only live automated prop source.
-- Removes/turns off Sleeper, Odds API, and SportsGameOdds from the active board flow.
+- Keeps Underdog as the first live automated prop source.
+- Adds PropLine as an API-key fallback/supplement for WNBA PTS/REB/AST/PRA when Underdog is blocked/empty.
+- Sleeper and SportsGameOdds remain disabled from the active board flow.
 - Adds an in-app Manual Line Entry board by slate and market, using cached WNBA schedules
   so you can enter PTS/REB/AST/PRA lines directly against the correct matchup.
 - Projection engine still runs from the SportsDataverse database even when lines are manual.
 """
 
 
+# APP133 PROPLINE WNBA LINE FALLBACK (LINE SOURCE ONLY)
+# - Keeps Underdog first when it works.
+# - Adds PropLine WNBA PTS/REB/AST/PRA fallback/supplement using Railway/Streamlit secret.
+# - Accepts PROP_LINE_API_KEY (same name as SOL V2) or PROPLINE_API_KEY (batter-app alias).
+# - Does NOT change production projection, side, probability, App128/App130, Best Slate, or grading math.
+#
 # APP132 TRUE LAZY MOBILE STABILITY BUILD (UI ONLY)
 # - Replaces eager Streamlit tabs with lazy section navigation so Safari receives only one section at a time.
 # - Mobile mode defaults Player Cards to Fast table and caps optional card rendering.
@@ -546,6 +553,22 @@ ODDS_API_MARKETS = {
     "PRA": "player_points_rebounds_assists",
 }
 DEFAULT_ODDS_API_BOOKMAKERS = "draftkings,fanduel,betmgm,caesars,espnbet"
+
+# PropLine fallback for WNBA player props. PropLine uses a The-Odds-API-compatible
+# response shape and currently exposes these exact WNBA market keys. Keep the
+# secret out of source control; the app reads Railway/Streamlit secrets only.
+PROPLINE_BASE = "https://api.prop-line.com/v1"
+PROPLINE_SPORT = "basketball_wnba"
+PROPLINE_MARKETS = {
+    "PTS": "player_points",
+    "REB": "player_rebounds",
+    "AST": "player_assists",
+    "PRA": "player_points_rebounds_assists",
+}
+PROPLINE_PREFERRED_BOOKS = [
+    "underdog", "prizepicks", "betr", "draftkings", "fanduel",
+    "fanatics", "betmgm", "caesars", "espnbet", "bovada", "pinnacle",
+]
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
@@ -3268,6 +3291,218 @@ def normalize_line_upload(df: pd.DataFrame, source_name: str = "CSV Upload") -> 
     return out[["Player", "Team", "Market", "Line", "Source", "Start", "Raw", "OverOdds", "UnderOdds"]].copy()
 
 
+
+def _propline_api_key() -> str:
+    """Read the same PropLine secret used by the other apps; never display it."""
+    for name in ("PROP_LINE_API_KEY", "PROPLINE_API_KEY"):
+        val = _read_secret_or_env(name, "")
+        if val:
+            return val.strip()
+    return ""
+
+
+def _propline_enabled() -> bool:
+    raw = _read_secret_or_env("PROPLINE_WNBA_ENABLED", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _propline_get_json(url: str, api_key: str, params=None, timeout: int = 18):
+    """PropLine accepts apiKey query auth and X-API-Key header auth. Try both safely."""
+    base_params = dict(params or {})
+    attempts = [
+        ("query_apiKey", {**base_params, "apiKey": api_key}, {}),
+        ("header_X_API_Key", base_params, {"X-API-Key": api_key}),
+    ]
+    last = {"status_code": 0, "auth_mode": "", "message": "NO_RESPONSE"}
+    for mode, qparams, extra_headers in attempts:
+        try:
+            headers = dict(DEFAULT_HEADERS)
+            headers.update(extra_headers)
+            r = requests.get(url, params=qparams, headers=headers, timeout=timeout)
+            status = int(getattr(r, "status_code", 0) or 0)
+            last = {
+                "status_code": status,
+                "auth_mode": mode,
+                "message": "ok" if status < 400 else (r.text or "")[:220],
+                "daily_remaining": r.headers.get("X-Daily-Remaining") or r.headers.get("X-RateLimit-Remaining") or "",
+                "daily_limit": r.headers.get("X-Daily-Limit") or r.headers.get("X-RateLimit-Limit") or "",
+            }
+            if status >= 400:
+                # Retry the alternate auth mode only for auth-ish responses.
+                if status in {401, 403, 422}:
+                    continue
+                return None, last
+            try:
+                return r.json(), last
+            except Exception:
+                last["message"] = "non-json response"
+                return None, last
+        except Exception as exc:
+            last = {"status_code": 0, "auth_mode": mode, "message": str(exc)[:220]}
+    return None, last
+
+
+def _propline_extract_events(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("events", "data", "results"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return val
+    return []
+
+
+def _propline_event_payload(payload):
+    if isinstance(payload, dict):
+        if isinstance(payload.get("event"), dict):
+            return payload.get("event")
+        if isinstance(payload.get("data"), dict):
+            return payload.get("data")
+        return payload
+    return {}
+
+
+def _propline_book_priority(book_key: str) -> int:
+    k = re.sub(r"[^a-z0-9]+", "", str(book_key or "").lower())
+    for i, preferred in enumerate(PROPLINE_PREFERRED_BOOKS):
+        p = re.sub(r"[^a-z0-9]+", "", preferred.lower())
+        if k == p or p in k:
+            return i
+    return 100
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_propline_board(key_marker: str = ""):
+    """Pull WNBA PTS/REB/AST/PRA lines through PropLine.
+
+    The key itself is read from Railway/Streamlit secrets inside this function;
+    only a short non-secret marker participates in the cache key. One combined
+    market request is used per event to protect the free-tier request budget.
+    """
+    empty_cols = ["Player", "Team", "Opponent", "Market", "Line", "Source", "Start", "Raw",
+                  "OverOdds", "UnderOdds", "Matchup", "EventAway", "EventHome", "ProviderBook"]
+    debug = []
+    api_key = _propline_api_key()
+    if not _propline_enabled():
+        return pd.DataFrame(columns=empty_cols), pd.DataFrame([{"source": "PropLine", "status": "disabled"}])
+    if not api_key:
+        return pd.DataFrame(columns=empty_cols), pd.DataFrame([{
+            "source": "PropLine", "status": "missing key",
+            "message": "Add PROP_LINE_API_KEY to the WNBA Railway service."
+        }])
+
+    events_url = f"{PROPLINE_BASE}/sports/{PROPLINE_SPORT}/events"
+    events_payload, req = _propline_get_json(events_url, api_key, timeout=18)
+    events = _propline_extract_events(events_payload)
+    debug.append({"source": "PropLine", "step": "events", "status": req.get("message"),
+                  "status_code": req.get("status_code"), "events": len(events),
+                  "daily_remaining": req.get("daily_remaining", "")})
+    if not events:
+        return pd.DataFrame(columns=empty_cols), pd.DataFrame(debug)
+
+    try:
+        max_events = int(float(_read_secret_or_env("PROPLINE_WNBA_MAX_EVENTS", "16") or 16))
+    except Exception:
+        max_events = 16
+    max_events = max(1, min(24, max_events))
+    market_keys = ",".join(PROPLINE_MARKETS.values())
+    preferred_books = _read_secret_or_env("PROPLINE_WNBA_BOOKMAKERS", "").strip()
+    paired_rows = []
+
+    for ev in events[:max_events]:
+        if not isinstance(ev, dict):
+            continue
+        event_id = str(ev.get("id") or "").strip()
+        if not event_id:
+            continue
+        odds_url = f"{PROPLINE_BASE}/sports/{PROPLINE_SPORT}/events/{event_id}/odds"
+        params = {"markets": market_keys, "includeBookIds": "true", "includeLinks": "false"}
+        if preferred_books:
+            params["bookmakers"] = preferred_books
+        payload, oreq = _propline_get_json(odds_url, api_key, params=params, timeout=18)
+        data = _propline_event_payload(payload)
+        books = data.get("bookmakers", []) if isinstance(data, dict) else []
+        debug.append({
+            "source": "PropLine", "step": "event_odds", "event_id": event_id,
+            "event": f"{ev.get('away_team','')} @ {ev.get('home_team','')}",
+            "status": oreq.get("message"), "status_code": oreq.get("status_code"),
+            "bookmakers": len(books), "daily_remaining": oreq.get("daily_remaining", ""),
+        })
+        if not books:
+            continue
+
+        away_raw = data.get("away_team") or ev.get("away_team") or ""
+        home_raw = data.get("home_team") or ev.get("home_team") or ""
+        away = _team_key_for_matchup(away_raw) if "_team_key_for_matchup" in globals() else str(away_raw)
+        home = _team_key_for_matchup(home_raw) if "_team_key_for_matchup" in globals() else str(home_raw)
+        start = data.get("commence_time") or ev.get("commence_time") or ""
+        matchup = f"{away} @ {home}" if away and home else f"{away_raw} @ {home_raw}".strip(" @")
+
+        # Pair O/U outcomes for each book/player/market/line.
+        paired = {}
+        for book in books or []:
+            if not isinstance(book, dict):
+                continue
+            book_key = str(book.get("key") or book.get("bookmaker") or book.get("title") or "book").strip()
+            book_title = str(book.get("title") or book.get("name") or book_key or "PropLine").strip()
+            for mkt in book.get("markets", []) or []:
+                if not isinstance(mkt, dict):
+                    continue
+                internal_market = odds_api_market_to_internal(mkt.get("key") or mkt.get("market_key"))
+                if internal_market not in MARKETS:
+                    continue
+                for out in mkt.get("outcomes", []) or []:
+                    if not isinstance(out, dict):
+                        continue
+                    side_name = str(out.get("name") or "").strip()
+                    desc = str(out.get("description") or out.get("player") or out.get("player_name") or "").strip()
+                    player = desc if side_name.lower() in {"over", "under"} and desc else side_name
+                    if not player or normalize_name(player) in {"over", "under"}:
+                        continue
+                    line = safe_float(out.get("point"), np.nan)
+                    if pd.isna(line):
+                        continue
+                    pkey = normalize_name(player)
+                    key = (pkey, internal_market, float(line), book_key.lower())
+                    rec = paired.setdefault(key, {
+                        "Player": player, "Team": str(out.get("team") or out.get("team_name") or ""),
+                        "Opponent": "", "Market": internal_market, "Line": float(line),
+                        "Source": "PropLine", "Start": start, "Raw": f"{matchup} | {book_title} | {mkt.get('key','')}",
+                        "OverOdds": np.nan, "UnderOdds": np.nan, "Matchup": matchup,
+                        "EventAway": away, "EventHome": home, "ProviderBook": book_title,
+                        "ProviderBookKey": book_key.lower(), "ProviderEventID": event_id,
+                    })
+                    price = safe_float(out.get("price"), np.nan)
+                    if side_name.lower() == "over":
+                        rec["OverOdds"] = price
+                    elif side_name.lower() == "under":
+                        rec["UnderOdds"] = price
+        paired_rows.extend(paired.values())
+
+    df = pd.DataFrame(paired_rows)
+    if df.empty:
+        debug.append({"source": "PropLine", "step": "final", "status": "no WNBA prop rows", "rows": 0})
+        return pd.DataFrame(columns=empty_cols), pd.DataFrame(debug)
+
+    # Pick one base line per player/market. Prefer DFS books matching the historical
+    # Underdog-style board; otherwise take the most commonly posted line across books.
+    df["NameKey"] = df["Player"].map(normalize_name)
+    df["_book_priority"] = df.get("ProviderBookKey", pd.Series("", index=df.index)).map(_propline_book_priority)
+    df["_line_frequency"] = df.groupby(["NameKey", "Market", "Line"])["Line"].transform("size")
+    df["_has_dfs"] = df["_book_priority"].lt(3).astype(int)
+    df = df.sort_values(
+        ["NameKey", "Market", "_has_dfs", "_line_frequency", "_book_priority"],
+        ascending=[True, True, False, False, True], kind="mergesort"
+    )
+    df = df.drop_duplicates(subset=["NameKey", "Market"], keep="first").copy()
+    df["Line Feed"] = "PropLine API"
+    df["Line Feed Version"] = "APP133_PROPLINE_WNBA_FALLBACK_2026_09_17"
+    df = df.drop(columns=["_book_priority", "_line_frequency", "_has_dfs"], errors="ignore")
+    debug.append({"source": "PropLine", "step": "final", "status": "parsed rows", "rows": len(df)})
+    return df, pd.DataFrame(debug)
+
+
 @st.cache_data(ttl=240, show_spinner=False)
 def fetch_odds_api_board(api_key: str, regions: str = "us", bookmakers: str = DEFAULT_ODDS_API_BOOKMAKERS, odds_format: str = "american"):
     """Pull WNBA player props from The Odds API when an API key is supplied.
@@ -3361,41 +3596,66 @@ def save_manual_lines(df):
 
 
 def aggregate_lines(use_ud=True, use_sleeper=False, manual_df=None, use_odds_api=False, odds_api_key: str = "", line_upload_df=None):
-    """Aggregate active line sources.
+    """Aggregate active WNBA line sources without changing projection math.
 
-    Current production setup is intentionally simple and stable:
-      1) Underdog if it returns WNBA rows
-      2) Manual in-app lines saved by the user
-      3) Optional uploaded line CSVs
+    Source order:
+      1) Direct Underdog when available
+      2) Explicit manual lines
+      3) PropLine API fallback/supplement (Railway secret; same provider used by other apps)
+      4) Uploaded CSV fallback
 
-    Sleeper, Odds API, and SportsGameOdds are not called here. Their old functions may remain
-    in the file as dormant utilities, but they are disabled from the live board so quota/tier
-    errors cannot break the app or clutter the debug screen.
+    PropLine only fills player/market keys missing from direct Underdog, so a working
+    Underdog line is never silently replaced by the fallback.
     """
     frames = []
-    ud_debug = pd.DataFrame(); manual_debug = []
+    ud_debug = pd.DataFrame()
+    provider_debug_rows = []
+    ud = pd.DataFrame()
+
     if use_ud:
         ud, ud_debug = fetch_underdog_board()
         if ud is not None and not ud.empty:
             frames.append(ud)
+
+    # PropLine is cheap enough for a WNBA slate and fills only direct-UD misses.
+    # It remains dormant when no key is configured.
+    pl_key = _propline_api_key()
+    try:
+        marker = pl_key[-6:] if pl_key else "missing"
+        pl, pl_debug = fetch_propline_board(marker)
+    except Exception as exc:
+        pl = pd.DataFrame()
+        pl_debug = pd.DataFrame([{"source": "PropLine", "status": "error", "message": str(exc)[:220]}])
+    if pl_debug is not None and not pl_debug.empty:
+        provider_debug_rows.extend(pl_debug.to_dict("records"))
+    if pl is not None and not pl.empty:
+        if ud is not None and not ud.empty:
+            ud_keys = set(zip(ud["Player"].map(normalize_name), ud["Market"].astype(str).str.upper()))
+            pl = pl[~pl.apply(lambda r: (normalize_name(r.get("Player")), str(r.get("Market", "")).upper()) in ud_keys, axis=1)].copy()
+        if not pl.empty:
+            frames.append(pl)
+
     if manual_df is not None and len(manual_df):
         m = manual_df.copy()
         if "Source" not in m.columns:
             m["Source"] = "Manual"
         m["Source"] = m["Source"].fillna("Manual").replace("", "Manual")
         frames.append(m)
-        manual_debug.append({"source": "Manual", "status": "loaded saved manual lines", "rows": len(m)})
+        provider_debug_rows.append({"source": "Manual", "status": "loaded saved manual lines", "rows": len(m)})
+
     if line_upload_df is not None and len(line_upload_df):
         u = line_upload_df.copy()
         if "Source" not in u.columns:
             u["Source"] = "CSV Upload"
         frames.append(u)
-        manual_debug.append({"source": "CSV Upload", "status": "loaded uploaded CSV lines", "rows": len(u)})
+        provider_debug_rows.append({"source": "CSV Upload", "status": "loaded uploaded CSV lines", "rows": len(u)})
+
     if not frames:
-        return pd.DataFrame(columns=["Player","Team","Opponent","Market","Line","Source","Start","Raw","OverOdds","UnderOdds","NameKey","Priority"]), ud_debug, pd.DataFrame(manual_debug)
+        return pd.DataFrame(columns=["Player","Team","Opponent","Market","Line","Source","Start","Raw","OverOdds","UnderOdds","NameKey","Priority"]), ud_debug, pd.DataFrame(provider_debug_rows)
+
     board = pd.concat(frames, ignore_index=True, sort=False)
     if board.empty:
-        return board, ud_debug, pd.DataFrame(manual_debug)
+        return board, ud_debug, pd.DataFrame(provider_debug_rows)
     board["Market"] = board["Market"].astype(str).str.upper().map(lambda x: "PRA" if "PRA" in x else x)
     board = board[board["Market"].isin(MARKETS)].copy()
     board["Line"] = pd.to_numeric(board["Line"], errors="coerce")
@@ -3404,15 +3664,20 @@ def aggregate_lines(use_ud=True, use_sleeper=False, manual_df=None, use_odds_api
         if c not in board.columns:
             board[c] = "" if c not in ["OverOdds", "UnderOdds"] else np.nan
     board["NameKey"] = board["Player"].map(normalize_name)
+
     def source_priority(s):
-        s = str(s)
+        s = str(s or "")
         if s == "Underdog": return 1
-        if s in ["Manual", "CSV Upload"]: return 2
+        if s == "Manual": return 2
+        if s == "PropLine": return 3
+        if s == "CSV Upload": return 4
+        if s.startswith("OddsAPI"): return 5
         return 9
+
     board["Priority"] = board["Source"].map(source_priority)
-    board = board.sort_values(["NameKey", "Market", "Priority"])
+    board = board.sort_values(["NameKey", "Market", "Priority"], kind="mergesort")
     board = select_primary_prop_lines(board, load_dataset("master_features"), group_source=True)
-    return board.sort_values(["NameKey", "Market", "Priority"]), ud_debug, pd.DataFrame(manual_debug)
+    return board.sort_values(["NameKey", "Market", "Priority"], kind="mergesort"), ud_debug, pd.DataFrame(provider_debug_rows)
 
 # ============================================================
 # Projection engine
@@ -3932,7 +4197,7 @@ def _historical_make_projection_board_1(lines, logs, base):
         primary["Manual Line"] = safe_float(grp[grp["Source"] == "Manual"]["Line"].iloc[0], np.nan) if len(grp[grp["Source"] == "Manual"]) else np.nan
         primary["Best Over Line"] = grp["Line"].min()
         primary["Best Under Line"] = grp["Line"].max()
-        primary["Line Source Reliability"] = {"Underdog": 95, "Manual": 70, "CSV Upload": 68}.get(str(primary.get("Source")), 50)
+        primary["Line Source Reliability"] = {"Underdog": 95, "PropLine": 90, "Manual": 70, "CSV Upload": 68}.get(str(primary.get("Source")), 50)
         active.append(primary)
     board = pd.DataFrame(active)
     rows = []
@@ -9119,6 +9384,7 @@ def render_manual_line_entry(mode: str, market: str, master_global: pd.DataFrame
                 st.success("Manual slate lines cleared.")
                 st.rerun()
 def render_source_status_card(lines: pd.DataFrame, ud_debug: pd.DataFrame, sl_debug: pd.DataFrame, use_odds_api_flag: bool = False, odds_api_key: str = ""):
+    propline_key_state = "configured" if bool(_propline_api_key()) else "missing"
     def count_source(src):
         try:
             return int((lines.get("Source", pd.Series(dtype=str)).astype(str) == src).sum()) if lines is not None and not lines.empty else 0
@@ -9126,8 +9392,8 @@ def render_source_status_card(lines: pd.DataFrame, ud_debug: pd.DataFrame, sl_de
             return 0
     st.markdown(f"""
     <div class='owp-blue-note'>
-      <b>Source Status</b> — Underdog: {count_source('Underdog')} lines | Manual: {count_source('Manual')} lines | CSV Upload: {count_source('CSV Upload')} lines<br>
-      Sleeper / Odds API / SportsGameOdds are disabled. Projection engine still runs from Underdog or manual lines.
+      <b>Source Status</b> — Underdog: {count_source('Underdog')} lines | PropLine: {count_source('PropLine')} lines | Manual: {count_source('Manual')} lines | CSV Upload: {count_source('CSV Upload')} lines<br>
+      Live order: Underdog first → PropLine API fallback → Manual/CSV. Projection math is unchanged.
     </div>
     """, unsafe_allow_html=True)
 
@@ -9217,14 +9483,15 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
     if logs_global.empty or master_global.empty:
         st.warning("Import/build SportsDataverse player logs first in Data Manager. Lines can load, but projections need player baselines.")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Lines loaded", 0 if lines is None else len(lines))
     c2.metric("Underdog rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Underdog").sum()))
-    c3.metric("Manual rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Manual").sum()))
-    c4.metric("CSV rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "CSV Upload").sum()))
+    c3.metric("PropLine rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "PropLine").sum()))
+    c4.metric("Manual rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "Manual").sum()))
+    c5.metric("CSV rows", 0 if lines_all is None or lines_all.empty else int((lines_all.get("Source", pd.Series(dtype=str)) == "CSV Upload").sum()))
 
     if lines is None or lines.empty:
-        st.error("No Underdog or manual lines loaded for this slate. Use the manual line editor above, then save and refresh.")
+        st.error("No live WNBA lines loaded for this slate. Underdog and PropLine returned 0; use the manual line editor if needed, then refresh.")
         if not master_global.empty:
             st.markdown("<div class='hidden-baseline-note'>Baseline table is hidden. Showing player cards only so you can still review projections while waiting for lines.</div>", unsafe_allow_html=True)
             baseline_cards = make_baseline_player_cards(master_global, force_market or "PRA", limit=30)
