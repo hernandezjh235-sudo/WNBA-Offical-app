@@ -14,12 +14,13 @@ Line-source build:
 """
 
 
-# APP134 DATA REFRESH + ZERO-PROJECTION RECOVERY (DATA PIPELINE ONLY)
-# - Fixes live lines showing with 0 projections when the cached player/master baseline is empty/stale.
-# - Data Manager gets one full required-data refresh: all SportsDataverse inputs, derived team context,
-#   official WNBA current/L5/L10/prior fallback, schedule/context refresh, and cache invalidation.
-# - Adds line-to-baseline coverage diagnostics and self-healing before projection build.
-# - NO projection formula, Final Resolved side/probability, App128/App130, Best Slate, or grading math changes.
+# APP134 FULL SPORTSDATAVERSE REFRESH + PROJECTION DATA SYNC
+# - Data Manager FULL refresh now downloads every supported SportsDataverse dataset for current + prior season.
+# - Always includes player logs, player/team season stats, schedules, rosters, game rosters, lineups, and shots.
+# - Rebuilds derived team recent/opponent context, team ranks, master features, and a refresh manifest.
+# - Clears stale in-memory dataset caches after refresh so newly downloaded data is used immediately.
+# - Refresh Today performs one automatic FULL SportsDataverse recovery pass when lines load but projected rows are 0.
+# - NO production projection, side, probability, App128/App130, Best Slate, or grading math changes.
 #
 # APP133 PROPLINE WNBA LINE FALLBACK (LINE SOURCE ONLY)
 # - Keeps Underdog first when it works.
@@ -508,6 +509,7 @@ DATASET_LABELS = {
     "lineups": "Lineups",
     "shots": "Shots",
 }
+FULL_SPORTSDATAVERSE_DATASETS = tuple(DATASET_LABELS.keys())
 
 SPORTSDATAVERSE_BASE = "https://raw.githubusercontent.com/sportsdataverse/wehoop-wnba-stats-data/main"
 SPORTSDATAVERSE_INDEXES = {
@@ -7039,19 +7041,48 @@ def build_master_features_v3() -> Tuple[pd.DataFrame, pd.DataFrame]:
 build_master_features = build_master_features_v3
 
 
+def _app134_dataset_data_through(df: Optional[pd.DataFrame]) -> str:
+    if df is None or df.empty:
+        return ""
+    for c in ["GameDate", "DataThrough", "EventStartUTC", "SlateDate", "Season"]:
+        if c not in df.columns:
+            continue
+        if c == "Season":
+            vals = pd.to_numeric(df[c], errors="coerce")
+            if vals.notna().any():
+                return str(int(vals.max()))
+        else:
+            vals = pd.to_datetime(df[c], errors="coerce", utc=True)
+            if vals.notna().any():
+                return str(vals.max().date())
+    return ""
+
+
 def refresh_data_and_build_advanced_features(dataset_choices=None, seasons=None, include_heavy=True):
-    """One-click pipeline used by Data Manager.
-    Pulls SportsDataverse, rebuilds team ranks/master features, repairs missing columns, and saves a report.
+    """FULL SportsDataverse refresh used by Data Manager and App134 recovery.
+
+    By default this pulls every supported SportsDataverse WNBA dataset for the
+    current + prior season, preserves any good local cache when an upstream file
+    is unavailable, then rebuilds every derived table needed by projections.
     """
     if seasons is None:
         seasons = [int(season_last), int(season_now)] if "season_last" in globals() and "season_now" in globals() else [2025, 2026]
-    dataset_choices = dataset_choices or ["player_game_logs", "player_season_stats", "team_season_stats", "schedules", "rosters", "game_rosters"]
+    seasons = sorted({int(x) for x in seasons if x is not None})
+
+    # App134 FULL means full: Data Manager no longer silently skips lineups/shots.
+    requested = list(dataset_choices or FULL_SPORTSDATAVERSE_DATASETS)
     if include_heavy:
-        for k in ["lineups", "shots"]:
-            if k not in dataset_choices:
-                dataset_choices.append(k)
+        for k in FULL_SPORTSDATAVERSE_DATASETS:
+            if k not in requested:
+                requested.append(k)
+    requested = [k for k in FULL_SPORTSDATAVERSE_DATASETS if k in set(requested)]
+
     debug = []
-    for key in dataset_choices:
+    manifest_rows = []
+    refresh_stamp = now_iso()
+    for key in requested:
+        before = load_dataset(key)
+        before_rows = 0 if before is None or before.empty else len(before)
         try:
             df, dbg = download_sportsdataverse_dataset(key, seasons)
             if dbg is not None and not dbg.empty:
@@ -7061,15 +7092,99 @@ def refresh_data_and_build_advanced_features(dataset_choices=None, seasons=None,
                 if std is not None and not std.empty:
                     save_dataset(key, std)
                     debug.append({"dataset": key, "status": "saved/standardized", "rows": len(std), "source": "SportsDataverse direct/manifest"})
+                    current = std
+                    status_txt = "saved/standardized"
                 else:
-                    debug.append({"dataset": key, "status": "downloaded but standardized empty", "rows": 0})
+                    current = before
+                    status_txt = "downloaded but standardized empty; prior cache kept"
+                    debug.append({"dataset": key, "status": status_txt, "rows": before_rows})
             else:
-                debug.append({"dataset": key, "status": "empty/failed; existing cache kept if present", "rows": 0})
+                current = before
+                status_txt = "remote empty/failed; prior cache kept"
+                debug.append({"dataset": key, "status": status_txt, "rows": before_rows})
         except Exception as e:
-            debug.append({"dataset": key, "status": f"error: {str(e)[:180]}", "rows": 0})
-    master, team_ranks = build_master_features()
+            current = before
+            status_txt = f"error; prior cache kept: {str(e)[:150]}"
+            debug.append({"dataset": key, "status": status_txt, "rows": before_rows})
+        manifest_rows.append({
+            "Dataset": key,
+            "Label": DATASET_LABELS.get(key, key),
+            "Status": status_txt,
+            "Rows": 0 if current is None or current.empty else len(current),
+            "DataThrough": _app134_dataset_data_through(current),
+            "SeasonsRequested": ",".join(map(str, seasons)),
+            "RefreshedAt": refresh_stamp,
+            "Source": "SportsDataverse",
+        })
+
+    # Derived team context must be rebuilt from the freshly pulled game logs
+    # BEFORE master features so the projection engine sees current opponent form.
+    logs = load_dataset("player_game_logs")
+    if logs is not None and not logs.empty:
+        try:
+            ctx_fn = globals().get("_app121_rebuild_live_team_context")
+            if callable(ctx_fn):
+                ctx_report = ctx_fn(logs) or {}
+                debug.append({"dataset": "derived_team_context", "status": str(ctx_report.get("Live Team Context", "rebuilt")), "rows": 0})
+        except Exception as e:
+            debug.append({"dataset": "derived_team_context", "status": f"rebuild warning: {str(e)[:160]}", "rows": 0})
+
+    try:
+        master, team_ranks = build_master_features()
+    except Exception as e:
+        master, team_ranks = load_dataset("master_features"), load_dataset("team_ranks")
+        debug.append({"dataset": "master_features", "status": f"rebuild error; prior cache kept: {str(e)[:160]}", "rows": 0 if master is None else len(master)})
+
+    # Rebuild slate-dependent derived context when those helpers are available.
+    for _mode in ["Today", "Tomorrow"]:
+        try:
+            ctx_builder = globals().get("build_daily_team_context_cache_v2")
+            if callable(ctx_builder):
+                ctx_df, _ctx_dbg = ctx_builder(_mode, force=True)
+                debug.append({"dataset": f"daily_team_context_{_mode.lower()}", "status": "rebuilt", "rows": 0 if ctx_df is None else len(ctx_df)})
+        except Exception as e:
+            debug.append({"dataset": f"daily_team_context_{_mode.lower()}", "status": f"warning: {str(e)[:140]}", "rows": 0})
+
+    # Visible manifest: raw SportsDataverse + derived projection inputs.
+    for derived_key in ["team_recent_stats", "team_opponent_stats", "team_ranks", "master_features"]:
+        try:
+            d = load_dataset(derived_key)
+            manifest_rows.append({
+                "Dataset": derived_key,
+                "Label": derived_key.replace("_", " ").title(),
+                "Status": "derived/rebuilt" if d is not None and not d.empty else "derived missing",
+                "Rows": 0 if d is None or d.empty else len(d),
+                "DataThrough": _app134_dataset_data_through(d),
+                "SeasonsRequested": ",".join(map(str, seasons)),
+                "RefreshedAt": refresh_stamp,
+                "Source": "Derived from SportsDataverse",
+            })
+        except Exception:
+            pass
+    try:
+        save_dataset("data_manifest", pd.DataFrame(manifest_rows))
+    except Exception:
+        pass
+
     audit = feature_missing_report(master)
     audit.to_csv(DATA_DIR / "wnba_feature_missing_report.csv", index=False)
+
+    # Critical: invalidate session/global dataset caches so the app does not keep
+    # showing 0 projections from pre-refresh empty data.
+    try:
+        fn = globals().get("get_global_datasets")
+        if fn is not None and hasattr(fn, "clear"):
+            fn.clear()
+    except Exception:
+        pass
+    for _fn_name in ["_app121_latest_completed_team_dates", "_elite_starter_rate_table", "_elite_current_shot_context", "_cached_ml_team_context"]:
+        try:
+            _fn = globals().get(_fn_name)
+            if _fn is not None and hasattr(_fn, "clear"):
+                _fn.clear()
+        except Exception:
+            pass
+
     return master, team_ranks, pd.DataFrame(debug), audit
 
 # ============================================================
@@ -8592,9 +8707,7 @@ def render_refresh_today_status():
 
 
 def clear_line_pull_caches():
-    # Refresh means refresh every active live line provider. This is line-cache
-    # invalidation only; it does not alter projection/model logic.
-    for fn in [fetch_underdog_board, fetch_propline_board]:
+    for fn in [fetch_underdog_board]:
         try:
             fn.clear()
         except Exception:
@@ -9515,12 +9628,7 @@ def render_mlb_style_board(mode: str, use_ud_flag: bool, use_sleeper_flag: bool,
         market_filter = st.multiselect("Market", MARKETS, default=MARKETS, key=f"market_{mode}_{market_key}")
     search = st.text_input("Search player", key=f"search_{mode}_{market_key}")
     st.session_state["wnba_current_mode"] = mode
-    _logs_use, _master_use, _match_dbg = _app134_ensure_projection_inputs(
-        lines[lines["Market"].isin(market_filter)], logs_global, master_global, mode
-    )
-    if _match_dbg.get("Coverage %", 0) < 85:
-        st.caption(f"Projection baseline match: {_match_dbg.get('Matched Players',0)}/{_match_dbg.get('Line Players',0)} players ({_match_dbg.get('Coverage %',0)}%).")
-    proj_df = make_projection_board(lines[lines["Market"].isin(market_filter)], _logs_use, _master_use, mode)
+    proj_df = make_projection_board(lines[lines["Market"].isin(market_filter)], logs_global, master_global, mode)
     if search and not proj_df.empty:
         proj_df = proj_df[proj_df["Player"].str.contains(search, case=False, na=False)]
 
@@ -11444,31 +11552,6 @@ def render_data_manager_tab():
     st.markdown("### Data status")
     st.dataframe(dataset_status_table(), width="stretch")
 
-    st.markdown("### ✅ One-click complete model-data refresh")
-    st.caption("Use this when lines load but projections are 0, or before a new slate when you want every model input refreshed. It pulls all 8 SportsDataverse datasets, rebuilds team/opponent context, refreshes official WNBA current/L5/L10/prior data, schedules, injury context, and invalidates stale caches.")
-    _last_full = st.session_state.get("app134_last_full_data_refresh")
-    if isinstance(_last_full, dict) and _last_full:
-        st.success(f"Last full data refresh: {_last_full.get('status','complete')} · master {_last_full.get('master_rows',0)} players · {_last_full.get('at','')}")
-    if st.button("🔄 REFRESH ALL REQUIRED MODEL DATA", width="stretch", key="app134_refresh_all_required_data"):
-        with st.spinner("Refreshing every required WNBA model dataset. This can take a little longer because it intentionally refreshes the full data stack..."):
-            _master134, _ranks134, _dbg134, _audit134 = _app134_refresh_all_required_model_data([int(season_last), int(season_now)])
-        st.session_state["app134_last_full_data_refresh"] = {
-            "status": "complete" if _master134 is not None and not _master134.empty else "master still empty",
-            "master_rows": 0 if _master134 is None else len(_master134),
-            "at": now_iso(),
-        }
-        st.session_state["app134_full_data_debug"] = _dbg134
-        if _master134 is not None and not _master134.empty:
-            st.success(f"Full model-data refresh complete: {len(_master134):,} player baselines ready. Now press REFRESH TODAY/TOMORROW to rebuild the live projection board.")
-        else:
-            st.error("Full refresh finished but no master player baseline was produced. Open the debug table below.")
-        if _audit134 is not None and not _audit134.empty:
-            st.caption("Feature coverage after full refresh")
-            st.dataframe(_audit134, width="stretch")
-    if "app134_full_data_debug" in st.session_state:
-        with st.expander("Full data refresh debug", expanded=False):
-            st.dataframe(st.session_state.get("app134_full_data_debug", pd.DataFrame()), width="stretch")
-
     st.markdown("### GitHub cache fallback")
     st.caption("Optional: commit CSVs into wnba_engine/data or set WNBA_DATA_BASE_URL to a raw GitHub data folder. The app loads GitHub/cache first, then official WNBA fallback if missing.")
     st.dataframe(github_cache_status_table(), width="stretch")
@@ -11488,7 +11571,6 @@ def render_data_manager_tab():
                 master, team_ranks, dbg = ensure_online_wnba_master_features(force_official=True)
             st.session_state["wnba_online_master_debug"] = dbg
             if master is not None and not master.empty:
-                _app134_clear_data_caches()
                 st.success(f"Official WNBA fallback master built: {len(master):,} players")
                 st.dataframe(feature_missing_report(master), width="stretch")
             else:
@@ -11501,7 +11583,6 @@ def render_data_manager_tab():
                     master, team_ranks = build_master_features()
                 audit = feature_missing_report(master)
                 audit.to_csv(DATA_DIR / "wnba_feature_missing_report.csv", index=False)
-            _app134_clear_data_caches()
             st.success(f"Advanced features ready. Master rows: {len(master)}")
             st.dataframe(audit, width="stretch")
 
@@ -11509,28 +11590,42 @@ def render_data_manager_tab():
         with st.expander("Official WNBA fallback debug", expanded=False):
             st.dataframe(st.session_state.get("wnba_online_master_debug", pd.DataFrame()), width="stretch")
 
-    st.markdown("### Remote SportsDataverse refresh")
-    st.caption("Use only when you need to reload historical/stat data. Daily betting use should stay on Refresh Today.")
-    default_datasets = ["player_game_logs", "player_season_stats", "team_season_stats", "schedules", "rosters", "game_rosters"]
-    dataset_choices = st.multiselect(
-        "SportsDataverse datasets to refresh",
-        list(DATASET_LABELS.keys()),
-        default=default_datasets,
-        format_func=lambda k: DATASET_LABELS.get(k, k),
-        key="dm_dataset_choices_visible_nologo",
-    )
-    include_heavy = st.toggle("Include heavier add-ons: lineups + shots", value=True, key="dm_include_heavy_visible_nologo")
+    st.markdown("### FULL SportsDataverse refresh")
+    st.caption("This button always pulls ALL supported WNBA SportsDataverse data for the current + prior season, then rebuilds the derived projection database. It does not change any projection formula.")
+    st.code("Player Game Logs · Player Season Stats · Team Season Stats · Schedules · Rosters · Game Rosters · Lineups · Shots", language=None)
     y1, y2 = st.columns(2)
     with y1:
-        if st.button("Refresh SportsDataverse Database", width="stretch", key="dm_refresh_remote_visible_nologo"):
-            with st.spinner("Refreshing SportsDataverse cache..."):
-                master, team_ranks, dbg, audit = refresh_data_and_build_advanced_features(dataset_choices, [int(season_last), int(season_now)], include_heavy)
-            _app134_clear_data_caches()
-            st.success(f"SportsDataverse refresh complete. Master rows: {0 if master is None else len(master)}")
+        if st.button("🔄 Refresh FULL SportsDataverse Database", width="stretch", key="dm_refresh_remote_visible_nologo"):
+            with st.spinner("Pulling all SportsDataverse WNBA datasets and rebuilding projection inputs..."):
+                master, team_ranks, dbg, audit = refresh_data_and_build_advanced_features(
+                    list(FULL_SPORTSDATAVERSE_DATASETS),
+                    [int(season_last), int(season_now)],
+                    include_heavy=True,
+                )
+                # Refresh the globals used by Player Cards in this same session.
+                try:
+                    globals()["logs_global"] = load_dataset("player_game_logs")
+                    globals()["master_global"] = master if master is not None else load_dataset("master_features")
+                except Exception:
+                    pass
+                st.session_state["wnba_prefer_projection_cache_after_refresh"] = False
+                st.session_state["wnba_force_live_Today"] = True
+                st.session_state["wnba_force_live_Tomorrow"] = True
+                st.session_state["app134_full_data_refresh_at"] = now_iso()
+            _logs_now = load_dataset("player_game_logs")
+            _master_now = load_dataset("master_features")
+            st.success(
+                f"FULL SportsDataverse refresh complete · logs {len(_logs_now):,} rows · master {len(_master_now):,} players. "
+                "Go to Player Cards and press Refresh Today/Tomorrow to rebuild the live projection board from the new data."
+            )
             st.dataframe(dbg, width="stretch")
             if audit is not None and not audit.empty:
                 st.caption("Missing-field audit")
                 st.dataframe(audit, width="stretch")
+            _manifest = load_dataset("data_manifest")
+            if _manifest is not None and not _manifest.empty:
+                st.caption("Full refresh manifest")
+                st.dataframe(_manifest, width="stretch")
     with y2:
         if st.button("Download missing-field report", width="stretch", key="dm_report_button_nologo"):
             report_path = DATA_DIR / "wnba_feature_missing_report.csv"
@@ -12500,7 +12595,7 @@ with st.sidebar:
     use_sleeper = False
     use_odds_api = False
     odds_api_key = ""
-    st.caption("Active line sources: Underdog first + PropLine fallback + saved manual lines. Sleeper, Odds API, and SportsGameOdds are disabled.")
+    st.caption("Active line sources: Underdog first + PropLine API fallback/supplement + saved manual lines. Projection data comes from the full SportsDataverse database.")
     use_remote = st.toggle("Allow SportsDataverse remote downloads", value=True)
     use_xgb_blend = st.toggle("Use XGBoost/GBM blend", value=False, help="Default OFF. Turn ON only after you have enough graded WNBA samples and want a small guarded ensemble signal.")
     st.session_state["use_xgb_blend"] = bool(use_xgb_blend)
@@ -14512,274 +14607,6 @@ def build_projection_only_board(
     return board.reset_index(drop=True)
 
 
-
-# ============================================================
-# APP134 — COMPLETE DATA REFRESH + PROJECTION INPUT RECOVERY
-# Data-pipeline only. Production projection/ranking math is untouched.
-# ============================================================
-
-APP134_REQUIRED_DATASETS = [
-    "player_game_logs", "player_season_stats", "team_season_stats", "schedules",
-    "rosters", "game_rosters", "lineups", "shots",
-]
-APP134_MATCH_DEBUG_FILE = DATA_DIR / "wnba_projection_match_debug.csv"
-
-
-def _app134_clear_data_caches() -> None:
-    """Invalidate only cached data loaders whose files may have changed."""
-    for _name in [
-        "get_global_datasets",
-        "_app121_latest_completed_team_dates",
-        "_elite_starter_rate_table",
-        "_elite_current_shot_context",
-        "_cached_ml_team_context",
-    ]:
-        try:
-            _fn = globals().get(_name)
-            if _fn is not None and hasattr(_fn, "clear"):
-                _fn.clear()
-        except Exception:
-            pass
-
-
-def _app134_master_keys(master: Optional[pd.DataFrame]) -> set:
-    if master is None or master.empty:
-        return set()
-    if "NameKey" in master.columns:
-        vals = master["NameKey"].astype(str)
-    elif "Player" in master.columns:
-        vals = master["Player"].map(normalize_name)
-    else:
-        return set()
-    return {normalize_name(v) for v in vals if normalize_name(v)}
-
-
-def _app134_line_keys(lines: Optional[pd.DataFrame]) -> set:
-    if lines is None or lines.empty or "Player" not in lines.columns:
-        return set()
-    return {normalize_name(v) for v in lines["Player"] if normalize_name(v)}
-
-
-def _app134_merge_master_sources(primary: Optional[pd.DataFrame], fresh: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Prefer fresh current/L5/L10 values while retaining richer cached columns."""
-    a = primary.copy() if isinstance(primary, pd.DataFrame) else pd.DataFrame()
-    b = fresh.copy() if isinstance(fresh, pd.DataFrame) else pd.DataFrame()
-    if a.empty:
-        return b
-    if b.empty:
-        return a
-    for frame in (a, b):
-        if "NameKey" not in frame.columns:
-            frame["NameKey"] = frame.get("Player", pd.Series("", index=frame.index)).map(normalize_name)
-        frame["NameKey"] = frame["NameKey"].map(normalize_name)
-    a = a[a["NameKey"].astype(str).ne("")].drop_duplicates("NameKey", keep="last")
-    b = b[b["NameKey"].astype(str).ne("")].drop_duplicates("NameKey", keep="last")
-    # Fresh source is authoritative where it has a value. Cached/SD columns fill
-    # only the fields the fresh source does not contain.
-    merged = b.set_index("NameKey").combine_first(a.set_index("NameKey")).reset_index()
-    return merged
-
-
-def _app134_projection_match_report(lines: Optional[pd.DataFrame], master: Optional[pd.DataFrame]) -> Dict[str, Any]:
-    line_keys = _app134_line_keys(lines)
-    base_keys = _app134_master_keys(master)
-    matched = line_keys & base_keys
-    unmatched = sorted(line_keys - base_keys)
-    report = {
-        "Line Players": len(line_keys),
-        "Baseline Players": len(base_keys),
-        "Matched Players": len(matched),
-        "Unmatched Players": len(unmatched),
-        "Coverage %": round(100.0 * len(matched) / max(len(line_keys), 1), 1) if line_keys else 0.0,
-    }
-    try:
-        if lines is not None and not lines.empty:
-            dbg = lines.copy()
-            dbg["NameKey"] = dbg.get("Player", pd.Series("", index=dbg.index)).map(normalize_name)
-            dbg["Baseline Match"] = dbg["NameKey"].isin(base_keys)
-            cols = [c for c in ["Player", "Team", "Opponent", "Matchup", "Market", "Line", "Source", "NameKey", "Baseline Match"] if c in dbg.columns]
-            dbg[cols].drop_duplicates().to_csv(APP134_MATCH_DEBUG_FILE, index=False)
-    except Exception:
-        pass
-    report["Unmatched Sample"] = ", ".join(unmatched[:12])
-    return report
-
-
-def _app134_ensure_projection_inputs(
-    lines: Optional[pd.DataFrame],
-    logs: Optional[pd.DataFrame],
-    master: Optional[pd.DataFrame],
-    mode: str,
-    force_official: bool = False,
-) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
-    """Ensure live lines have a current player baseline before model math runs."""
-    logs_use = logs.copy() if isinstance(logs, pd.DataFrame) else pd.DataFrame()
-    master_use = master.copy() if isinstance(master, pd.DataFrame) else pd.DataFrame()
-
-    # First reload disk after any explicit refresh. This fixes the stale
-    # st.cache_data state that could keep an empty startup master all session.
-    try:
-        _app134_clear_data_caches()
-        disk_logs, disk_master = get_global_datasets()
-        if logs_use.empty and disk_logs is not None and not disk_logs.empty:
-            logs_use = disk_logs
-        if disk_master is not None and not disk_master.empty:
-            master_use = _app134_merge_master_sources(master_use, disk_master)
-    except Exception:
-        pass
-
-    before = _app134_projection_match_report(lines, master_use)
-    coverage = float(before.get("Coverage %", 0.0) or 0.0)
-
-    # If the live line names are not represented in the baseline, use the
-    # app's existing official current/L5/L10/prior loader. This changes data
-    # freshness/coverage only; it does not touch a projection formula.
-    if master_use.empty or (before.get("Line Players", 0) and coverage < 85.0) or force_official:
-        try:
-            if force_official or coverage < 85.0:
-                _fn = globals().get("pull_official_multiwindow_player_context")
-                if _fn is not None and hasattr(_fn, "clear"):
-                    _fn.clear()
-            online_master, _, online_dbg = ensure_online_wnba_master_features(force_official=True)
-            if online_master is not None and not online_master.empty:
-                master_use = _app134_merge_master_sources(master_use, online_master)
-                save_dataset("master_features", master_use)
-            st.session_state["app134_online_baseline_debug"] = online_dbg
-        except Exception as exc:
-            st.session_state["app134_online_baseline_error"] = str(exc)[:240]
-
-    after = _app134_projection_match_report(lines, master_use)
-    after["Coverage Before %"] = before.get("Coverage %", 0.0)
-    after["Mode"] = mode
-    try:
-        _app134_clear_data_caches()
-    except Exception:
-        pass
-    return logs_use, master_use, after
-
-
-def _app134_write_data_manifest() -> pd.DataFrame:
-    rows = []
-    for key, path in CACHE_FILES.items():
-        if key == "data_manifest":
-            continue
-        row = {"Dataset": key, "File": str(path), "Exists": bool(path.exists()), "Rows": 0, "Columns": 0, "UpdatedAt": ""}
-        try:
-            if path.exists():
-                df = pd.read_csv(path, low_memory=False)
-                row["Rows"] = int(len(df))
-                row["Columns"] = int(len(df.columns))
-                row["UpdatedAt"] = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
-        except Exception as exc:
-            row["ReadError"] = str(exc)[:160]
-        rows.append(row)
-    manifest = pd.DataFrame(rows)
-    try:
-        manifest.to_csv(CACHE_FILES["data_manifest"], index=False)
-    except Exception:
-        pass
-    return manifest
-
-
-def _app134_refresh_all_required_model_data(seasons: Optional[List[int]] = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Explicit Data Manager full refresh of every input required by the WNBA board."""
-    if seasons is None:
-        current = int(st.session_state.get("season_now", datetime.now().year))
-        seasons = [current - 1, current]
-    seasons = sorted({int(x) for x in seasons})
-    debug_rows: List[Dict[str, Any]] = []
-
-    # 1) Pull every SportsDataverse input, including heavier lineup/shot context.
-    try:
-        sd_master, team_ranks, sd_dbg, _ = refresh_data_and_build_advanced_features(
-            APP134_REQUIRED_DATASETS.copy(), seasons, include_heavy=True
-        )
-        if sd_dbg is not None and not sd_dbg.empty:
-            debug_rows.extend(sd_dbg.to_dict("records"))
-    except Exception as exc:
-        sd_master, team_ranks = pd.DataFrame(), pd.DataFrame()
-        debug_rows.append({"dataset": "SportsDataverse full refresh", "status": f"error: {str(exc)[:220]}", "rows": 0})
-
-    # 2) Refresh today's/tomorrow's schedule and game context.
-    for mode in ["Today", "Tomorrow"]:
-        try:
-            sched, _ = update_schedule_cache_with_espn(mode)
-            debug_rows.append({"dataset": f"{mode} schedule", "status": "refreshed", "rows": 0 if sched is None else len(sched)})
-        except Exception as exc:
-            debug_rows.append({"dataset": f"{mode} schedule", "status": f"kept cache: {str(exc)[:160]}", "rows": 0})
-
-    # 3) Rebuild derived team recent/opponent/rank context from completed logs.
-    logs = load_dataset("player_game_logs")
-    try:
-        if logs is not None and not logs.empty:
-            derived = _app121_rebuild_live_team_context(logs)
-            debug_rows.append({"dataset": "derived team recent/opponent context", "status": str(derived), "rows": len(logs)})
-    except Exception as exc:
-        debug_rows.append({"dataset": "derived team recent/opponent context", "status": f"error: {str(exc)[:180]}", "rows": 0})
-
-    # 4) Rebuild the rich SD master after the derived team context is current.
-    try:
-        if logs is not None and not logs.empty:
-            rebuilt_master, rebuilt_ranks = build_master_features()
-            if rebuilt_master is not None and not rebuilt_master.empty:
-                sd_master = rebuilt_master
-            if rebuilt_ranks is not None and not rebuilt_ranks.empty:
-                team_ranks = rebuilt_ranks
-            debug_rows.append({"dataset": "master_features", "status": "rebuilt from refreshed caches", "rows": 0 if sd_master is None else len(sd_master)})
-    except Exception as exc:
-        debug_rows.append({"dataset": "master_features", "status": f"rebuild warning: {str(exc)[:180]}", "rows": 0})
-
-    # 5) Pull official current season + L5 + L10 + prior-season context. Prefer
-    # fresh recent/role fields, while retaining richer SD fields where available.
-    online_master = pd.DataFrame()
-    try:
-        fn = globals().get("pull_official_multiwindow_player_context")
-        if fn is not None and hasattr(fn, "clear"):
-            fn.clear()
-        online_master, online_ranks, online_dbg = ensure_online_wnba_master_features(force_official=True)
-        if online_dbg is not None and not online_dbg.empty:
-            debug_rows.extend(online_dbg.to_dict("records"))
-        if (team_ranks is None or team_ranks.empty) and online_ranks is not None:
-            team_ranks = online_ranks
-    except Exception as exc:
-        debug_rows.append({"dataset": "official WNBA current/L5/L10/prior", "status": f"fallback warning: {str(exc)[:180]}", "rows": 0})
-
-    final_master = _app134_merge_master_sources(sd_master, online_master)
-    if final_master is not None and not final_master.empty:
-        save_dataset("master_features", final_master)
-
-    # 6) Refresh daily matchup/team context after all source files are current.
-    for mode in ["Today", "Tomorrow"]:
-        try:
-            game_ctx, _ = build_game_context_cache(mode, force_official=True)
-            daily_ctx, _ = build_daily_team_context_cache_v2(mode, force=True)
-            debug_rows.append({
-                "dataset": f"{mode} projection context",
-                "status": "rebuilt",
-                "rows": int((0 if game_ctx is None else len(game_ctx)) + (0 if daily_ctx is None else len(daily_ctx))),
-            })
-        except Exception as exc:
-            debug_rows.append({"dataset": f"{mode} projection context", "status": f"warning: {str(exc)[:180]}", "rows": 0})
-
-    # 7) Pull the official injury truth used by role/availability gates.
-    try:
-        fn = globals().get("fetch_official_wnba_injury_report_rows")
-        if fn is not None and hasattr(fn, "clear"):
-            fn.clear()
-        injuries, note = fetch_official_wnba_injury_report_rows()
-        debug_rows.append({"dataset": "official WNBA injury report", "status": note, "rows": 0 if injuries is None else len(injuries)})
-    except Exception as exc:
-        debug_rows.append({"dataset": "official WNBA injury report", "status": f"warning: {str(exc)[:180]}", "rows": 0})
-
-    manifest = _app134_write_data_manifest()
-    audit = feature_missing_report(final_master)
-    try:
-        audit.to_csv(DATA_DIR / "wnba_feature_missing_report.csv", index=False)
-    except Exception:
-        pass
-    _app134_clear_data_caches()
-    return final_master, (team_ranks if isinstance(team_ranks, pd.DataFrame) else pd.DataFrame()), pd.DataFrame(debug_rows), audit
-
 def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd.DataFrame, master_global: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """One visible refresh path: schedule/context, lines, projections, cache."""
     progress = st.progress(0, text="Starting full refresh...")
@@ -14846,23 +14673,14 @@ def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd
         status["Line Rows"] = 0 if lines is None or lines.empty else len(lines)
         status["Underdog Lines"] = int((lines.get("Source", pd.Series(dtype=str)).astype(str) == "Underdog").sum()) if lines is not None and not lines.empty else 0
         status["Slate Note"] = slate_note
-        status["PropLine Lines"] = int((lines.get("Source", pd.Series(dtype=str)).astype(str) == "PropLine").sum()) if lines is not None and not lines.empty else 0
         st.session_state["wnba_ud_debug"] = ud_debug
         st.session_state["wnba_sl_debug"] = manual_debug
 
-        step(68, "Verifying live-line players against projection baselines...")
-        logs, master, match_report = _app134_ensure_projection_inputs(lines, logs, master, mode)
-        status.update({f"Projection Match {k}": v for k, v in match_report.items() if k != "Unmatched Sample"})
-        if match_report.get("Unmatched Sample"):
-            status["Projection Unmatched Sample"] = match_report.get("Unmatched Sample")
-
-        # Current/L5/L10 official baselines can project even when detailed game
-        # logs are temporarily unavailable. Only a missing master is fatal.
-        if master is None or master.empty:
-            status["Status"] = "lines loaded, projection baseline missing"
+        if logs is None or logs.empty or master is None or master.empty:
+            status["Status"] = "lines loaded, database missing"
             status["Seconds"] = round(time.time() - started, 2)
             st.session_state["wnba_refresh_today_status"] = status
-            step(100, "Refresh finished: lines loaded, but no player projection baseline is available.")
+            step(100, "Refresh finished: lines loaded, but player database is missing.")
             return pd.DataFrame(), status
 
         if lines is None or lines.empty:
@@ -14888,14 +14706,39 @@ def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd
 
         step(78, "Building projections from current lines...")
         board = make_projection_board(lines[lines["Market"].isin(MARKETS)], logs, master, mode)
-        projected_n = int(pd.to_numeric(board.get("Projection"), errors="coerce").notna().sum()) if board is not None and not board.empty else 0
-        status["Projected Rows"] = projected_n
-        if board is None or board.empty or projected_n == 0:
-            status["Status"] = "projection build returned 0 projected rows"
+        _projected_rows = 0 if board is None or board.empty else int(pd.to_numeric(board.get("Projection"), errors="coerce").notna().sum())
+
+        # App134 recovery: if lines are valid but none can be projected, the most
+        # common cause is an empty/stale SportsDataverse player database after a
+        # deploy. Do one explicit FULL data pull and retry once.
+        if lines is not None and not lines.empty and _projected_rows == 0:
+            step(83, "Lines loaded but projected rows are 0 — refreshing FULL SportsDataverse data and retrying once...")
+            try:
+                target_year = int((slate_target_date(mode) or app_today()).year)
+                master_retry, _tr_retry, _dbg_retry, _audit_retry = refresh_data_and_build_advanced_features(
+                    list(FULL_SPORTSDATAVERSE_DATASETS),
+                    [target_year - 1, target_year],
+                    include_heavy=True,
+                )
+                logs_retry = load_dataset("player_game_logs")
+                if logs_retry is not None and not logs_retry.empty and master_retry is not None and not master_retry.empty:
+                    logs, master = logs_retry, master_retry
+                    board = make_projection_board(lines[lines["Market"].isin(MARKETS)], logs, master, mode)
+                    _projected_rows = 0 if board is None or board.empty else int(pd.to_numeric(board.get("Projection"), errors="coerce").notna().sum())
+                    status["Full SportsDataverse Recovery"] = f"retry built {_projected_rows} projected rows from {len(master):,} master players"
+                else:
+                    status["Full SportsDataverse Recovery"] = "full pull completed but player logs/master are still empty"
+            except Exception as exc:
+                status["Full SportsDataverse Recovery"] = f"recovery failed safely: {str(exc)[:180]}"
+
+        if board is None or board.empty or _projected_rows == 0:
+            status["Status"] = "lines loaded but projection build returned 0 projected rows"
+            status["Projected Rows"] = int(_projected_rows)
             status["Seconds"] = round(time.time() - started, 2)
             st.session_state["wnba_refresh_today_status"] = status
-            step(100, f"Refresh finished: {len(lines):,} lines loaded but 0 projection baselines matched. Open Data Manager → Refresh ALL Required Model Data.")
-            return board if isinstance(board, pd.DataFrame) else pd.DataFrame(), status
+            step(100, "Refresh finished: lines loaded, but 0 projection rows matched. Run FULL SportsDataverse in Data Manager and inspect the manifest/debug if this persists.")
+            return board if board is not None else pd.DataFrame(), status
+        status["Projected Rows"] = int(_projected_rows)
         board["Slate"] = mode
         board["SlateDate"] = str(slate_target_date(mode) or "ALL")
         board = enrich_board_with_matchups(board, mode)
