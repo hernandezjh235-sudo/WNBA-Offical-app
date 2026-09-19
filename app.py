@@ -14,6 +14,12 @@ Line-source build:
 """
 
 
+# APP135 IN-APP PROPLINE KEY + LIVE PROVIDER TEST (CREDENTIAL HANDLING/UI ONLY)
+# - Paste/save/test PropLine inside Data Manager without exposing the key in public GitHub.
+# - Railway/Streamlit secret remains first priority; in-app runtime storage is fallback only.
+# - Refresh clears both Underdog and PropLine caches and surfaces provider diagnostics.
+# - No projection, side, probability, Best Slate, App128/App130, or grading math changes.
+#
 # APP134 FULL SPORTSDATAVERSE REFRESH + PROJECTION DATA SYNC
 # - Data Manager FULL refresh now downloads every supported SportsDataverse dataset for current + prior season.
 # - Always includes player logs, player/team season stats, schedules, rosters, game rosters, lineups, and shots.
@@ -3301,13 +3307,97 @@ def normalize_line_upload(df: pd.DataFrame, source_name: str = "CSV Upload") -> 
 
 
 
+PROPLINE_RUNTIME_KEY_FILE = LOCAL_DIR / ".propline_api_key"
+
+
 def _propline_api_key() -> str:
-    """Read the same PropLine secret used by the other apps; never display it."""
+    """Resolve PropLine key without printing it or committing it to source.
+
+    Priority: Railway/Streamlit secret -> in-app session key -> runtime file.
+    """
     for name in ("PROP_LINE_API_KEY", "PROPLINE_API_KEY"):
         val = _read_secret_or_env(name, "")
         if val:
             return val.strip()
+    try:
+        val = str(st.session_state.get("propline_runtime_api_key", "") or "").strip()
+        if val:
+            return val
+    except Exception:
+        pass
+    try:
+        if PROPLINE_RUNTIME_KEY_FILE.exists():
+            val = PROPLINE_RUNTIME_KEY_FILE.read_text(encoding="utf-8").strip()
+            if val:
+                return val
+    except Exception:
+        pass
     return ""
+
+
+def _propline_key_source() -> str:
+    for name in ("PROP_LINE_API_KEY", "PROPLINE_API_KEY"):
+        if _read_secret_or_env(name, ""):
+            return f"Railway/secret ({name})"
+    try:
+        if str(st.session_state.get("propline_runtime_api_key", "") or "").strip():
+            return "in-app session"
+    except Exception:
+        pass
+    try:
+        if PROPLINE_RUNTIME_KEY_FILE.exists() and PROPLINE_RUNTIME_KEY_FILE.read_text(encoding="utf-8").strip():
+            return "in-app runtime storage"
+    except Exception:
+        pass
+    return "missing"
+
+
+def _save_propline_runtime_key(value: str) -> bool:
+    value = str(value or "").strip()
+    if not value:
+        return False
+    try:
+        st.session_state["propline_runtime_api_key"] = value
+    except Exception:
+        pass
+    try:
+        PROPLINE_RUNTIME_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PROPLINE_RUNTIME_KEY_FILE.write_text(value, encoding="utf-8")
+        try:
+            os.chmod(PROPLINE_RUNTIME_KEY_FILE, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        fetch_propline_board.clear()
+    except Exception:
+        pass
+    try:
+        st.session_state.pop("wnba_lines_all", None)
+    except Exception:
+        pass
+    return True
+
+
+def _clear_propline_runtime_key() -> None:
+    try:
+        st.session_state.pop("propline_runtime_api_key", None)
+    except Exception:
+        pass
+    try:
+        if PROPLINE_RUNTIME_KEY_FILE.exists():
+            PROPLINE_RUNTIME_KEY_FILE.unlink()
+    except Exception:
+        pass
+    try:
+        fetch_propline_board.clear()
+    except Exception:
+        pass
+    try:
+        st.session_state.pop("wnba_lines_all", None)
+    except Exception:
+        pass
 
 
 def _propline_enabled() -> bool:
@@ -8711,8 +8801,6 @@ def render_refresh_today_status():
 
 
 def clear_line_pull_caches():
-    # A real Refresh must invalidate every active line provider. App134 briefly
-    # cleared only Underdog, which could leave a cached empty PropLine response.
     for fn in [fetch_underdog_board, fetch_propline_board]:
         try:
             fn.clear()
@@ -11557,6 +11645,52 @@ def render_data_manager_tab():
 
     st.markdown("### Data status")
     st.dataframe(dataset_status_table(), width="stretch")
+
+    st.markdown("### 🔑 PropLine API key")
+    _pl_source = _propline_key_source()
+    if _pl_source == "missing":
+        st.warning("PropLine key is not configured. Paste it below to use PropLine without putting the key in GitHub.")
+    else:
+        st.success(f"PropLine key configured via {_pl_source}. The key itself is never displayed.")
+    _pl_input = st.text_input(
+        "PropLine API key",
+        type="password",
+        value="",
+        placeholder="Paste key here",
+        key="dm_propline_runtime_key_input",
+        help="Stored only in this running app/container; it is not written into app.py or GitHub.",
+    )
+    _plc1, _plc2, _plc3 = st.columns(3)
+    with _plc1:
+        if st.button("💾 Save key in app", width="stretch", key="dm_save_propline_runtime_key"):
+            if _save_propline_runtime_key(_pl_input):
+                st.success("PropLine key saved for this running app. Live line cache cleared.")
+            else:
+                st.error("Paste a PropLine key first.")
+    with _plc2:
+        if st.button("🧪 Test PropLine", width="stretch", key="dm_test_propline_runtime_key"):
+            _test_key = str(_pl_input or _propline_api_key() or "").strip()
+            if not _test_key:
+                st.error("No PropLine key is configured.")
+            else:
+                if _pl_input:
+                    _save_propline_runtime_key(_pl_input)
+                _payload, _req = _propline_get_json(
+                    f"{PROPLINE_BASE}/sports/{PROPLINE_SPORT}/events",
+                    _test_key,
+                    timeout=18,
+                )
+                _events = _propline_extract_events(_payload)
+                _code = int(_req.get("status_code", 0) or 0)
+                if 200 <= _code < 300:
+                    st.success(f"PropLine authentication works · HTTP {_code} · WNBA events returned: {len(_events)}")
+                else:
+                    st.error(f"PropLine test failed · HTTP {_code or 'NO RESPONSE'} · {str(_req.get('message',''))[:180]}")
+    with _plc3:
+        if st.button("🧹 Clear app key", width="stretch", key="dm_clear_propline_runtime_key"):
+            _clear_propline_runtime_key()
+            st.success("In-app PropLine key cleared.")
+    st.caption("The key is never written into app.py. Runtime storage can be lost on Railway restart/redeploy; a Railway PROP_LINE_API_KEY variable is the permanent option.")
 
     st.markdown("### GitHub cache fallback")
     st.caption("Optional: commit CSVs into wnba_engine/data or set WNBA_DATA_BASE_URL to a raw GitHub data folder. The app loads GitHub/cache first, then official WNBA fallback if missing.")
@@ -14684,7 +14818,6 @@ def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd
         status["Slate Note"] = slate_note
         st.session_state["wnba_ud_debug"] = ud_debug
         st.session_state["wnba_sl_debug"] = manual_debug
-        # Surface PropLine diagnostics instead of silently reporting zero lines.
         try:
             if manual_debug is not None and not manual_debug.empty:
                 _src = manual_debug.get("source", pd.Series("", index=manual_debug.index)).astype(str)
@@ -14707,25 +14840,13 @@ def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd
             return pd.DataFrame(), status
 
         if lines is None or lines.empty:
-            _pl_key_ready = bool(_propline_api_key())
-            if not _pl_key_ready:
-                status["PropLine Status"] = "MISSING API KEY — add PROP_LINE_API_KEY (or PROPLINE_API_KEY) to the WNBA Railway service"
             step(76, "No live player lines are posted; building a projection-only PASS board...")
             board = build_projection_only_board(mode, logs, master, schedule=sched)
             if board is None or board.empty:
-                status["Status"] = (
-                    "no lines: Underdog returned 0 and PropLine API key is missing"
-                    if not _pl_key_ready
-                    else "no lines and no verified projection-only slate"
-                )
+                status["Status"] = "no lines and no verified projection-only slate"
                 status["Seconds"] = round(time.time() - started, 2)
                 st.session_state["wnba_refresh_today_status"] = status
-                step(
-                    100,
-                    "Refresh finished: PropLine key is not configured on this Railway service."
-                    if not _pl_key_ready
-                    else "Refresh finished: no live lines and no verified scheduled player slate was available."
-                )
+                step(100, "Refresh finished: no live lines and no verified scheduled player slate was available.")
                 return pd.DataFrame(), status
             save_dataset("projection_board", board)
             st.session_state[f"wnba_force_live_{mode}"] = False
