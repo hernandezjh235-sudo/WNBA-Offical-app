@@ -8696,18 +8696,24 @@ def render_refresh_today_status():
     if not status:
         return
     st.markdown("### 🔄 Refresh Today Status")
-    c = st.columns(6)
+    c = st.columns(7)
     c[0].metric("Schedule", status.get("Schedule Loaded", "NO"))
     c[1].metric("Games", status.get("Games", 0))
     c[2].metric("Context", status.get("Game Context Rows", 0))
     c[3].metric("Underdog", status.get("Underdog Lines", 0))
-    c[4].metric("Cards", status.get("Cards", 0))
-    c[5].metric("Seconds", status.get("Seconds", "-"))
+    c[4].metric("PropLine", status.get("PropLine Lines", 0))
+    c[5].metric("Cards", status.get("Cards", 0))
+    c[6].metric("Seconds", status.get("Seconds", "-"))
+    provider_note = str(status.get("PropLine Status", "") or "").strip()
+    if provider_note:
+        st.caption(f"PropLine: {provider_note}")
     st.caption(f"Status: {status.get('Status')} | Daily Context Rows: {status.get('Daily Context Rows', 0)}")
 
 
 def clear_line_pull_caches():
-    for fn in [fetch_underdog_board]:
+    # A real Refresh must invalidate every active line provider. App134 briefly
+    # cleared only Underdog, which could leave a cached empty PropLine response.
+    for fn in [fetch_underdog_board, fetch_propline_board]:
         try:
             fn.clear()
         except Exception:
@@ -8717,8 +8723,8 @@ def clear_line_pull_caches():
 def pull_board_lines(use_ud_flag: bool, use_sleeper_flag: bool = False, use_odds_api_flag: bool = False, odds_api_key: str = "") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Refresh active line sources.
 
-    Active sources: Underdog + saved manual lines. Sleeper/Odds/SportsGameOdds are disabled
-    from production flow because they were either blocked, quota-limited, or unavailable for WNBA.
+    Active sources: Underdog first + PropLine API fallback/supplement + saved manual lines.
+    Sleeper/Odds/SportsGameOdds remain disabled from production flow.
     """
     manual_df = load_manual_lines()
     lines, ud_debug, manual_debug = aggregate_lines(
@@ -12595,7 +12601,8 @@ with st.sidebar:
     use_sleeper = False
     use_odds_api = False
     odds_api_key = ""
-    st.caption("Active line sources: Underdog first + PropLine API fallback/supplement + saved manual lines. Projection data comes from the full SportsDataverse database.")
+    _pl_key_state = "✅ configured" if bool(_propline_api_key()) else "❌ missing"
+    st.caption(f"Active line sources: Underdog first + PropLine API fallback/supplement + saved manual lines. PropLine key: {_pl_key_state}. Projection data comes from the full SportsDataverse database.")
     use_remote = st.toggle("Allow SportsDataverse remote downloads", value=True)
     use_xgb_blend = st.toggle("Use XGBoost/GBM blend", value=False, help="Default OFF. Turn ON only after you have enough graded WNBA samples and want a small guarded ensemble signal.")
     st.session_state["use_xgb_blend"] = bool(use_xgb_blend)
@@ -14671,10 +14678,26 @@ def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd
         lines_all, ud_debug, manual_debug = pull_board_lines(use_ud_flag, False, False, "")
         lines, slate_note = filter_lines_for_slate(lines_all, mode)
         status["Line Rows"] = 0 if lines is None or lines.empty else len(lines)
+        status["All Provider Rows"] = 0 if lines_all is None or lines_all.empty else len(lines_all)
         status["Underdog Lines"] = int((lines.get("Source", pd.Series(dtype=str)).astype(str) == "Underdog").sum()) if lines is not None and not lines.empty else 0
+        status["PropLine Lines"] = int((lines.get("Source", pd.Series(dtype=str)).astype(str) == "PropLine").sum()) if lines is not None and not lines.empty else 0
         status["Slate Note"] = slate_note
         st.session_state["wnba_ud_debug"] = ud_debug
         st.session_state["wnba_sl_debug"] = manual_debug
+        # Surface PropLine diagnostics instead of silently reporting zero lines.
+        try:
+            if manual_debug is not None and not manual_debug.empty:
+                _src = manual_debug.get("source", pd.Series("", index=manual_debug.index)).astype(str)
+                _pldbg = manual_debug[_src.str.contains("PropLine", case=False, na=False)].copy()
+                if not _pldbg.empty:
+                    _last = _pldbg.iloc[-1]
+                    _bits = []
+                    for _k in ["step", "status", "status_code", "events", "bookmakers", "rows", "daily_remaining", "message"]:
+                        if _k in _last.index and pd.notna(_last.get(_k)) and str(_last.get(_k)).strip():
+                            _bits.append(f"{_k}={str(_last.get(_k))[:120]}")
+                    status["PropLine Status"] = " · ".join(_bits)[:420]
+        except Exception:
+            pass
 
         if logs is None or logs.empty or master is None or master.empty:
             status["Status"] = "lines loaded, database missing"
@@ -14684,13 +14707,25 @@ def run_full_refresh_with_progress(mode: str, use_ud_flag: bool, logs_global: pd
             return pd.DataFrame(), status
 
         if lines is None or lines.empty:
+            _pl_key_ready = bool(_propline_api_key())
+            if not _pl_key_ready:
+                status["PropLine Status"] = "MISSING API KEY — add PROP_LINE_API_KEY (or PROPLINE_API_KEY) to the WNBA Railway service"
             step(76, "No live player lines are posted; building a projection-only PASS board...")
             board = build_projection_only_board(mode, logs, master, schedule=sched)
             if board is None or board.empty:
-                status["Status"] = "no lines and no verified projection-only slate"
+                status["Status"] = (
+                    "no lines: Underdog returned 0 and PropLine API key is missing"
+                    if not _pl_key_ready
+                    else "no lines and no verified projection-only slate"
+                )
                 status["Seconds"] = round(time.time() - started, 2)
                 st.session_state["wnba_refresh_today_status"] = status
-                step(100, "Refresh finished: no live lines and no verified scheduled player slate was available.")
+                step(
+                    100,
+                    "Refresh finished: PropLine key is not configured on this Railway service."
+                    if not _pl_key_ready
+                    else "Refresh finished: no live lines and no verified scheduled player slate was available."
+                )
                 return pd.DataFrame(), status
             save_dataset("projection_board", board)
             st.session_state[f"wnba_force_live_{mode}"] = False
